@@ -7,6 +7,7 @@ import { readState, readToken } from './state.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const packageRoot = __dirname;
 
 async function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -67,7 +68,8 @@ export async function ensureDesktopRunning({
   fetchImpl = fetch,
   spawnImpl = spawn,
   timeoutMs = 30_000,
-  showTabs = false
+  showTabs = false,
+  platform = process.platform
 }) {
   const conn = await loadConnection({ stateDir });
   if (conn) {
@@ -79,7 +81,9 @@ export async function ensureDesktopRunning({
     }
   }
 
-  const electronBin = path.resolve('node_modules', '.bin', process.platform === 'win32' ? 'electron.cmd' : 'electron');
+  const electronBin =
+    String(process.env.AGENTIFY_DESKTOP_ELECTRON_BIN || '').trim() ||
+    path.join(packageRoot, 'node_modules', '.bin', platform === 'win32' ? 'electron.cmd' : 'electron');
   const entry = path.join(__dirname, 'main.mjs');
   if (!(await fileExists(electronBin))) throw new Error('missing_electron_binary');
   if (!(await fileExists(entry))) throw new Error('missing_desktop_entry');
@@ -90,7 +94,8 @@ export async function ensureDesktopRunning({
       ...process.env,
       AGENTIFY_DESKTOP_STATE_DIR: stateDir,
       ...(showTabs ? { AGENTIFY_DESKTOP_SHOW_TABS: 'true' } : {})
-    }
+    },
+    shell: platform === 'win32'
   })?.unref?.();
 
   const start = Date.now();

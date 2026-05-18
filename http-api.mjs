@@ -48,6 +48,7 @@ function mapErrorToHttp(error) {
   if (msg === 'missing_url') return { code: 400, body: { error: 'missing_url' } };
   if (msg === 'missing_tabId') return { code: 400, body: { error: 'missing_tabId' } };
   if (msg === 'missing_key') return { code: 400, body: { error: 'missing_key' } };
+  if (msg === 'key_vendor_mismatch') return { code: 409, body: { error: 'key_vendor_mismatch' } };
   if (msg === 'tab_not_found') return { code: 404, body: { error: 'tab_not_found' } };
   if (msg === 'tab_closed') return { code: 409, body: { error: 'tab_closed' } };
   if (msg === 'default_tab_protected') return { code: 409, body: { error: 'default_tab_protected' } };
@@ -66,12 +67,78 @@ function envShowTabsDefault() {
   return v === '1' || v === 'true' || v === 'yes' || v === 'on';
 }
 
-async function resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault = false }) {
+function normalizeVendorToken(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .replace(/\/+$/, '')
+    .replace(/[^a-z0-9.]+/g, '');
+}
+
+function resolveVendor({ body, vendors = [] } = {}) {
+  const raw = String(body?.vendorId || body?.model || '').trim();
+  if (!raw) return null;
+  const token = normalizeVendorToken(raw);
+  return (Array.isArray(vendors) ? vendors : []).find((v) => {
+    return token === normalizeVendorToken(v?.id || '') || token === normalizeVendorToken(v?.name || '') || token === normalizeVendorToken(v?.url || '');
+  }) || null;
+}
+
+function defaultVendor(vendors = []) {
+  return (Array.isArray(vendors) ? vendors : []).find((v) => v.id === 'chatgpt') || (Array.isArray(vendors) ? vendors[0] : null) || null;
+}
+
+function listedTabMatchesVendor(tab, vendor) {
+  if (!vendor) return true;
+  const tabVendor = normalizeVendorToken(tab?.vendorId || '');
+  const requestedVendor = normalizeVendorToken(vendor?.id || '');
+  if (tabVendor && requestedVendor) return tabVendor === requestedVendor;
+  const tabUrl = normalizeVendorToken(tab?.url || '');
+  const requestedUrl = normalizeVendorToken(vendor?.url || '');
+  if (tabUrl && requestedUrl) return tabUrl.startsWith(requestedUrl) || requestedUrl.startsWith(tabUrl);
+  return true;
+}
+
+async function resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault = false, vendors = [] }) {
   const tabId = (body?.tabId ? String(body.tabId).trim() : '') || getTabIdFromUrl(url) || null;
   const key = (body?.key ? String(body.key).trim() : '') || null;
   const name = (body?.name ? String(body.name).trim() : '') || null;
   if (tabId) return tabId;
-  if (key) return await tabs.ensureTab({ key, name, show: envShowTabsDefault() || showTabsByDefault });
+  const newWindow = body?.newWindow === true || body?.parallelWindow === true;
+  const explicitVendor = resolveVendor({ body, vendors });
+  if (key) {
+    const existing = (tabs.listTabs?.() || []).find((t) => t?.key === key);
+    if (existing?.id) {
+      if (explicitVendor && !listedTabMatchesVendor(existing, explicitVendor)) throw new Error('key_vendor_mismatch');
+      return existing.id;
+    }
+    const vendor = explicitVendor || defaultVendor(vendors);
+    return await tabs.ensureTab({
+      key,
+      name,
+      show: envShowTabsDefault() || showTabsByDefault,
+      newWindow,
+      url: vendor?.url,
+      vendorId: vendor?.id,
+      vendorName: vendor?.name
+    });
+  }
+  if (explicitVendor) {
+    const vendorKey = `vendor:${explicitVendor.id}`;
+    const existing = (tabs.listTabs?.() || []).find((t) => t?.key === vendorKey);
+    if (existing?.id) return existing.id;
+    return await tabs.ensureTab({
+      key: vendorKey,
+      name: explicitVendor.name || explicitVendor.id,
+      show: envShowTabsDefault() || showTabsByDefault,
+      newWindow,
+      url: explicitVendor.url,
+      vendorId: explicitVendor.id,
+      vendorName: explicitVendor.name
+    });
+  }
   return defaultTabId;
 }
 
@@ -87,7 +154,8 @@ export function startHttpApi({
   onHide,
   onShutdown,
   getStatus,
-  getSettings
+  getSettings,
+  vendors = []
 }) {
   const tokenRef = typeof token === 'string' ? { current: token } : token;
 
@@ -177,13 +245,13 @@ export function startHttpApi({
 
       if (url.pathname === '/show' && req.method === 'POST') {
         const body = await parseBody(req);
-        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault });
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, vendors });
         await onShow?.({ tabId });
         return sendJson(res, 200, { ok: true });
       }
       if (url.pathname === '/hide' && req.method === 'POST') {
         const body = await parseBody(req);
-        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault });
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, vendors });
         await onHide?.({ tabId });
         return sendJson(res, 200, { ok: true });
       }
@@ -196,7 +264,11 @@ export function startHttpApi({
         const key = (body.key ? String(body.key).trim() : '') || null;
         const name = (body.name ? String(body.name).trim() : '') || null;
         const show = typeof body.show === 'boolean' ? body.show : envShowTabsDefault() || governor.showTabsByDefault;
-        const tabId = key ? await tabs.ensureTab({ key, name, show }) : await tabs.createTab({ name, show });
+        const newWindow = body.newWindow === true || body.parallelWindow === true;
+        const vendor = resolveVendor({ body, vendors }) || defaultVendor(vendors);
+        const tabId = key
+          ? await tabs.ensureTab({ key, name, show, newWindow, url: vendor?.url, vendorId: vendor?.id, vendorName: vendor?.name })
+          : await tabs.createTab({ name, show, newWindow, url: vendor?.url, vendorId: vendor?.id, vendorName: vendor?.name });
         if (show) await onShow?.({ tabId }).catch(() => {});
         return sendJson(res, 200, { ok: true, tabId });
       }
@@ -232,7 +304,7 @@ export function startHttpApi({
         const body = await parseBody(req);
         const to = String(body.url || '').trim();
         if (!to) return sendJson(res, 400, { error: 'missing_url' });
-        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault });
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, vendors });
         const controller = tabs.getControllerById(tabId);
         await controller.navigate(to);
         return sendJson(res, 200, { ok: true, tabId, url: await controller.getUrl() });
@@ -241,7 +313,7 @@ export function startHttpApi({
       if (url.pathname === '/ensure-ready' && req.method === 'POST') {
         const body = await parseBody(req);
         const timeoutMs = Number(body.timeoutMs || 0) || 10 * 60_000;
-        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault });
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, vendors });
         const controller = tabs.getControllerById(tabId);
         const st = await controller.ensureReady({ timeoutMs });
         return sendJson(res, 200, { ok: true, tabId, state: st });
@@ -252,7 +324,7 @@ export function startHttpApi({
         const timeoutMs = Number(body.timeoutMs || 0) || 10 * 60_000;
         const prompt = String(body.prompt || '');
         const attachments = Array.isArray(body.attachments) ? body.attachments.map(String) : [];
-        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault });
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, vendors });
         checkAndConsumeQueryBudget({ tabId, governor });
         inflight.queries += 1;
         const controller = tabs.getControllerById(tabId);
@@ -269,7 +341,7 @@ export function startHttpApi({
         const timeoutMs = Number(body.timeoutMs || 0) || 3 * 60_000;
         const text = String(body.text || '');
         const stopAfterSend = !!body.stopAfterSend;
-        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault });
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, vendors });
         // Apply the same governor as /query since it still sends a message.
         checkAndConsumeQueryBudget({ tabId, governor });
         inflight.queries += 1;
@@ -282,21 +354,70 @@ export function startHttpApi({
         }
       }
 
+      if (url.pathname === '/image-gen' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 5_000_000 });
+        const timeoutMs = Number(body.timeoutMs || 0) || 10 * 60_000;
+        const prompt = String(body.prompt || '');
+        const attachments = Array.isArray(body.attachments) ? body.attachments.map(String) : [];
+        const maxImages = Number(body.maxImages || 0) || 6;
+        const minImages = Number(body.minImages || 0) || 1;
+        const postprocess = body.postprocess !== false;
+        const postprocessMode = String(body.postprocessMode || 'auto');
+        const imageOptions = body.imageOptions && typeof body.imageOptions === 'object' ? body.imageOptions : {};
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, vendors });
+        checkAndConsumeQueryBudget({ tabId, governor });
+        inflight.queries += 1;
+        const controller = tabs.getControllerById(tabId);
+        try {
+          const result = await controller.generateImages({ prompt, attachments, timeoutMs, maxImages, minImages });
+          const files = await controller.downloadLastAssistantImages({ maxImages, postprocess, postprocessMode, imageOptions });
+          return sendJson(res, 200, { ok: true, tabId, result, files });
+        } finally {
+          inflight.queries = Math.max(0, inflight.queries - 1);
+        }
+      }
+
       if (url.pathname === '/read-page' && req.method === 'POST') {
         const body = await parseBody(req);
         const maxChars = Number(body.maxChars || 0) || 200_000;
-        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault });
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, vendors });
         const controller = tabs.getControllerById(tabId);
         const text = await controller.readPageText({ maxChars });
         return sendJson(res, 200, { ok: true, tabId, text });
       }
 
+      if (url.pathname === '/inspect-ui' && req.method === 'POST') {
+        const body = await parseBody(req);
+        const limit = Number(body.limit || 0) || 120;
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, vendors });
+        const controller = tabs.getControllerById(tabId);
+        const elements = await controller.inspectUi({ limit });
+        return sendJson(res, 200, { ok: true, tabId, elements });
+      }
+
+      if (url.pathname === '/click-ui' && req.method === 'POST') {
+        const body = await parseBody(req);
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, vendors });
+        const controller = tabs.getControllerById(tabId);
+        const result = await controller.clickUi({
+          text: body.text,
+          aria: body.aria,
+          testId: body.testId,
+          role: body.role,
+          index: body.index
+        });
+        return sendJson(res, 200, { ok: true, tabId, result });
+      }
+
       if (url.pathname === '/download-images' && req.method === 'POST') {
         const body = await parseBody(req);
         const maxImages = Number(body.maxImages || 0) || 6;
-        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault });
+        const postprocess = body.postprocess !== false;
+        const postprocessMode = String(body.postprocessMode || 'auto');
+        const imageOptions = body.imageOptions && typeof body.imageOptions === 'object' ? body.imageOptions : {};
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, vendors });
         const controller = tabs.getControllerById(tabId);
-        const files = await controller.downloadLastAssistantImages({ maxImages });
+        const files = await controller.downloadLastAssistantImages({ maxImages, postprocess, postprocessMode, imageOptions });
         return sendJson(res, 200, { ok: true, tabId, files });
       }
 

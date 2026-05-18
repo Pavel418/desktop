@@ -1,9 +1,39 @@
 {
-  "name": "agentify-desktop",
-  "private": true,
-  "version": "0.1.0",
+  "name": "@agentify/desktop",
+  "version": "0.2.0",
+  "description": "Agentify Desktop control center and MCP server for local AI web sessions",
+  "license": "MPL-2.0",
   "type": "module",
   "main": "main.mjs",
+  "bin": {
+    "agentify-desktop": "bin/agentify-desktop.mjs",
+    "agentify-desktop-gui": "bin/agentify-desktop.mjs",
+    "agentify-desktop-mcp": "bin/agentify-desktop.mjs"
+  },
+  "files": [
+    "CHANGELOG.md",
+    "README.md",
+    "SECURITY.md",
+    "TRADEMARKS.md",
+    "browser-backend.mjs",
+    "chatgpt-controller.mjs",
+    "chrome-cdp-backend.mjs",
+    "electron-browser-backend.mjs",
+    "http-api.mjs",
+    "image-postprocess.mjs",
+    "main.mjs",
+    "mcp-lib.mjs",
+    "mcp-server.mjs",
+    "orchestrator.mjs",
+    "orchestrator/",
+    "popup-policy.mjs",
+    "selectors.json",
+    "state.mjs",
+    "tab-manager.mjs",
+    "ui/",
+    "vendors.json",
+    "bin/"
+  ],
   "scripts": {
     "start": "electron .",
     "mcp": "node mcp-server.mjs",
@@ -14,6 +44,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",
     "electron": "^39.2.7",
+    "pngjs": "^7.0.0",
     "zod": "^3.22.3"
   },
   "devDependencies": {

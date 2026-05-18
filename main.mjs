@@ -2,19 +2,69 @@
 import { app, Notification, BrowserWindow, ipcMain, shell, Menu } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
+import {
+  createBrowserBackend,
+  resolveBrowserBackend,
+  resolveChromeDebugPort,
+  resolveChromeExecutablePath,
+  resolveChromeProfileMode,
+  resolveChromeProfileName
+} from './browser-backend.mjs';
 import { ChatGPTController } from './chatgpt-controller.mjs';
 import { startHttpApi } from './http-api.mjs';
 import { TabManager } from './tab-manager.mjs';
 import { defaultStateDir, ensureToken, readSettings, writeSettings, defaultSettings, writeState } from './state.mjs';
 import { getWorkspace, setWorkspace } from './orchestrator/storage.mjs';
 import { logPath as orchestratorLogPath } from './orchestrator/logging.mjs';
+import { shouldAllowPopup } from './popup-policy.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+let bootLogPath = null;
+
+async function bootLog(message, extra = null) {
+  try {
+    const stateDir = argValue('--state-dir') || defaultStateDir();
+    const logDir = path.join(stateDir, 'logs');
+    await fs.mkdir(logDir, { recursive: true });
+    bootLogPath = bootLogPath || path.join(logDir, 'desktop.current.log');
+    const line = `${new Date().toISOString()} ${message}${extra ? ` ${JSON.stringify(extra)}` : ''}\n`;
+    await fs.appendFile(bootLogPath, line, 'utf8');
+  } catch {}
+}
+
+function bootLogSync(message, extra = null) {
+  try {
+    const stateDir = argValue('--state-dir') || defaultStateDir();
+    const logDir = path.join(stateDir, 'logs');
+    fsSync.mkdirSync(logDir, { recursive: true });
+    bootLogPath = bootLogPath || path.join(logDir, 'desktop.current.log');
+    const line = `${new Date().toISOString()} ${message}${extra ? ` ${JSON.stringify(extra)}` : ''}\n`;
+    fsSync.appendFileSync(bootLogPath, line, 'utf8');
+  } catch {}
+}
+
+process.on('uncaughtException', (error) => {
+  bootLogSync('uncaughtException', { message: String(error?.message || error), stack: String(error?.stack || '') });
+  // eslint-disable-next-line no-console
+  console.error('[agentify-desktop] uncaughtException', error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  bootLogSync('unhandledRejection', { message: String(reason?.message || reason), stack: String(reason?.stack || '') });
+  // eslint-disable-next-line no-console
+  console.error('[agentify-desktop] unhandledRejection', reason);
+});
+
+process.on('exit', (code) => {
+  bootLogSync('process.exit', { code });
+});
 
 function argFlag(name) {
   return process.argv.includes(name);
@@ -73,6 +123,8 @@ async function loadVendors() {
 }
 
 async function main() {
+  await bootLog('main.start', { argv: process.argv.slice(2), cwd: process.cwd() });
+  let browserBackend = null;
   const stateDir = argValue('--state-dir') || defaultStateDir();
   const basePort = Number(argValue('--port') || process.env.AGENTIFY_DESKTOP_PORT || 0);
   const startMinimized = argFlag('--start-minimized');
@@ -92,6 +144,7 @@ async function main() {
   app.setPath('userData', path.join(stateDir, 'electron-user-data'));
   const gotLock = app.requestSingleInstanceLock();
   if (!gotLock) {
+    await bootLog('single_instance_lock_failed');
     app.quit();
     return;
   }
@@ -104,12 +157,27 @@ async function main() {
   });
 
   await app.whenReady();
+  await bootLog('app.ready');
 
   const token = await ensureToken(stateDir);
   const selectors = await loadSelectors(stateDir);
   const vendors = await loadVendors();
   let settings = await readSettings(stateDir);
+  const requestedBrowserBackendKind = resolveBrowserBackend({ settings });
+  let browserBackendKind = requestedBrowserBackendKind;
+  const chromeExecutablePath = resolveChromeExecutablePath({ settings });
+  const chromeDebugPort = resolveChromeDebugPort({ settings });
+  const chromeProfileMode = resolveChromeProfileMode({ settings });
+  const chromeProfileName = resolveChromeProfileName({ settings });
   const serverId = crypto.randomUUID();
+  let browserStartupError = null;
+  await bootLog('settings.loaded', {
+    requestedBrowserBackendKind,
+    chromeDebugPort,
+    chromeProfileMode,
+    chromeProfileName,
+    showTabsByDefault: settings?.showTabsByDefault
+  });
 
   const notify = (body) => {
     try {
@@ -120,15 +188,31 @@ async function main() {
 
   const onNeedsAttention = async ({ reason }) => {
     if (reason === 'all_clear') return;
-    if (reason?.kind === 'login') notify('Agentify needs attention. Please sign in to ChatGPT.');
-    else if (reason?.kind === 'ui') notify('Agentify is stuck. Please bring ChatGPT to a ready state (UI changed, blocked, or needs a click).');
+    if (reason?.kind === 'login') notify('Agentify needs attention. Please sign in to the target site.');
+    else if (reason?.kind === 'ui') notify('Agentify is stuck. Please bring the target site to a ready state (UI changed, blocked, or needs a click).');
     else notify('Agentify needs a human check. Please solve the CAPTCHA.');
+  };
+
+  const describeBrowserStartupError = (error) => {
+    const message = String(error?.message || error || 'browser_start_failed');
+    const code = message.includes(':') ? message.split(':')[0] : message;
+    return {
+      requestedBackend: requestedBrowserBackendKind,
+      fallbackBackend: 'electron',
+      code,
+      message
+    };
   };
 
   let controlWin = null;
   let quitting = false;
   const orchestrators = new Map(); // key -> { child, pid, startedAt }
   const orchestratorHistory = new Map(); // key -> { pid, startedAt, exitedAt, exitCode, signal, logPath }
+  const emitTabsChanged = () => {
+    try {
+      if (controlWin && !controlWin.isDestroyed()) controlWin.webContents.send('agentify:tabsChanged');
+    } catch {}
+  };
   const showControlCenter = async () => {
     if (controlWin && !controlWin.isDestroyed()) {
       if (controlWin.isMinimized()) controlWin.restore();
@@ -145,7 +229,7 @@ async function main() {
         sandbox: true,
         contextIsolation: true,
         nodeIntegration: false,
-        preload: path.join(__dirname, 'ui', 'preload.mjs')
+        preload: path.join(__dirname, 'ui', 'preload.cjs')
       }
     });
     controlWin.setMenuBarVisibility(false);
@@ -159,20 +243,53 @@ async function main() {
     await controlWin.loadFile(path.join(__dirname, 'ui', 'control-center.html'));
   };
 
+  const makeBrowserBackend = async (kind) =>
+    await createBrowserBackend({
+      kind,
+      stateDir,
+      windowDefaults: { width: 1100, height: 800, show: !startMinimized, title: 'Agentify Desktop' },
+      userAgent: app.userAgentFallback,
+      onChanged: emitTabsChanged,
+      popupPolicy: ({ url, vendorId, openerUrl, frameName, disposition }) =>
+        shouldAllowPopup({ url, vendorId, openerUrl, frameName, disposition, allowAuthPopups: settings?.allowAuthPopups !== false }),
+      chromeExecutablePath,
+      chromeDebugPort,
+      chromeProfileMode,
+      chromeProfileName
+    });
+
+  browserBackend = await makeBrowserBackend(browserBackendKind);
+  let browserState = null;
+  try {
+    await bootLog('browser.start.begin', { browserBackendKind });
+    browserState = await browserBackend.start();
+    await bootLog('browser.start.ok', browserState);
+  } catch (e) {
+    await bootLog('browser.start.error', { message: String(e?.message || e), stack: String(e?.stack || '') });
+    if (browserBackendKind !== 'chrome-cdp') throw e;
+    browserStartupError = describeBrowserStartupError(e);
+    if (String(process.env.AGENTIFY_DESKTOP_ALLOW_ELECTRON_FALLBACK || '').trim().toLowerCase() !== 'true') {
+      throw e;
+    }
+    try {
+      await browserBackend.dispose?.();
+    } catch {}
+    browserBackendKind = 'electron';
+    notify('Chrome CDP is unavailable. Agentify is using Electron browser fallback.');
+    browserBackend = await makeBrowserBackend(browserBackendKind);
+    browserState = await browserBackend.start();
+  }
+
   const tabs = new TabManager({
+    browserBackend,
     maxTabs: Number(process.env.AGENTIFY_DESKTOP_MAX_TABS || 12),
     onNeedsAttention,
     userAgent: app.userAgentFallback,
-    onChanged: () => {
-      try {
-        if (controlWin && !controlWin.isDestroyed()) controlWin.webContents.send('agentify:tabsChanged');
-      } catch {}
-    },
+    onChanged: emitTabsChanged,
     windowDefaults: { width: 1100, height: 800, show: !startMinimized, title: 'Agentify Desktop' },
-    createController: async ({ tabId, win }) => {
+    createController: async ({ tabId, page }) => {
       const controller = new ChatGPTController({
-        webContents: win.webContents,
-        loadURL: (url) => win.loadURL(url),
+        page,
         selectors,
         stateDir,
         onBlocked: async (st) => {
@@ -196,22 +313,22 @@ async function main() {
     name: 'default',
     url: defaultVendor.url,
     show: !startMinimized,
+    reuseExisting: browserBackendKind === 'chrome-cdp',
     protectedTab: true,
     vendorId: defaultVendor.id,
     vendorName: defaultVendor.name
   });
+  await bootLog('default_tab.created', { defaultTabId });
 
   focusDefaultTab = () => {
     try {
       const win = tabs.getWindowById(defaultTabId);
-      if (win.isMinimized()) win.restore();
-      win.show();
-      win.focus();
+      if (win.isMinimized?.()) win.restore?.();
+      win.show?.();
+      win.focus?.();
     } catch {}
   };
   if (pendingSecondInstanceFocus) focusDefaultTab();
-
-  await showControlCenter().catch(() => {});
 
   const buildMenu = () => {
     const template = [
@@ -254,7 +371,17 @@ async function main() {
   } catch {}
 
   ipcMain.handle('agentify:getState', async () => {
-    return { ok: true, vendors, tabs: tabs.listTabs(), defaultTabId, stateDir };
+    return {
+      ok: true,
+      vendors,
+      tabs: tabs.listTabs(),
+      defaultTabId,
+      stateDir,
+      browserBackend: browserBackendKind,
+      requestedBrowserBackend: requestedBrowserBackendKind,
+      browser: browserState,
+      browserStartupError
+    };
   });
 
   ipcMain.handle('agentify:getSettings', async () => {
@@ -273,7 +400,13 @@ async function main() {
       maxQueriesPerMinute: args?.maxQueriesPerMinute,
       minTabGapMs: args?.minTabGapMs,
       minGlobalGapMs: args?.minGlobalGapMs,
-      showTabsByDefault: args?.showTabsByDefault
+      showTabsByDefault: args?.showTabsByDefault,
+      browserBackend: args?.browserBackend ?? settings.browserBackend,
+      chromeDebugPort: args?.chromeDebugPort ?? settings.chromeDebugPort,
+      chromeExecutablePath: args?.chromeExecutablePath ?? settings.chromeExecutablePath,
+      chromeProfileMode: args?.chromeProfileMode ?? settings.chromeProfileMode,
+      chromeProfileName: args?.chromeProfileName ?? settings.chromeProfileName,
+      allowAuthPopups: args?.allowAuthPopups ?? settings.allowAuthPopups
     };
     if (args?.acknowledge) next.acknowledgedAt = new Date().toISOString();
     settings = await writeSettings(next, stateDir);
@@ -294,9 +427,9 @@ async function main() {
 
     if (show) {
       const win = tabs.getWindowById(tabId);
-      if (win.isMinimized()) win.restore();
-      win.show();
-      win.focus();
+      if (win.isMinimized?.()) win.restore?.();
+      win.show?.();
+      win.focus?.();
     }
     return { ok: true, tabId };
   });
@@ -305,9 +438,10 @@ async function main() {
     const tabId = String(args?.tabId || '').trim();
     if (!tabId) throw new Error('missing_tabId');
     const win = tabs.getWindowById(tabId);
-    if (win.isMinimized()) win.restore();
-    win.show();
-    win.focus();
+    if (win.isMinimized?.()) win.restore?.();
+    win.show?.();
+    win.focus?.();
+    emitTabsChanged();
     return { ok: true };
   });
 
@@ -315,8 +449,39 @@ async function main() {
     const tabId = String(args?.tabId || '').trim();
     if (!tabId) throw new Error('missing_tabId');
     const win = tabs.getWindowById(tabId);
-    win.minimize();
+    win.minimize?.();
+    emitTabsChanged();
     return { ok: true };
+  });
+
+  const setTabsVisible = async (visible) => {
+    const tabList = tabs.listTabs();
+    let changed = 0;
+    for (const tab of tabList) {
+      const win = tabs.getWindowById(tab.id);
+      if (visible) {
+        if (win.isMinimized?.()) win.restore?.();
+        win.show?.();
+        win.focus?.();
+      } else {
+        win.minimize?.();
+      }
+      changed += 1;
+    }
+    emitTabsChanged();
+    return { ok: true, visible: !!visible, changed, tabs: tabs.listTabs() };
+  };
+
+  ipcMain.handle('agentify:setTabsVisible', async (_evt, args) => {
+    return await setTabsVisible(!!args?.visible);
+  });
+
+  ipcMain.handle('agentify:showAllTabs', async () => {
+    return await setTabsVisible(true);
+  });
+
+  ipcMain.handle('agentify:hideAllTabs', async () => {
+    return await setTabsVisible(false);
   });
 
   ipcMain.handle('agentify:closeTab', async (_evt, args) => {
@@ -328,7 +493,8 @@ async function main() {
   });
 
   ipcMain.handle('agentify:openStateDir', async () => {
-    await shell.openPath(stateDir);
+    const error = await shell.openPath(stateDir);
+    if (error) throw new Error(error);
     return { ok: true };
   });
 
@@ -421,28 +587,34 @@ async function main() {
     return { ok: true };
   });
 
+  await showControlCenter()
+    .then(() => bootLog('control_center.shown'))
+    .catch((error) => bootLog('control_center.error', { message: String(error?.message || error), stack: String(error?.stack || '') }));
+
   let server = null;
   let port = basePort;
   const tries = port === 0 ? 1 : 20;
   for (let i = 0; i < tries; i++) {
     try {
+      await bootLog('http.start.begin', { port });
       server = await startHttpApi({
         port,
         token,
         tabs,
         defaultTabId,
+        vendors,
         serverId,
         stateDir,
         getSettings: async () => settings,
         onShow: async ({ tabId }) => {
           const win = tabs.getWindowById(tabId || defaultTabId);
-          if (win.isMinimized()) win.restore();
-          win.show();
-          win.focus();
+          if (win.isMinimized?.()) win.restore?.();
+          win.show?.();
+          win.focus?.();
         },
         onHide: async ({ tabId }) => {
           const win = tabs.getWindowById(tabId || defaultTabId);
-          win.minimize();
+          win.minimize?.();
         },
         onShutdown: async () => {
           try {
@@ -469,8 +641,10 @@ async function main() {
       try {
         port = server.address().port;
       } catch {}
+      await bootLog('http.start.ok', { port });
       break;
     } catch (e) {
+      await bootLog('http.start.error', { port, message: String(e?.message || e), code: e?.code || null });
       if (e?.code === 'EADDRINUSE') {
         port += 1;
         continue;
@@ -481,8 +655,10 @@ async function main() {
   if (!server) throw new Error('http_api_start_failed');
 
   await writeState({ ok: true, port, pid: process.pid, serverId, startedAt: new Date().toISOString() }, stateDir);
+  await bootLog('state.written', { port, pid: process.pid, serverId });
 
   app.on('before-quit', () => {
+    bootLogSync('app.before-quit');
     quitting = true;
     for (const v of orchestrators.values()) {
       try {
@@ -490,6 +666,7 @@ async function main() {
       } catch {}
     }
     tabs.setQuitting(true);
+    Promise.resolve(browserBackend?.dispose?.()).catch(() => {});
   });
 
   process.on('SIGINT', () => {
@@ -500,15 +677,18 @@ async function main() {
   });
 
   app.on('activate', () => {
+    bootLogSync('app.activate');
     showControlCenter().catch(() => {});
   });
 
   app.on('window-all-closed', () => {
+    bootLogSync('app.window-all-closed', { platform: process.platform });
     if (process.platform !== 'darwin') app.quit();
   });
 }
 
 main().catch((e) => {
+  bootLogSync('main.fatal', { message: String(e?.message || e), stack: String(e?.stack || '') });
   // eslint-disable-next-line no-console
   console.error('[agentify-desktop] fatal', e);
   process.exit(1);

@@ -1,6 +1,4 @@
 import crypto from 'node:crypto';
-import { BrowserWindow } from 'electron';
-
 class Mutex {
   #p = Promise.resolve();
   async run(fn) {
@@ -16,8 +14,30 @@ class Mutex {
   }
 }
 
+function normalizeVendorToken(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .replace(/\/+$/, '')
+    .replace(/[^a-z0-9.]+/g, '');
+}
+
+function tabMatchesVendor(tab, { vendorId = null, url = null } = {}) {
+  if (!vendorId && !url) return true;
+  const requestedId = normalizeVendorToken(vendorId);
+  const currentId = normalizeVendorToken(tab?.vendorId || '');
+  if (requestedId && currentId) return requestedId === currentId;
+  const requestedUrl = normalizeVendorToken(url);
+  const currentUrl = normalizeVendorToken(tab?.url || '');
+  if (requestedUrl && currentUrl) return requestedUrl.startsWith(currentUrl) || currentUrl.startsWith(requestedUrl);
+  return true;
+}
+
 export class TabManager {
-  constructor({ createController, maxTabs = 12, onNeedsAttention, windowDefaults, userAgent, onChanged }) {
+  constructor({ browserBackend = null, createController, maxTabs = 12, onNeedsAttention, windowDefaults, userAgent, onChanged }) {
+    this.browserBackend = browserBackend;
     this.createController = createController;
     this.maxTabs = Math.max(1, Number(maxTabs) || 12);
     this.onNeedsAttention = onNeedsAttention;
@@ -34,42 +54,36 @@ export class TabManager {
 
   setQuitting(v = true) {
     this.quitting = !!v;
+    this.browserBackend?.setQuitting?.(this.quitting);
   }
 
-  async createTab({ key = null, name = null, url = 'https://chatgpt.com/', show = false, protectedTab = false, vendorId = null, vendorName = null } = {}) {
+  async createTab({ key = null, name = null, url = 'https://chatgpt.com/', show = false, newWindow = false, reuseExisting = false, protectedTab = false, vendorId = null, vendorName = null } = {}) {
     return await this.mutex.run(async () => {
       if (key && this.keyToId.has(key)) return this.keyToId.get(key);
       if (this.tabs.size >= this.maxTabs) throw new Error('max_tabs_reached');
 
       const id = crypto.randomUUID();
-      const win = new BrowserWindow({
-        ...this.windowDefaults,
-        show: !!show,
-        webPreferences: {
-          sandbox: true,
-          contextIsolation: true,
-          nodeIntegration: false,
-          ...(this.windowDefaults.webPreferences || {})
-        }
-      });
-      if (this.userAgent) {
-        try {
-          win.webContents.setUserAgent(this.userAgent);
-        } catch {}
-      }
-      win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-      const fixedTitle = `Agentify Desktop${vendorName ? ` — ${vendorName}` : ''}`;
-      try {
-        win.setTitle(fixedTitle);
-        win.on('page-title-updated', (e) => {
-          try {
-            e.preventDefault();
-            win.setTitle(fixedTitle);
-          } catch {}
-        });
-      } catch {}
+      let finalized = false;
+      const finalizeClose = () => {
+        if (finalized) return;
+        finalized = true;
+        this.tabs.delete(id);
+        if (key) this.keyToId.delete(key);
+        this.forcedFocusTabs.delete(id);
+        this.onChanged?.();
+      };
 
-      const controller = await this.createController({ tabId: id, win });
+      const session = await this.browserBackend.createSession({ tabId: id, url, show, newWindow, reuseExisting, protectedTab, vendorId, vendorName, onClosed: finalizeClose });
+      let controller;
+      try {
+        controller = await this.createController({ tabId: id, page: session.page, session });
+      } catch (error) {
+        try {
+          await session?.close?.();
+        } catch {}
+        finalizeClose();
+        throw error;
+      }
 
       const tab = {
         id,
@@ -78,7 +92,8 @@ export class TabManager {
         vendorId: vendorId || null,
         vendorName: vendorName || null,
         url: String(url || ''),
-        win,
+        session,
+        presenter: session.presenter,
         controller,
         protectedTab: !!protectedTab,
         createdAt: Date.now(),
@@ -88,35 +103,23 @@ export class TabManager {
       this.tabs.set(id, tab);
       if (key) this.keyToId.set(key, id);
       this.onChanged?.();
-
-      win.on('closed', () => {
-        this.tabs.delete(id);
-        if (tab.key) this.keyToId.delete(tab.key);
-        this.forcedFocusTabs.delete(id);
-        this.onChanged?.();
-      });
-
-      win.on('close', (e) => {
-        if (this.quitting) return;
-        if (!tab.protectedTab) return;
-        try {
-          e.preventDefault();
-          if (win.isMinimized()) return;
-          win.minimize();
-        } catch {}
-      });
-
-      await win.loadURL(url);
-      this.onChanged?.();
       return id;
     });
   }
 
-  async ensureTab({ key, name, url, vendorId, vendorName, show } = {}) {
+  async ensureTab({ key, name, url, vendorId, vendorName, show, newWindow, reuseExisting } = {}) {
     if (!key) throw new Error('missing_key');
     const existing = this.keyToId.get(key);
-    if (existing) return existing;
-    return await this.createTab({ key, name, show: !!show, url, vendorId, vendorName });
+    if (existing) {
+      const tab = this.tabs.get(existing);
+      if (!tab) {
+        this.keyToId.delete(key);
+      } else {
+        if (!tabMatchesVendor(tab, { vendorId, url })) throw new Error('key_vendor_mismatch');
+        return existing;
+      }
+    }
+    return await this.createTab({ key, name, show: !!show, newWindow: !!newWindow, reuseExisting: !!reuseExisting, url, vendorId, vendorName });
   }
 
   listTabs() {
@@ -129,6 +132,13 @@ export class TabManager {
         vendorId: t.vendorId || null,
         vendorName: t.vendorName || null,
         url: t.url || null,
+        visible: (() => {
+          try {
+            if (typeof t.presenter?.isMinimized === 'function') return !t.presenter.isMinimized();
+            if (typeof t.presenter?.isVisible === 'function') return !!t.presenter.isVisible();
+          } catch {}
+          return null;
+        })(),
         protectedTab: !!t.protectedTab,
         createdAt: t.createdAt,
         lastUsedAt: t.lastUsedAt
@@ -141,7 +151,7 @@ export class TabManager {
   getControllerById(id) {
     const tab = this.tabs.get(id);
     if (!tab) throw new Error('tab_not_found');
-    if (tab.win?.isDestroyed?.() || tab.win?.webContents?.isDestroyed?.()) throw new Error('tab_closed');
+    if (tab.session?.isClosed?.()) throw new Error('tab_closed');
     tab.lastUsedAt = Date.now();
     return tab.controller;
   }
@@ -149,8 +159,9 @@ export class TabManager {
   getWindowById(id) {
     const tab = this.tabs.get(id);
     if (!tab) throw new Error('tab_not_found');
+    if (tab.session?.isClosed?.()) throw new Error('tab_closed');
     tab.lastUsedAt = Date.now();
-    return tab.win;
+    return tab.presenter;
   }
 
   async closeTab(id) {
@@ -161,7 +172,7 @@ export class TabManager {
       this.tabs.delete(id);
       this.forcedFocusTabs.delete(id);
       try {
-        tab.win.close();
+        await tab.session?.close?.();
       } catch {}
       this.onChanged?.();
       return true;
@@ -172,9 +183,9 @@ export class TabManager {
     this.forcedFocusTabs.add(tabId);
     try {
       const win = this.getWindowById(tabId);
-      if (win.isMinimized()) win.restore();
-      win.show();
-      win.focus();
+      if (win.isMinimized?.()) win.restore?.();
+      win.show?.();
+      win.focus?.();
     } catch {}
     await this.onNeedsAttention?.({ tabId, reason });
   }
@@ -186,7 +197,7 @@ export class TabManager {
     if (wasForced) {
       try {
         const win = this.getWindowById(tabId);
-        if (win.isVisible()) win.minimize();
+        if (win.isVisible?.()) win.minimize?.();
       } catch {}
     }
     if (this.forcedFocusTabs.size === 0) {

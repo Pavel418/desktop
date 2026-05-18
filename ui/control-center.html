@@ -17,8 +17,29 @@
           </div>
         </div>
         <div class="actions">
-          <button id="btnOpenState" class="btn secondary" title="Open state folder">State</button>
-          <button id="btnRefresh" class="btn secondary" title="Refresh">Refresh</button>
+          <button id="btnToggleTabs" class="btn secondary iconHeaderBtn" title="Hide all managed tabs" aria-label="Hide all managed tabs" aria-pressed="false">
+            <svg class="icon iconHideTabs" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M2.5 12s3.4-5.5 9.5-5.5 9.5 5.5 9.5 5.5-3.4 5.5-9.5 5.5S2.5 12 2.5 12Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+              <circle cx="12" cy="12" r="2.8" fill="none" stroke="currentColor" stroke-width="1.8"/>
+              <path d="m4 4 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+            <svg class="icon iconShowTabs" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M2.5 12s3.4-5.5 9.5-5.5 9.5 5.5 9.5 5.5-3.4 5.5-9.5 5.5S2.5 12 2.5 12Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+              <circle cx="12" cy="12" r="2.8" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            </svg>
+          </button>
+          <button id="btnOpenState" class="btn secondary iconHeaderBtn" title="Open the Agentify state folder" aria-label="Open the Agentify state folder">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3.5 7.5h6l2 2h9v7.8a2.2 2.2 0 0 1-2.2 2.2H5.7a2.2 2.2 0 0 1-2.2-2.2Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+              <path d="M3.5 7.5V6.7a2.2 2.2 0 0 1 2.2-2.2h3.5l2 3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+            </svg>
+          </button>
+          <button id="btnRefresh" class="btn secondary iconHeaderBtn" title="Refresh" aria-label="Refresh">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 6.5v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M19.1 11.5A7.2 7.2 0 1 0 17 17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+          </button>
         </div>
       </header>
 
@@ -55,7 +76,7 @@
           <div id="tabsList" class="tabs"></div>
         </section>
 
-        <section class="card">
+        <section id="orchestratorCard" class="card isHidden" aria-hidden="true">
           <div class="cardTitle">Orchestrator (single-chat emulator)</div>
           <div class="hint">
             Runs locally: watches the ChatGPT thread for <span class="mono">agentify_tool</span> JSON blocks and executes Codex + posts results back.
@@ -76,6 +97,7 @@
                 <option value="git.diff">git.diff</option>
                 <option value="tests.run">tests.run</option>
                 <option value="fs.read">fs.read</option>
+                <option value="fs.list">fs.list</option>
               </select>
             </label>
           </div>
@@ -97,26 +119,63 @@
         </section>
 
         <section class="card">
-          <div class="cardTitle">Settings (governor)</div>
-          <div class="hint">
-            These defaults exist to reduce accidental high-rate automation. Automating web UIs may violate website terms; use responsibly.
-          </div>
+          <div class="cardTitle">Browser backend</div>
           <div class="grid">
             <label class="field">
+              <div class="label">Engine</div>
+              <select id="setBrowserBackend">
+                <option value="chrome-cdp">Chrome CDP</option>
+                <option value="electron">Electron</option>
+              </select>
+            </label>
+            <label class="field">
+              <div class="label">Chrome profile mode</div>
+              <select id="setChromeProfileMode">
+                <option value="agentify">Agentify persistent Chrome profile</option>
+                <option value="attach">Attach to open Chrome</option>
+                <option value="existing">Existing Chrome profile</option>
+                <option value="isolated">Agentify isolated profile</option>
+              </select>
+            </label>
+            <label class="field">
+              <div class="label">Chrome debug port</div>
+              <input id="setChromeDebugPort" type="number" min="1024" max="65535" step="1" />
+            </label>
+            <label class="field">
+              <div class="label">Chrome binary (optional)</div>
+              <input id="setChromeBinary" type="text" placeholder="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" autocomplete="off" />
+            </label>
+          </div>
+          <div class="row">
+            <label class="checkbox">
+              <input id="setAllowAuthPopups" type="checkbox" />
+              <span>Allow trusted auth popups for Electron fallback</span>
+            </label>
+          </div>
+          <div id="browserHint" class="hint"></div>
+        </section>
+
+        <section class="card">
+          <div class="cardTitle">Settings (governor)</div>
+          <div class="hint governorIntro">
+            These defaults exist to reduce accidental high-rate automation. Automating web UIs may violate website terms; use responsibly.
+          </div>
+          <div class="grid governorGrid">
+            <label class="field">
               <div class="label">Max in-flight queries</div>
-              <input id="setMaxInflight" type="number" min="1" max="12" step="1" />
+              <input id="setMaxInflight" class="governorInput" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" data-min="1" data-max="12" value="2" />
             </label>
             <label class="field">
               <div class="label">Max queries per minute</div>
-              <input id="setQpm" type="number" min="1" max="600" step="1" />
+              <input id="setQpm" class="governorInput" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" data-min="1" data-max="600" value="12" />
             </label>
             <label class="field">
               <div class="label">Min gap per tab (ms)</div>
-              <input id="setTabGap" type="number" min="0" max="60000" step="50" />
+              <input id="setTabGap" class="governorInput" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" data-min="0" data-max="60000" value="1200" />
             </label>
             <label class="field">
               <div class="label">Min global gap (ms)</div>
-              <input id="setGlobalGap" type="number" min="0" max="10000" step="10" />
+              <input id="setGlobalGap" class="governorInput" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" data-min="0" data-max="10000" value="200" />
             </label>
           </div>
           <div class="row">
@@ -126,10 +185,10 @@
             </label>
           </div>
           <div class="row">
-            <label class="checkbox">
+            <div class="checkbox">
               <input id="setAcknowledge" type="checkbox" />
-              <span>I understand the risks and want to change these limits</span>
-            </label>
+              <span>I understand the <button id="btnRiskDetails" class="linkButton" type="button">risks</button> and want to change these limits</span>
+            </div>
             <div class="btnRow">
               <button id="btnResetSettings" class="btn secondary">Reset</button>
               <button id="btnSaveSettings" class="btn primary" disabled>Save</button>
@@ -149,9 +208,64 @@
         </section>
       </main>
 
+      <dialog id="riskModal" class="modal">
+        <div class="modalPanel">
+          <div class="modalHeader">
+            <div class="modalTitle">Automation risk controls</div>
+            <button id="btnCloseRiskModal" class="btn secondary compactBtn" type="button" aria-label="Close">Close</button>
+          </div>
+          <div class="modalBody">
+            <p>
+              Agentify Desktop controls browser tabs on your machine. High-frequency tab automation can accidentally send repeated prompts,
+              trigger abuse systems, consume account quota, or violate a website's terms of use.
+            </p>
+            <p>
+              The governor reduces those risks by limiting concurrent prompts, capping prompts per minute, spacing requests to the same tab,
+              and enforcing a short global gap between sends. CAPTCHA, login, and auth challenges pause automation and bring the tab forward
+              so you can resolve them manually.
+            </p>
+            <p>
+              These controls are guardrails, not permission to ignore service limits. Keep the defaults unless you have a specific reason,
+              and raise limits only for websites and accounts where that activity is allowed.
+            </p>
+          </div>
+        </div>
+      </dialog>
+
+      <dialog id="chromeCdpModal" class="modal">
+        <div class="modalPanel">
+          <div class="modalHeader">
+            <div class="modalTitle">Chrome CDP is unavailable</div>
+            <button id="btnCloseChromeCdpModal" class="btn secondary compactBtn" type="button" aria-label="Close">Close</button>
+          </div>
+          <div class="modalBody">
+            <p id="chromeCdpReason">
+              Agentify could not start a Chrome-family browser with remote debugging, so it opened with the Electron fallback.
+            </p>
+            <p>
+              Recommended: install Google Chrome, Chromium, Brave, or Microsoft Edge yourself, then restart Agentify Desktop with
+              <span class="mono">Chrome CDP</span> selected. If the browser is installed in a custom location, paste its executable path in
+              <span class="mono">Chrome binary</span>.
+            </p>
+            <p>
+              Electron fallback is useful for basic testing, but Chrome CDP gives better SSO compatibility and a real browser profile.
+              Agentify does not silently download a browser for you.
+            </p>
+            <div class="modalActions">
+              <button id="btnChromeCdpContinueElectron" class="btn secondary" type="button">Continue with Electron</button>
+              <button id="btnChromeCdpUseElectron" class="btn secondary" type="button">Use Electron by default</button>
+              <button id="btnChromeCdpKeepChrome" class="btn primary" type="button">I will install Chrome and restart</button>
+            </div>
+          </div>
+        </div>
+      </dialog>
+
       <footer class="footer">
-        <div id="statusLine" class="status">Loading…</div>
-        <button id="btnShowDefault" class="btn secondary">Show default</button>
+        <div class="footerStatus">
+          <div id="statusLine" class="status"><span class="activityLabel">Activity:</span> Starting Agentify Desktop…</div>
+          <div id="messageLine" class="messageLine">Loading…</div>
+        </div>
+        <button id="btnShowDefault" class="btn secondary compactBtn">Show default tab</button>
       </footer>
     </div>
 

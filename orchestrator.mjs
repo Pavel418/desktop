@@ -216,20 +216,94 @@ async function handleFsRead({ stateDir, key, args, conn }) {
   await appendLog(stateDir, key, `fs.read ${abs}`);
   const buf = await fs.readFile(abs);
   const sliced = buf.subarray(0, maxBytes);
-  const text = sliced.toString('utf8');
   const truncated = buf.length > maxBytes;
+
+  // Heuristic: avoid dumping binary garbage into ChatGPT.
+  let isBinary = false;
+  let nonPrintable = 0;
+  for (let i = 0; i < sliced.length; i++) {
+    const c = sliced[i];
+    if (c === 0) {
+      isBinary = true;
+      break;
+    }
+    // Allow common whitespace + printable ASCII.
+    const printable = c === 9 || c === 10 || c === 13 || (c >= 32 && c <= 126);
+    if (!printable) nonPrintable += 1;
+  }
+  if (!isBinary) {
+    const ratio = sliced.length ? nonPrintable / sliced.length : 0;
+    if (ratio > 0.18) isBinary = true;
+  }
+
+  const text = isBinary ? '' : sliced.toString('utf8');
 
   const result = {
     agentify_result_for: args.id,
     ok: true,
     file,
     bytes: buf.length,
-    truncated
+    truncated,
+    binary: isBinary
   };
-  const body =
-    `Agentify fs.read:\n\n` +
-    formatResultBlock(result) +
-    `\n\`\`\`\n${text}\n\`\`\`\n`;
+  const body = isBinary
+    ? `Agentify fs.read:\n\n${formatResultBlock(result)}\n(Binary detected; not printing contents.)\n`
+    : `Agentify fs.read:\n\n${formatResultBlock(result)}\n\`\`\`\n${text}\n\`\`\`\n`;
+  for (const m of makeChunkedMessages({ header: 'Agentify Tool Result', body, maxChars: Number(args.maxPostChars || 25_000) || 25_000 })) {
+    await sendNoWait(conn, { key, text: m, stopAfterSend: true }).catch(() => {});
+    await sleep(350);
+  }
+}
+
+async function handleFsList({ stateDir, key, args, conn }) {
+  const rel = String(args.path || '.').trim() || '.';
+  const maxEntries = Math.max(1, Math.min(2000, Number(args.maxEntries || 400) || 400));
+  const maxDepth = Math.max(0, Math.min(8, Number(args.maxDepth || 3) || 3));
+
+  const ws = await getWorkspace(stateDir, { key });
+  if (!ws?.root) throw new Error('missing_workspace');
+  const allowRoots = ws.allowRoots || [ws.root];
+
+  const base = path.resolve(ws.root, rel);
+  assertWithin({ filePath: base, allowedRoots: allowRoots });
+
+  await appendLog(stateDir, key, `fs.list ${base} depth=${maxDepth} maxEntries=${maxEntries}`);
+
+  const out = [];
+  let count = 0;
+  const walk = async (dir, depth) => {
+    if (count >= maxEntries) return;
+    let entries = [];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const e of entries) {
+      if (count >= maxEntries) return;
+      const p = path.join(dir, e.name);
+      assertWithin({ filePath: p, allowedRoots: allowRoots });
+      const relPath = path.relative(ws.root, p) || '.';
+      if (e.isSymbolicLink()) {
+        out.push(`${'  '.repeat(depth)}↪ ${relPath}`);
+        count += 1;
+        continue;
+      }
+      if (e.isDirectory()) {
+        out.push(`${'  '.repeat(depth)}📁 ${relPath}/`);
+        count += 1;
+        if (depth < maxDepth) await walk(p, depth + 1);
+      } else {
+        out.push(`${'  '.repeat(depth)}- ${relPath}`);
+        count += 1;
+      }
+    }
+  };
+  await walk(base, 0);
+
+  const result = { agentify_result_for: args.id, ok: true, root: ws.root, path: rel, entries: out.length, truncated: count >= maxEntries };
+  const body = `Agentify fs.list:\n\n${formatResultBlock(result)}\n\`\`\`\n${out.join('\n')}\n\`\`\`\n`;
   for (const m of makeChunkedMessages({ header: 'Agentify Tool Result', body, maxChars: Number(args.maxPostChars || 25_000) || 25_000 })) {
     await sendNoWait(conn, { key, text: m, stopAfterSend: true }).catch(() => {});
     await sleep(350);
@@ -251,6 +325,10 @@ async function executeTool({ stateDir, req, conn }) {
   }
   if (req.tool === 'fs.read') {
     await handleFsRead({ stateDir, key: req.key, args: { ...req.args, id: req.id }, conn });
+    return;
+  }
+  if (req.tool === 'fs.list') {
+    await handleFsList({ stateDir, key: req.key, args: { ...req.args, id: req.id }, conn });
     return;
   }
   const err = new Error('unknown_tool');

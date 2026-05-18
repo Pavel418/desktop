@@ -1,4 +1,8 @@
-* { box-sizing: border-box; }
+* {
+  box-sizing: border-box;
+  scrollbar-color: rgba(122, 137, 165, 0.72) rgba(255,255,255,0.06);
+  scrollbar-width: thin;
+}
 html, body { height: 100%; }
 body {
   margin: 0;
@@ -6,6 +10,14 @@ body {
   background: #0b0d12;
   color: #e9ecf2;
 }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: rgba(255,255,255,0.05); }
+::-webkit-scrollbar-thumb {
+  background: rgba(122, 137, 165, 0.64);
+  border: 2px solid rgba(11, 13, 18, 0.95);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(162, 174, 196, 0.78); }
 
 .app {
   display: flex;
@@ -16,7 +28,8 @@ body {
 .header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
+  gap: 12px;
   padding: 14px 14px 10px;
   border-bottom: 1px solid rgba(255,255,255,0.08);
   background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0));
@@ -33,7 +46,31 @@ body {
 .titles .name { font-weight: 700; letter-spacing: 0.2px; }
 .titles .sub { font-size: 12px; color: rgba(233,236,242,0.72); margin-top: 2px; }
 
-.actions { display: flex; gap: 8px; }
+.actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
+}
+.actions .btn {
+  padding: 8px;
+  white-space: nowrap;
+}
+.iconHeaderBtn {
+  width: 34px;
+  height: 34px;
+  display: inline-grid;
+  place-items: center;
+}
+.icon {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+.iconShowTabs { display: none; }
+.tabsAreHidden .iconHideTabs { display: none; }
+.tabsAreHidden .iconShowTabs { display: block; }
 
 .main {
   padding: 14px;
@@ -49,6 +86,7 @@ body {
   border-radius: 14px;
   padding: 12px;
 }
+.isHidden { display: none; }
 
 .cardTitle { font-weight: 700; margin-bottom: 10px; }
 
@@ -56,6 +94,17 @@ body {
   display: grid;
   grid-template-columns: 1fr;
   gap: 10px;
+}
+.governorIntro {
+  margin-bottom: 14px;
+}
+.governorGrid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+.governorInput {
+  max-width: 112px;
+  text-align: right;
 }
 
 .field .label { font-size: 12px; color: rgba(233,236,242,0.72); margin-bottom: 6px; }
@@ -121,13 +170,105 @@ input::placeholder { color: rgba(233,236,242,0.45); }
 
 .hint { font-size: 12px; color: rgba(233,236,242,0.66); line-height: 1.35; margin-top: 8px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.linkButton {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #93c5fd;
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.linkButton:hover { color: #bfdbfe; }
+.modal {
+  max-width: min(560px, calc(100vw - 32px));
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 12px;
+  padding: 0;
+  background: #10131a;
+  color: #e9ecf2;
+  box-shadow: 0 22px 70px rgba(0,0,0,0.52);
+}
+.modal::backdrop { background: rgba(0,0,0,0.58); }
+.modalPanel { padding: 14px; }
+.modalHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.modalTitle { font-weight: 700; }
+.modalBody {
+  margin-top: 12px;
+  color: rgba(233,236,242,0.78);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.modalBody p { margin: 0 0 10px; }
+.modalBody p:last-child { margin-bottom: 0; }
+.modalActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
 
 .footer {
   border-top: 1px solid rgba(255,255,255,0.08);
-  padding: 10px 14px;
+  padding: 6px 10px;
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
   background: rgba(0,0,0,0.15);
+  min-height: 44px;
 }
-.status { font-size: 12px; color: rgba(233,236,242,0.65); }
+.footerStatus {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.activityLabel {
+  font-size: 12px;
+  font-weight: 700;
+  color: rgba(233,236,242,0.86);
+}
+.status {
+  font-size: 12px;
+  color: rgba(233,236,242,0.7);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.messageLine {
+  font-size: 11px;
+  color: #93c5fd;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.messageLine.isWarn {
+  color: #fbbf24;
+}
+.messageLine.isError {
+  color: #fca5a5;
+}
+.messageLine.isMuted {
+  color: rgba(233,236,242,0.52);
+}
+.compactBtn {
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  border-radius: 10px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+@media (max-width: 420px) {
+  .governorGrid {
+    grid-template-columns: 1fr;
+  }
+}

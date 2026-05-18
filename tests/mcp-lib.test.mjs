@@ -84,6 +84,10 @@ test('mcp-lib: ensureDesktopRunning spawns if serverId mismatches and then recov
   await ensureToken(dir);
   await fs.writeFile(path.join(dir, 'token.txt'), `${token}\n`, 'utf8');
   await writeState({ ok: true, port: 12345, serverId: 'sid-old' }, dir);
+  const fakeElectron = path.join(dir, process.platform === 'win32' ? 'electron.cmd' : 'electron');
+  await fs.writeFile(fakeElectron, '#!/bin/sh\n', 'utf8');
+  const previous = process.env.AGENTIFY_DESKTOP_ELECTRON_BIN;
+  process.env.AGENTIFY_DESKTOP_ELECTRON_BIN = fakeElectron;
 
   let fetchServerId = 'sid-wrong';
   const fetchImpl = makeFetch({ getServerId: () => fetchServerId, acceptToken: token });
@@ -98,7 +102,47 @@ test('mcp-lib: ensureDesktopRunning spawns if serverId mismatches and then recov
     return { unref() {} };
   };
 
-  const conn = await ensureDesktopRunning({ stateDir: dir, fetchImpl, spawnImpl, timeoutMs: 3000, showTabs: true });
-  assert.ok(spawned >= 1);
-  assert.equal(conn.serverId, 'sid-new');
+  try {
+    const conn = await ensureDesktopRunning({ stateDir: dir, fetchImpl, spawnImpl, timeoutMs: 3000, showTabs: true });
+    assert.ok(spawned >= 1);
+    assert.equal(conn.serverId, 'sid-new');
+  } finally {
+    if (previous == null) delete process.env.AGENTIFY_DESKTOP_ELECTRON_BIN;
+    else process.env.AGENTIFY_DESKTOP_ELECTRON_BIN = previous;
+  }
+});
+
+test('mcp-lib: Windows spawn uses shell for electron.cmd', async () => {
+  const dir = await tempDir();
+  const token = 't';
+  await ensureToken(dir);
+  await fs.writeFile(path.join(dir, 'token.txt'), `${token}\n`, 'utf8');
+  await writeState({ ok: true, port: 12345, serverId: 'sid-old' }, dir);
+
+  const fakeElectron = path.join(dir, 'electron.cmd');
+  await fs.writeFile(fakeElectron, '@echo off\n', 'utf8');
+  const previous = process.env.AGENTIFY_DESKTOP_ELECTRON_BIN;
+  process.env.AGENTIFY_DESKTOP_ELECTRON_BIN = fakeElectron;
+
+  let fetchServerId = 'sid-wrong';
+  let sawShell = false;
+  try {
+    const conn = await ensureDesktopRunning({
+      stateDir: dir,
+      fetchImpl: makeFetch({ getServerId: () => fetchServerId, acceptToken: token }),
+      platform: 'win32',
+      spawnImpl: (_cmd, _args, opts) => {
+        sawShell = opts?.shell === true;
+        fetchServerId = 'sid-new';
+        void writeState({ ok: true, port: 12345, serverId: 'sid-new' }, dir);
+        return { unref() {} };
+      },
+      timeoutMs: 3000
+    });
+    assert.equal(conn.serverId, 'sid-new');
+    assert.equal(sawShell, true);
+  } finally {
+    if (previous == null) delete process.env.AGENTIFY_DESKTOP_ELECTRON_BIN;
+    else process.env.AGENTIFY_DESKTOP_ELECTRON_BIN = previous;
+  }
 });

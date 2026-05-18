@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('agentifyDesktop', {
   getState: () => ipcRenderer.invoke('agentify:getState'),

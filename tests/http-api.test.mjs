@@ -187,6 +187,93 @@ test('http-api: tabs list/create/close', async (t) => {
   assert.equal(cl.res.status, 200);
 });
 
+test('http-api: stable key reuses existing vendor tab without model', async (t) => {
+  const created = [{ id: 'perp-1', key: 'perplexity', vendorId: 'perplexity', vendorName: 'Perplexity', url: 'https://www.perplexity.ai/' }];
+  const tabs = {
+    listTabs: () => created.map((t) => ({ ...t })),
+    ensureTab: async ({ key, vendorId, vendorName, url }) => {
+      const existing = created.find((t) => t.key === key);
+      if (existing) return existing.id;
+      const id = `tab-${key}`;
+      created.push({ id, key, vendorId, vendorName, url });
+      return id;
+    },
+    createTab: async () => 'created',
+    closeTab: async () => true,
+    getControllerById: (id) => ({
+      readPageText: async () => `read:${id}`
+    })
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    vendors: [
+      { id: 'chatgpt', name: 'ChatGPT', url: 'https://chatgpt.com/' },
+      { id: 'perplexity', name: 'Perplexity', url: 'https://www.perplexity.ai/' }
+    ],
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+
+  const r1 = await req({ port, token: 'secret', method: 'POST', pth: '/read-page', body: { key: 'perplexity', maxChars: 10 } });
+  assert.equal(r1.res.status, 200);
+  assert.equal(r1.data.tabId, 'perp-1');
+
+  const r2 = await req({ port, token: 'secret', method: 'POST', pth: '/read-page', body: { key: 'perplexity', vendorId: 'chatgpt', maxChars: 10 } });
+  assert.equal(r2.res.status, 409);
+  assert.equal(r2.data.error, 'key_vendor_mismatch');
+});
+
+test('http-api: vendor-only calls reuse a stable vendor tab', async (t) => {
+  const created = [];
+  const tabs = {
+    listTabs: () => created.map((tab) => ({ ...tab })),
+    ensureTab: async ({ key, vendorId, vendorName, url }) => {
+      const existing = created.find((tab) => tab.key === key);
+      if (existing) return existing.id;
+      const id = `tab-${key}`;
+      created.push({ id, key, vendorId, vendorName, url });
+      return id;
+    },
+    createTab: async () => {
+      throw new Error('should_not_create_fresh_vendor_tab');
+    },
+    closeTab: async () => true,
+    getControllerById: (id) => ({
+      readPageText: async () => `read:${id}`
+    })
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    vendors: [
+      { id: 'chatgpt', name: 'ChatGPT', url: 'https://chatgpt.com/' },
+      { id: 'perplexity', name: 'Perplexity', url: 'https://www.perplexity.ai/' }
+    ],
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+
+  const r1 = await req({ port, token: 'secret', method: 'POST', pth: '/read-page', body: { vendorId: 'perplexity', maxChars: 10 } });
+  const r2 = await req({ port, token: 'secret', method: 'POST', pth: '/read-page', body: { vendorId: 'perplexity', maxChars: 10 } });
+
+  assert.equal(r1.res.status, 200);
+  assert.equal(r2.res.status, 200);
+  assert.equal(r1.data.tabId, 'tab-vendor:perplexity');
+  assert.equal(r2.data.tabId, 'tab-vendor:perplexity');
+  assert.equal(created.length, 1);
+});
+
 test('http-api: invalid tabId returns 404', async (t) => {
   const tabs = {
     listTabs: () => [],
@@ -413,4 +500,74 @@ test('http-api: send uses governor too', async (t) => {
   qpm = 100;
   const r3 = await req({ port, token: 'secret', method: 'POST', pth: '/send', body: { text: 'hi3' } });
   assert.equal(r3.res.status, 200);
+});
+
+test('http-api: image-gen waits for generated images and downloads files', async (t) => {
+  const calls = [];
+  const tabs = {
+    listTabs: () => [],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => ({
+      generateImages: async ({ prompt, maxImages, minImages }) => {
+        calls.push({ method: 'generateImages', prompt, maxImages, minImages });
+        return { images: [{ src: 'https://chatgpt.com/backend-api/estuary/content?id=file_x', alt: 'Generated image' }], elapsedMs: 123 };
+      },
+      downloadLastAssistantImages: async ({ maxImages, postprocess, postprocessMode, imageOptions }) => {
+        calls.push({ method: 'downloadLastAssistantImages', maxImages, postprocess, postprocessMode, imageOptions });
+        return [
+          {
+            path: '/tmp/agentify-test.alpha.png',
+            rawPath: '/tmp/agentify-test.png',
+            alt: 'Generated image',
+            mime: 'image/png',
+            source: 'https://chatgpt.com/backend-api/estuary/content?id=file_x',
+            postprocess: { kind: 'checkerboard_to_alpha' }
+          }
+        ];
+      }
+    })
+  };
+
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true }),
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+
+  const r = await req({
+    port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/image-gen',
+    body: { prompt: 'make image', maxImages: 4, minImages: 1, postprocessMode: 'lcd-ink', imageOptions: { columns: 4, rows: 4, cellSize: 128 } }
+  });
+
+  assert.equal(r.res.status, 200);
+  assert.equal(r.data.ok, true);
+  assert.equal(r.data.result.images.length, 1);
+  assert.equal(r.data.result.elapsedMs, 123);
+  assert.equal(r.data.files.length, 1);
+  assert.equal(r.data.files[0].mime, 'image/png');
+  assert.equal(r.data.files[0].path, '/tmp/agentify-test.alpha.png');
+  assert.equal(r.data.files[0].rawPath, '/tmp/agentify-test.png');
+  assert.equal(r.data.files[0].postprocess.kind, 'checkerboard_to_alpha');
+  assert.deepEqual(calls, [
+    { method: 'generateImages', prompt: 'make image', maxImages: 4, minImages: 1 },
+    {
+      method: 'downloadLastAssistantImages',
+      maxImages: 4,
+      postprocess: true,
+      postprocessMode: 'lcd-ink',
+      imageOptions: { columns: 4, rows: 4, cellSize: 128 }
+    }
+  ]);
 });

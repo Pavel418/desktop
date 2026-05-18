@@ -7,22 +7,34 @@
       "status": "supported"
     },
     {
+      "id": "perplexity",
+      "name": "Perplexity",
+      "url": "https://www.perplexity.ai/",
+      "status": "supported"
+    },
+    {
       "id": "claude",
       "name": "Claude",
       "url": "https://claude.ai/",
-      "status": "planned"
+      "status": "supported"
     },
     {
       "id": "grok",
       "name": "Grok",
       "url": "https://grok.com/",
-      "status": "planned"
+      "status": "supported"
     },
     {
       "id": "aistudio",
       "name": "Google AI Studio",
       "url": "https://aistudio.google.com/",
-      "status": "planned"
+      "status": "supported"
+    },
+    {
+      "id": "gemini",
+      "name": "Gemini",
+      "url": "https://gemini.google.com/",
+      "status": "supported"
     }
   ]
 }

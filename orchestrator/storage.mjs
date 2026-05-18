@@ -58,9 +58,21 @@ export async function markHandled(stateDir, { key, id, status, meta = null }) {
   return data.keys[k][i];
 }
 
+function isStaleStarted(entry, { maxAgeMs }) {
+  if (!entry || typeof entry !== 'object') return false;
+  if (String(entry.status || '') !== 'started') return false;
+  const at = Date.parse(String(entry.at || ''));
+  if (!Number.isFinite(at)) return false;
+  return Date.now() - at > maxAgeMs;
+}
+
 export async function isHandled(stateDir, { key, id }) {
   const data = await loadHandled(stateDir);
-  return !!data?.keys?.[String(key)]?.[String(id)];
+  const entry = data?.keys?.[String(key)]?.[String(id)] || null;
+  if (!entry) return false;
+  // If the orchestrator died mid-run, allow retry after a while instead of blocking forever.
+  if (isStaleStarted(entry, { maxAgeMs: 45 * 60_000 })) return false;
+  return true;
 }
 
 export async function loadSessions(stateDir) {

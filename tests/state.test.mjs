@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { ensureToken, readToken, writeToken } from '../state.mjs';
+import { defaultSettings, ensureToken, normalizeSettings, readToken, writeToken } from '../state.mjs';
 
 async function tempDir() {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-desktop-test-'));
@@ -28,3 +28,15 @@ test('state: writeToken overrides existing', async () => {
   assert.equal(await readToken(dir), 'def456');
 });
 
+test('state: defaults to Chrome CDP backend', async () => {
+  const settings = defaultSettings();
+  assert.equal(settings.browserBackend, 'chrome-cdp');
+  assert.equal(settings.chromeProfileMode, 'agentify');
+  assert.equal(settings.allowAuthPopups, true);
+
+  const normalized = normalizeSettings({ browserBackend: 'electron', chromeDebugPort: 9333, chromeProfileMode: 'attach' });
+  assert.equal(normalized.browserBackend, 'electron');
+  assert.equal(normalized.chromeDebugPort, 9333);
+  assert.equal(normalized.chromeProfileMode, 'attach');
+  assert.equal(normalizeSettings({ chromeProfileMode: 'persistent' }).chromeProfileMode, 'persistent');
+});

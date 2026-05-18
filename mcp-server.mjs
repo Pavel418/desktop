@@ -22,24 +22,24 @@ registerTool(
   'agentify_query',
   {
     description:
-      'Send a prompt to the local Agentify Desktop session (ChatGPT web) and return the latest assistant response. If a CAPTCHA/login challenge appears, the desktop window will ask for user intervention and resume automatically.',
+      'Send a prompt to a local Agentify Desktop browser session and return the latest assistant response. If a CAPTCHA/login challenge appears, the browser window will ask for user intervention and resume automatically.',
     inputSchema: {
       model: z.string().optional().describe('Target model/provider hint (e.g., "chatgpt").'),
+      vendorId: z.string().optional().describe('Target vendor id (chatgpt, perplexity, claude, aistudio, gemini, grok).'),
       tabId: z.string().optional().describe('Tab/session id to use (for parallel jobs).'),
       key: z.string().optional().describe('Stable tab key (e.g., project name); creates a tab if missing.'),
-      prompt: z.string().describe('Prompt to send to ChatGPT.'),
+      prompt: z.string().describe('Prompt to send to the selected AI web UI.'),
       attachments: z.array(z.string()).optional().describe('Local file paths to upload before sending the prompt.'),
       timeoutMs: z.number().optional().describe('Maximum time to wait for completion.')
     }
   },
-  async ({ model, tabId, key, prompt, attachments, timeoutMs }) => {
-    void model;
+  async ({ model, vendorId, tabId, key, prompt, attachments, timeoutMs }) => {
     const conn = await getConn();
     const data = await requestJson({
       ...conn,
       method: 'POST',
       path: '/query',
-      body: { tabId, key, prompt, attachments: attachments || [], timeoutMs: timeoutMs || 10 * 60_000 }
+      body: { tabId, key, model, vendorId, prompt, attachments: attachments || [], timeoutMs: timeoutMs || 10 * 60_000 }
     });
     const structuredContent = {
       text: data.result?.text || '',
@@ -60,16 +60,17 @@ registerTool(
     inputSchema: {
       tabId: z.string().optional().describe('Tab/session id to use.'),
       key: z.string().optional().describe('Stable tab key; creates a tab if missing.'),
+      vendorId: z.string().optional().describe('Target vendor id when creating a tab for this key.'),
       maxChars: z.number().optional().describe('Maximum characters to return.')
     }
   },
-  async ({ tabId, key, maxChars }) => {
+  async ({ tabId, key, vendorId, maxChars }) => {
     const conn = await getConn();
     const data = await requestJson({
       ...conn,
       method: 'POST',
       path: '/read-page',
-      body: { tabId, key, maxChars: maxChars || 200_000 }
+      body: { tabId, key, vendorId, maxChars: maxChars || 200_000 }
     });
     return { content: [{ type: 'text', text: data.text || '' }] };
   }
@@ -82,12 +83,13 @@ registerTool(
     inputSchema: {
       tabId: z.string().optional().describe('Tab/session id to use.'),
       key: z.string().optional().describe('Stable tab key; creates a tab if missing.'),
+      vendorId: z.string().optional().describe('Target vendor id when creating a tab for this key.'),
       url: z.string().describe('URL to navigate to.')
     }
   },
-  async ({ tabId, key, url }) => {
+  async ({ tabId, key, vendorId, url }) => {
     const conn = await getConn();
-    const data = await requestJson({ ...conn, method: 'POST', path: '/navigate', body: { tabId, key, url } });
+    const data = await requestJson({ ...conn, method: 'POST', path: '/navigate', body: { tabId, key, vendorId, url } });
     return { content: [{ type: 'text', text: data.url || 'ok' }], structuredContent: data };
   }
 );
@@ -96,16 +98,17 @@ registerTool(
   'agentify_ensure_ready',
   {
     description:
-      'Wait until ChatGPT is ready for input (e.g., after login/CAPTCHA). Triggers local user handoff if needed and resumes when the prompt textarea is visible.',
+      'Wait until the selected AI web UI is ready for input (e.g., after login/CAPTCHA). Triggers local user handoff if needed and resumes when the prompt textarea is visible.',
     inputSchema: {
       tabId: z.string().optional().describe('Tab/session id to use.'),
       key: z.string().optional().describe('Stable tab key; creates a tab if missing.'),
+      vendorId: z.string().optional().describe('Target vendor id when creating a tab for this key.'),
       timeoutMs: z.number().optional().describe('Maximum time to wait for readiness.')
     }
   },
-  async ({ tabId, key, timeoutMs }) => {
+  async ({ tabId, key, vendorId, timeoutMs }) => {
     const conn = await getConn();
-    const data = await requestJson({ ...conn, method: 'POST', path: '/ensure-ready', body: { tabId, key, timeoutMs: timeoutMs || 10 * 60_000 } });
+    const data = await requestJson({ ...conn, method: 'POST', path: '/ensure-ready', body: { tabId, key, vendorId, timeoutMs: timeoutMs || 10 * 60_000 } });
     return { content: [{ type: 'text', text: JSON.stringify(data.state || {}, null, 2) }], structuredContent: data };
   }
 );
@@ -114,21 +117,21 @@ registerTool(
   'agentify_show',
   {
     description: 'Bring the Agentify Desktop window to the front.',
-    inputSchema: { tabId: z.string().optional(), key: z.string().optional() }
+    inputSchema: { tabId: z.string().optional(), key: z.string().optional(), vendorId: z.string().optional() }
   },
-  async ({ tabId, key }) => {
+  async ({ tabId, key, vendorId }) => {
     const conn = await getConn();
-    await requestJson({ ...conn, method: 'POST', path: '/show', body: { tabId, key } });
+    await requestJson({ ...conn, method: 'POST', path: '/show', body: { tabId, key, vendorId } });
     return { content: [{ type: 'text', text: 'ok' }] };
   }
 );
 
 registerTool(
   'agentify_hide',
-  { description: 'Minimize the Agentify Desktop window.', inputSchema: { tabId: z.string().optional(), key: z.string().optional() } },
-  async ({ tabId, key }) => {
+  { description: 'Minimize the Agentify Desktop window.', inputSchema: { tabId: z.string().optional(), key: z.string().optional(), vendorId: z.string().optional() } },
+  async ({ tabId, key, vendorId }) => {
     const conn = await getConn();
-    await requestJson({ ...conn, method: 'POST', path: '/hide', body: { tabId, key } });
+    await requestJson({ ...conn, method: 'POST', path: '/hide', body: { tabId, key, vendorId } });
     return { content: [{ type: 'text', text: 'ok' }] };
   }
 );
@@ -151,28 +154,46 @@ registerTool(
   'agentify_image_gen',
   {
     description:
-      'Generate images via ChatGPT web UI (best-effort): sends the prompt, then downloads any images from the latest assistant message to a local folder and returns file paths.',
+      'Generate images via the selected AI web UI, then download them to local files. Optional post-processing can remove fake checkerboard/chroma-key backgrounds or normalize fixed-grid monochrome sheets.',
     inputSchema: {
       tabId: z.string().optional().describe('Tab/session id to use.'),
       key: z.string().optional().describe('Stable tab key; creates a tab if missing.'),
-      prompt: z.string().describe('Prompt to send to ChatGPT for image generation.'),
+      vendorId: z.string().optional().describe('Target vendor id when creating a tab for this key.'),
+      prompt: z.string().describe('Prompt to send for image generation.'),
       timeoutMs: z.number().optional().describe('Maximum time to wait for completion.'),
-      maxImages: z.number().optional().describe('Maximum images to download.')
+      maxImages: z.number().optional().describe('Maximum images to download.'),
+      postprocessMode: z.enum(['auto', 'chroma-key', 'lcd-ink', 'none']).optional().describe('Post-processing mode. Use chroma-key for flat #FF00FF/#00FF00 keyed backgrounds; use lcd-ink for black-only transparent grid images.'),
+      chromaKey: z.string().optional().describe('Hex chroma-key color to remove when postprocessMode="chroma-key"; default #FF00FF.'),
+      columns: z.number().optional().describe('Grid image columns for lcd-ink mode.'),
+      rows: z.number().optional().describe('Grid image rows for lcd-ink mode.'),
+      cellSize: z.number().optional().describe('Output cell size in pixels for lcd-ink mode.')
     }
   },
-  async ({ tabId, key, prompt, timeoutMs, maxImages }) => {
+  async ({ tabId, key, vendorId, prompt, timeoutMs, maxImages, postprocessMode, chromaKey, columns, rows, cellSize }) => {
     const conn = await getConn();
-    const q = await requestJson({
+    const mode = postprocessMode === 'none' ? 'auto' : postprocessMode || 'auto';
+    const data = await requestJson({
       ...conn,
       method: 'POST',
-      path: '/query',
-      body: { tabId, key, prompt, attachments: [], timeoutMs: timeoutMs || 10 * 60_000 }
+      path: '/image-gen',
+      body: {
+        tabId,
+        key,
+        vendorId,
+        prompt,
+        attachments: [],
+        timeoutMs: timeoutMs || 10 * 60_000,
+        maxImages: maxImages || 6,
+        minImages: 1,
+        postprocess: postprocessMode !== 'none',
+        postprocessMode: mode,
+        imageOptions: { columns, rows, cellSize, chromaKey }
+      }
     });
-    const d = await requestJson({ ...conn, method: 'POST', path: '/download-images', body: { tabId: q.tabId || tabId, maxImages: maxImages || 6 } });
-    const structuredContent = { text: q.result?.text || '', files: d.files || [] };
+    const structuredContent = { files: data.files || [], imageCount: data.result?.images?.length || 0, elapsedMs: data.result?.elapsedMs || null };
     return {
       content: [{ type: 'text', text: JSON.stringify(structuredContent, null, 2) }],
-      structuredContent: { tabId: q.tabId || tabId || null, ...structuredContent }
+      structuredContent: { tabId: data.tabId || tabId || null, ...structuredContent }
     };
   }
 );
@@ -185,12 +206,13 @@ registerTool(
     inputSchema: {
       tabId: z.string().optional().describe('Tab/session id to use.'),
       key: z.string().optional().describe('Stable tab key; creates a tab if missing.'),
+      vendorId: z.string().optional().describe('Target vendor id when creating a tab for this key.'),
       maxImages: z.number().optional().describe('Maximum images to download.')
     }
   },
-  async ({ tabId, key, maxImages }) => {
+  async ({ tabId, key, vendorId, maxImages }) => {
     const conn = await getConn();
-    const d = await requestJson({ ...conn, method: 'POST', path: '/download-images', body: { tabId, key, maxImages: maxImages || 6 } });
+    const d = await requestJson({ ...conn, method: 'POST', path: '/download-images', body: { tabId, key, vendorId, maxImages: maxImages || 6 } });
     const structuredContent = { files: d.files || [] };
     return { content: [{ type: 'text', text: JSON.stringify(structuredContent, null, 2) }], structuredContent };
   }
@@ -213,11 +235,22 @@ registerTool(
   'agentify_tab_create',
   {
     description: 'Create (or ensure) a tab/session for a given key.',
-    inputSchema: { key: z.string().optional(), name: z.string().optional(), show: z.boolean().optional().describe('Show the tab window immediately.') }
+    inputSchema: {
+      key: z.string().optional(),
+      name: z.string().optional(),
+      vendorId: z.string().optional().describe('Vendor id: chatgpt, perplexity, claude, aistudio, gemini, or grok.'),
+      show: z.boolean().optional().describe('Focus the tab immediately. Does not create a separate browser window.'),
+      newWindow: z.boolean().optional().describe('Create a separate browser window instead of a tab. Leave false unless the governor explicitly needs parallel visible windows.')
+    }
   },
-  async ({ key, name, show }) => {
+  async ({ key, name, vendorId, show, newWindow }) => {
     const conn = await getConn();
-    const data = await requestJson({ ...conn, method: 'POST', path: '/tabs/create', body: { key, name, show: typeof show === 'boolean' ? show : undefined } });
+    const data = await requestJson({
+      ...conn,
+      method: 'POST',
+      path: '/tabs/create',
+      body: { key, name, vendorId, show: typeof show === 'boolean' ? show : undefined, newWindow: newWindow === true }
+    });
     return { content: [{ type: 'text', text: data.tabId || '' }], structuredContent: data };
   }
 );

@@ -272,12 +272,15 @@ test('chrome-cdp-backend: session close is best-effort when closeTarget fails', 
 
 test('chrome-cdp-backend: start cleans up spawned chrome process when CDP connect fails', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-chrome-start-fail-'));
-  const scriptPath = path.join(tmpDir, 'fake-chrome.sh');
-  await fs.writeFile(scriptPath, '#!/bin/sh\nsleep 30\n', { encoding: 'utf8', mode: 0o755 });
+  let executablePath = process.execPath;
+  if (process.platform !== 'win32') {
+    executablePath = path.join(tmpDir, 'fake-chrome.sh');
+    await fs.writeFile(executablePath, '#!/bin/sh\nsleep 30\n', { encoding: 'utf8', mode: 0o755 });
+  }
 
   const backend = new ChromeCdpBrowserBackend({
     stateDir: tmpDir,
-    executablePath: scriptPath,
+    executablePath,
     debugPort: 45999
   });
 

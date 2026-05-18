@@ -105,7 +105,7 @@ test('mcp-lib: ensureDesktopRunning spawns if serverId mismatches and then recov
   assert.equal(conn.serverId, 'sid-new');
 });
 
-test('mcp-lib: Windows spawn uses shell for electron.cmd', async () => {
+test('mcp-lib: Windows spawn uses Node-hosted Electron CLI without shell', async () => {
   const dir = await tempDir();
   const token = 't';
   await ensureToken(dir);
@@ -113,13 +113,17 @@ test('mcp-lib: Windows spawn uses shell for electron.cmd', async () => {
   await writeState({ ok: true, port: 12345, serverId: 'sid-old' }, dir);
 
   let fetchServerId = 'sid-wrong';
-  let sawShell = false;
+  let spawnedCmd = null;
+  let spawnedArgs = null;
+  let spawnShell = null;
   const conn = await ensureDesktopRunning({
     stateDir: dir,
     fetchImpl: makeFetch({ getServerId: () => fetchServerId, acceptToken: token }),
     platform: 'win32',
-    spawnImpl: (_cmd, _args, opts) => {
-      sawShell = opts?.shell === true;
+    spawnImpl: (cmd, args, opts) => {
+      spawnedCmd = cmd;
+      spawnedArgs = args;
+      spawnShell = opts?.shell;
       fetchServerId = 'sid-new';
       void writeState({ ok: true, port: 12345, serverId: 'sid-new' }, dir);
       return { unref() {} };
@@ -127,7 +131,11 @@ test('mcp-lib: Windows spawn uses shell for electron.cmd', async () => {
     timeoutMs: 3000
   });
   assert.equal(conn.serverId, 'sid-new');
-  assert.equal(sawShell, true);
+  const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  assert.equal(spawnedCmd, process.execPath);
+  assert.equal(spawnedArgs?.[0], path.join(packageRoot, 'node_modules', 'electron', 'cli.js'));
+  assert.equal(spawnedArgs?.[1], path.join(packageRoot, 'main.mjs'));
+  assert.equal(spawnShell, false);
 });
 
 test('mcp-lib: ensureDesktopRunning resolves bundled electron relative to desktop package, not cwd', async () => {
@@ -157,8 +165,9 @@ test('mcp-lib: ensureDesktopRunning resolves bundled electron relative to deskto
     assert.equal(conn.serverId, 'sid-new');
     assert.equal(path.isAbsolute(spawnedCmd), true);
     const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-    assert.equal(spawnedCmd, path.join(packageRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'electron.cmd' : 'electron'));
-    assert.equal(spawnedArgs?.[0], path.join(packageRoot, 'main.mjs'));
+    assert.equal(spawnedCmd, process.execPath);
+    assert.equal(spawnedArgs?.[0], path.join(packageRoot, 'node_modules', 'electron', 'cli.js'));
+    assert.equal(spawnedArgs?.[1], path.join(packageRoot, 'main.mjs'));
   } finally {
     process.chdir(originalCwd);
   }

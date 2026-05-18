@@ -270,6 +270,19 @@ Agentify Desktop does not bypass CAPTCHAs or use third-party solvers. If a verif
 
 If your account uses Google, Microsoft, or Apple SSO, keep auth popups enabled in the Control Center. If embedded login remains unreliable, use Chrome CDP.
 
+## Windows Notes
+
+Use Node.js 20 or 22 on Windows. Agentify Desktop is tested against Windows in CI, including the npm CLI launcher path.
+
+Chrome CDP is still the recommended backend on Windows because Google and Microsoft SSO can block embedded Electron login. Agentify looks for Chrome, Chromium, Brave, and Microsoft Edge in the usual install locations and on `PATH`.
+
+If Chrome CDP cannot find your browser, set the executable explicitly:
+
+```powershell
+$env:AGENTIFY_DESKTOP_CHROME_BIN = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+npx @agentify/desktop
+```
+
 ## Local Data And Privacy
 
 Agentify Desktop is local-first:

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3 - 2026-05-17
+
+### Fixed
+- Fixed the Windows npm/global GUI launcher path by running Electron through its package CLI with Node instead of the Windows `.cmd` shim.
+- Applied the same safer Electron launch resolution to MCP desktop auto-start.
+
+### Changed
+- Added Windows CI coverage for install/test and the npm CLI help path.
+- Added README Windows notes for Chrome CDP and explicit browser executable configuration.
+
 ## 0.2.2 - 2026-05-17
 
 ### Fixed

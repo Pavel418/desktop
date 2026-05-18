@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.4 - 2026-05-17
+
+### Fixed
+- Fixed Windows Chrome CDP startup by spawning the Chrome/Edge/Brave executable directly without a shell.
+- Added a regression test to keep Chrome CDP spawn options shell-free on every platform.
+
 ## 0.2.3 - 2026-05-17
 
 ### Fixed

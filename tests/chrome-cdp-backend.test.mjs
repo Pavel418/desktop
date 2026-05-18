@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { ChromeCdpBrowserBackend, ChromeCdpConnection } from '../chrome-cdp-backend.mjs';
+import { ChromeCdpBrowserBackend, ChromeCdpConnection, chromeSpawnOptions } from '../chrome-cdp-backend.mjs';
 
 class MockWebSocket {
   constructor() {
@@ -82,6 +82,12 @@ test('chrome-cdp-backend: pending commands reject when websocket closes', async 
   ws.close();
 
   await assert.rejects(async () => await pending, /chrome_cdp_disconnected/);
+});
+
+test('chrome-cdp-backend: Chrome spawn does not use shell on any platform', () => {
+  const opts = chromeSpawnOptions();
+  assert.equal(opts.stdio, 'ignore');
+  assert.equal(Object.hasOwn(opts, 'shell'), false);
 });
 
 test('chrome-cdp-backend: connect rejects if websocket closes before open', async () => {

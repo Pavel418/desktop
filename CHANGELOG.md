@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.2 - 2026-05-17
+
+### Fixed
+- Restored the full governor UI from the prepared release work: digit-only inputs, narrow two-column layout, safe default values, and protection against live refresh wiping unsaved edits.
+- Added the missing risk-disclaimer modal linked from the governor acknowledgement text.
+- Restored the compact two-line footer with activity summary and color-coded status messages.
+- Added bulk tab visibility bridge methods so the header show/hide-all control can use one desktop IPC call when available.
+- Made Chrome CDP the first browser backend option in the Control Center.
+
+### Verified
+- Control Center script syntax check passed.
+- Public package dry-run excludes private workflows.
+
 ## 0.2.1 - 2026-05-17
 
 ### Fixed

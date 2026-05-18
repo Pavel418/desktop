@@ -141,26 +141,26 @@
         </section>
 
         <section class="card">
-          <div class="cardTitle">Automation limits</div>
-          <div class="hint">
+          <div class="cardTitle">Settings (governor)</div>
+          <div class="hint governorIntro">
             These defaults exist to reduce accidental high-rate automation. Automating web UIs may violate website terms; use responsibly.
           </div>
-          <div class="grid settingsGrid">
+          <div class="grid governorGrid">
             <label class="field">
               <div class="label">Max in-flight queries</div>
-              <input id="setMaxInflight" class="compactNum" type="number" min="1" max="12" step="1" />
+              <input id="setMaxInflight" class="governorInput" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" data-min="1" data-max="12" value="2" />
             </label>
             <label class="field">
               <div class="label">Max queries per minute</div>
-              <input id="setQpm" class="compactNum" type="number" min="1" max="600" step="1" />
+              <input id="setQpm" class="governorInput" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" data-min="1" data-max="600" value="12" />
             </label>
             <label class="field">
               <div class="label">Min gap per tab (ms)</div>
-              <input id="setTabGap" class="compactNum" type="number" min="0" max="60000" step="50" />
+              <input id="setTabGap" class="governorInput" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" data-min="0" data-max="60000" value="1200" />
             </label>
             <label class="field">
               <div class="label">Min global gap (ms)</div>
-              <input id="setGlobalGap" class="compactNum" type="number" min="0" max="10000" step="10" />
+              <input id="setGlobalGap" class="governorInput" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" data-min="0" data-max="10000" value="200" />
             </label>
           </div>
           <div class="row">
@@ -176,10 +176,10 @@
             </label>
           </div>
           <div class="row">
-            <label class="checkbox">
+            <div class="checkbox">
               <input id="setAcknowledge" type="checkbox" />
-              <span>I understand the risks and want to change these limits</span>
-            </label>
+              <span>I understand the <button id="btnRiskDetails" class="linkButton" type="button">risks</button> and want to change these limits</span>
+            </div>
             <div class="btnRow">
               <button id="btnResetSettings" class="btn secondary">Reset</button>
               <button id="btnSaveSettings" class="btn primary" disabled>Save</button>
@@ -197,8 +197,8 @@
             <label class="field">
               <div class="label">Browser backend</div>
               <select id="setBrowserBackend">
-                <option value="electron">Electron embedded tabs</option>
                 <option value="chrome-cdp">Chrome CDP (better SSO)</option>
+                <option value="electron">Electron embedded tabs</option>
               </select>
               <div class="fieldHelp">Use `chrome-cdp` for Google/Microsoft/Apple SSO and real Chrome profile sessions.</div>
             </label>
@@ -219,8 +219,35 @@
         </section>
       </main>
 
+      <dialog id="riskModal" class="modal">
+        <div class="modalPanel">
+          <div class="modalHeader">
+            <div class="modalTitle">Automation risk controls</div>
+            <button id="btnCloseRiskModal" class="btn secondary compactBtn" type="button" aria-label="Close">Close</button>
+          </div>
+          <div class="modalBody">
+            <p>
+              Agentify Desktop controls browser tabs on your machine. High-frequency tab automation can accidentally send repeated prompts,
+              trigger abuse systems, consume account quota, or violate a website's terms of use.
+            </p>
+            <p>
+              The governor reduces those risks by limiting concurrent prompts, capping prompts per minute, spacing requests to the same tab,
+              and enforcing a short global gap between sends. CAPTCHA, login, and auth challenges pause automation and bring the tab forward
+              so you can resolve them manually.
+            </p>
+            <p>
+              These controls are guardrails, not permission to ignore service limits. Keep the defaults unless you have a specific reason,
+              and raise limits only for websites and accounts where that activity is allowed.
+            </p>
+          </div>
+        </div>
+      </dialog>
+
       <footer class="footer">
-        <div id="statusLine" class="status">Loading…</div>
+        <div class="footerStatus">
+          <div id="statusLine" class="status"><span class="activityLabel">Activity:</span> Starting Agentify Desktop…</div>
+          <div id="messageLine" class="messageLine">Loading…</div>
+        </div>
       </footer>
     </div>
 

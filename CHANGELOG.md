@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 - 2026-07-20
+
+### Changed
+- Repurposed the project into a single headless batch script (`run-batch.mjs`): walk directories of PDFs, send each PDF + a per-directory Python template into its own ChatGPT chat, chain a generated schema file across a directory's PDFs, and download the generated files. Entry directories run in parallel; PDFs within a directory run sequentially.
+- Configuration is now a `batch.config.json` describing the entry directories.
+
+### Removed
+- Removed the MCP server, the Codex orchestrator, the Electron GUI / Control Center, the local HTTP API, the Electron browser backend, and the context-packer / bundle-store / artifact-store / watch-folder features. Only the Chrome-CDP browser backend and the ChatGPT controller are retained.
+- Dropped all npm dependencies (`electron`, `@modelcontextprotocol/sdk`, `zod`, `electron-builder`); the tool now runs on Node built-ins only.
+
 ## 0.2.4 - 2026-05-17
 
 ### Fixed

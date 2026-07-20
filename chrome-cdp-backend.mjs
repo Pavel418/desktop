@@ -403,34 +403,132 @@ class ChromeCdpPageAdapter {
   }
 
   async setFileInputFiles(files) {
-    let lastNodeIds = [];
+    let lastFound = 0;
     for (let attempt = 0; attempt < 10; attempt++) {
       const { root } = await this.client.send('DOM.getDocument', { depth: 12, pierce: true }, this.sessionId);
-      const q = await this.client.send('DOM.querySelectorAll', { nodeId: root.nodeId, selector: 'input[type="file"]' }, this.sessionId);
-      const nodeIds = Array.isArray(q?.nodeIds) ? q.nodeIds : [];
-      lastNodeIds = nodeIds;
-      if (!nodeIds.length) {
+      // Prefer the composer's real upload input; fall back to any file input.
+      // Set exactly ONE input — setting several submits the same files repeatedly,
+      // which pops a duplicate-file dialog and steals focus from the composer.
+      const ordered = [];
+      for (const sel of ['input[type="file"]#upload-files', 'form input[type="file"]', 'input[type="file"]']) {
+        const q = await this.client.send('DOM.querySelectorAll', { nodeId: root.nodeId, selector: sel }, this.sessionId);
+        for (const id of (Array.isArray(q?.nodeIds) ? q.nodeIds : [])) if (!ordered.includes(id)) ordered.push(id);
+      }
+      lastFound = ordered.length;
+      if (!ordered.length) {
         await sleep(180);
         continue;
       }
-
-      let lastErr = null;
-      for (const nodeId of [...nodeIds].reverse()) {
+      for (const nodeId of ordered) {
         try {
           await this.client.send('DOM.setFileInputFiles', { nodeId, files }, this.sessionId);
-          lastErr = null;
-          break;
-        } catch (error) {
-          lastErr = error;
-        }
+          return { found: ordered.length, set: 1 };
+        } catch {}
       }
-      if (!lastErr) return;
       await sleep(180);
     }
 
     const err = new Error('missing_file_input');
-    err.data = { selector: 'input[type=file]', found: lastNodeIds.length };
+    err.data = { selector: 'input[type=file]', found: lastFound };
     throw err;
+  }
+
+  // ChatGPT renders generated files as clickable "entity" buttons (aria-label =
+  // filename). Clicking one opens a full-screen preview that, once loaded, exposes
+  // a "Download" button. For each file: open preview → wait for it to load → click
+  // Download → capture the download via CDP → close the preview.
+  async downloadEntityFiles({ outDir, previewTimeoutMs = 120_000, downloadTimeoutMs = 60_000, debug = () => {} } = {}) {
+    await fs.mkdir(outDir, { recursive: true });
+    try {
+      await this.client.send('Browser.setDownloadBehavior', { behavior: 'allowAndName', downloadPath: outDir, eventsEnabled: true });
+    } catch {
+      try { await this.client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: outDir }, this.sessionId); } catch {}
+    }
+
+    const findLabels = `(() => {
+      const nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
+      const last = nodes[nodes.length - 1];
+      if (!last) return [];
+      const out = [];
+      for (const b of Array.from(last.querySelectorAll('button[aria-label]'))) {
+        const label = (b.getAttribute('aria-label') || '').trim();
+        const cls = String(b.className || '');
+        if (/\\.[A-Za-z0-9]{1,8}$/.test(label) && /behavior-btn|text-token-text-link/.test(cls)) out.push(label);
+      }
+      return Array.from(new Set(out));
+    })()`;
+    const labels = await this.evaluate(findLabels);
+    debug(`found ${Array.isArray(labels) ? labels.length : 0} file button(s): ${JSON.stringify(labels)}`);
+    if (!Array.isArray(labels) || !labels.length) return [];
+
+    const closePreview = async () => {
+      await this.evaluate(`(() => {
+        const b = document.querySelector('[data-testid="close-button"]')
+          || Array.from(document.querySelectorAll('[role="dialog"] button,[role="dialog"] [role="button"]')).find(x => /^close$/i.test((x.getAttribute('aria-label')||'').trim()));
+        if (b) { b.click(); return true; } return false;
+      })()`).catch(() => {});
+      await sleep(700);
+    };
+
+    const saved = [];
+    for (const label of labels) {
+      // Open the preview for this file.
+      const opened = await this.evaluate(`(() => {
+        const nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
+        const last = nodes[nodes.length - 1];
+        if (!last) return false;
+        const b = Array.from(last.querySelectorAll('button[aria-label]')).find(x => (x.getAttribute('aria-label') || '').trim() === ${JSON.stringify(label)});
+        if (b) { b.click(); return true; } return false;
+      })()`);
+      if (!opened) { debug(`entity button "${label}" not found`); continue; }
+
+      // Wait for the preview to finish "Preparing preview..." and expose Download.
+      let ready = false;
+      const startWait = Date.now();
+      while (Date.now() - startWait < previewTimeoutMs) {
+        await sleep(1200);
+        const st = await this.evaluate(`(() => {
+          const d = document.querySelectorAll('[role="dialog"]'); const l = d[d.length - 1];
+          if (!l) return { none: true };
+          const t = (l.innerText || '');
+          const hasDownload = Array.from(l.querySelectorAll('button,[role="button"]')).some(b => /^download$/i.test((b.getAttribute('aria-label')||'').trim()));
+          return { preparing: /preparing preview/i.test(t), hasDownload };
+        })()`);
+        if (!st.none && !st.preparing && st.hasDownload) { ready = true; break; }
+      }
+      if (!ready) { debug(`preview for "${label}" not ready in time`); await closePreview(); continue; }
+
+      // Arm download capture, then click the Download button.
+      const capture = new Promise((resolve) => {
+        let guid = null; let name = null;
+        const offBegin = this.client.on('Browser.downloadWillBegin', (p) => { if (!guid) { guid = p.guid; name = p.suggestedFilename || label; } });
+        const offProg = this.client.on('Browser.downloadProgress', (p) => {
+          if (guid && p.guid === guid && (p.state === 'completed' || p.state === 'canceled')) { offBegin(); offProg(); resolve({ guid, name, state: p.state }); }
+        });
+        setTimeout(() => { offBegin(); offProg(); resolve(guid ? { guid, name, state: 'timeout' } : null); }, downloadTimeoutMs);
+      });
+      await this.evaluate(`(() => {
+        const d = document.querySelectorAll('[role="dialog"]'); const l = d[d.length - 1]; if (!l) return false;
+        const b = Array.from(l.querySelectorAll('button,[role="button"]')).find(x => /^download$/i.test((x.getAttribute('aria-label')||'').trim()));
+        if (b) { b.click(); return true; } return false;
+      })()`);
+      const res = await capture;
+      debug(`download "${label}" -> ${res ? res.state : 'no-event'}`);
+
+      if (res && res.guid && res.state === 'completed') {
+        const src = path.join(outDir, res.guid);
+        const cleaned = String(res.name || label).replace(/[\\/:*?"<>|]+/g, '-');
+        const parsed = path.parse(cleaned);
+        let finalName = cleaned;
+        for (let s = 1; s < 1000; s++) {
+          try { await fs.access(path.join(outDir, finalName)); finalName = `${parsed.name}-${s}${parsed.ext}`; } catch { break; }
+        }
+        try { await fs.rename(src, path.join(outDir, finalName)); saved.push({ path: path.join(outDir, finalName), name: finalName }); }
+        catch { try { await fs.access(path.join(outDir, cleaned)); saved.push({ path: path.join(outDir, cleaned), name: cleaned }); } catch {} }
+      }
+      await closePreview();
+    }
+    return saved;
   }
 
   async bringToFront() {

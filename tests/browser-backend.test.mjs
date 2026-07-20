@@ -2,8 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  normalizeBrowserBackend,
-  resolveBrowserBackend,
   resolveChromeDebugPort,
   resolveChromeExecutablePath,
   resolveChromeProfileMode,
@@ -11,27 +9,19 @@ import {
 } from '../browser-backend.mjs';
 import { buildChromeLaunchArgs, defaultChromeUserDataDir } from '../chrome-cdp-backend.mjs';
 
-test('browser-backend: normalizes aliases', () => {
-  assert.equal(normalizeBrowserBackend('chrome'), 'chrome-cdp');
-  assert.equal(normalizeBrowserBackend('cdp'), 'chrome-cdp');
-  assert.equal(normalizeBrowserBackend('electron'), 'electron');
-  assert.equal(normalizeBrowserBackend('unknown'), 'chrome-cdp');
-  assert.equal(normalizeBrowserBackend(''), 'chrome-cdp');
-});
-
-test('browser-backend: argv overrides env and settings', () => {
-  const value = resolveBrowserBackend({
-    argv: ['node', 'main.mjs', '--browser-backend', 'chrome-cdp'],
-    env: { AGENTIFY_DESKTOP_BROWSER_BACKEND: 'electron' },
-    settings: { browserBackend: 'electron' }
+test('browser-backend: argv overrides env and settings for chrome binary', () => {
+  const value = resolveChromeExecutablePath({
+    argv: ['node', 'run-batch.mjs', '--chrome-binary', '/opt/chrome'],
+    env: { AGENTIFY_DESKTOP_CHROME_BIN: '/tmp/chrome' },
+    settings: { chromeExecutablePath: '/settings/chrome' }
   });
-  assert.equal(value, 'chrome-cdp');
+  assert.equal(value, '/opt/chrome');
 });
 
 test('browser-backend: resolves chrome debug port and binary path', () => {
   assert.equal(
     resolveChromeDebugPort({
-      argv: ['node', 'main.mjs'],
+      argv: ['node', 'run-batch.mjs'],
       env: { AGENTIFY_DESKTOP_CHROME_DEBUG_PORT: '9333' },
       settings: { chromeDebugPort: 9444 }
     }),
@@ -39,7 +29,7 @@ test('browser-backend: resolves chrome debug port and binary path', () => {
   );
   assert.equal(
     resolveChromeExecutablePath({
-      argv: ['node', 'main.mjs'],
+      argv: ['node', 'run-batch.mjs'],
       env: { AGENTIFY_DESKTOP_CHROME_BIN: '/tmp/chrome' },
       settings: {}
     }),
@@ -47,7 +37,7 @@ test('browser-backend: resolves chrome debug port and binary path', () => {
   );
   assert.equal(
     resolveChromeProfileMode({
-      argv: ['node', 'main.mjs'],
+      argv: ['node', 'run-batch.mjs'],
       env: { AGENTIFY_DESKTOP_CHROME_PROFILE_MODE: 'existing' },
       settings: {}
     }),
@@ -55,7 +45,7 @@ test('browser-backend: resolves chrome debug port and binary path', () => {
   );
   assert.equal(
     resolveChromeProfileName({
-      argv: ['node', 'main.mjs'],
+      argv: ['node', 'run-batch.mjs'],
       env: { AGENTIFY_DESKTOP_CHROME_PROFILE_NAME: 'Profile 3' },
       settings: {}
     }),

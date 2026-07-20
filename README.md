@@ -1,332 +1,136 @@
-# Agentify Desktop
+# pdf-chatgpt-batch
 
-Agentify Desktop is a local control center for AI web sessions. It lets MCP-capable tools such as Codex, Claude Code, and OpenCode use the AI subscriptions you are already signed into, while keeping browser state, files, and automation on your machine.
+A headless Node script that batch-processes directories of PDFs through ChatGPT
+in your own signed-in browser session, and downloads the files ChatGPT generates.
 
-## What It Does
+It drives a real Chrome window over the Chrome DevTools Protocol — no API keys,
+no MCP server, no GUI. You stay logged into ChatGPT in an isolated Chrome profile.
 
-- Opens a local Agentify Control Center.
-- Manages signed-in browser sessions for ChatGPT, Claude, Perplexity, Gemini, Google AI Studio, and Grok.
-- Exposes MCP tools for querying a tab, reading a page, navigating, uploading files, saving artifacts, and reusing stable tab keys.
-- Supports parallel tabs so different agents or tasks can use separate sessions.
-- Packs local repo/file context into prompts when requested.
-- Saves generated images/files locally so they can be reused in follow-up prompts.
+## How it works
 
-## Example Prompts After MCP Setup
+You define one or more **entry directories** in `batch.config.json`. Each entry
+has its own PDFs, its own static Python template, and its own prompt.
 
-Once Agentify Desktop is running and registered with your MCP client, you can ask for workflows like:
-
-- “Use Agentify with key `repo-triage` to ask ChatGPT for a second opinion on this bug, then compare its answer with your own analysis.”
-- “Open a Perplexity tab with key `research-auth-flow` and research current OAuth best practices for desktop apps.”
-- “Send this implementation plan to Claude in a separate Agentify tab and summarize any risks it finds.”
-- “Use Agentify to generate three UI concept images, save the images as artifacts, and return the local file paths.”
-- “Open Grok and ChatGPT in separate Agentify tabs, ask both to review this API design, then compare the tradeoffs.”
-- “Pack this repo into context, ask ChatGPT to identify risky files, and save the conversation under a stable tab key for follow-ups.”
-- “Read the current ChatGPT page through Agentify and turn the conversation into actionable TODOs.”
+- **Entry directories run in parallel** (bounded by `concurrency`).
+- PDF selection per entry:
+  - default: process every PDF in the directory sequentially;
+  - `randomOne`: pick ONE random PDF from the directory;
+  - `randomPerSubdir`: pick ONE random PDF from **each immediate subdirectory**
+    (output is grouped by subdirectory name).
+- Each PDF is processed in its **own chat** (a **temporary chat** by default — never
+  in a project, not saved to ChatGPT history), with the PDF and Python template
+  attached.
+- Generated files are captured by **clicking each file button ChatGPT shows, opening
+  its preview, and clicking Download** (captured via CDP). Real `<a>` download links
+  and fenced code blocks are also saved as fallbacks.
+- Each chat's **full reply text** is saved to `<pdf>.response.txt` (temporary chats
+  aren't saved by ChatGPT, so we log them ourselves).
+- The reply is expected to end with a **`STATUS_CODE: N`** line, which drives
+  continue/retry handling (see **Status handling**).
+- Optional **schema chaining** (`chainSchema`, multi-PDF entries only): the first
+  PDF's generated schema file is attached to every later PDF in that entry.
 
 ## Requirements
 
 - Node.js 20 or newer
-- An MCP-capable CLI if you want tool integration: Codex, Claude Code, or OpenCode
+- Google Chrome (or Chromium / Brave / Edge) installed
 
-## Supported Sites
+## Configure
 
-- `chatgpt.com`
-- `claude.ai`
-- `perplexity.ai`
-- `aistudio.google.com`
-- `gemini.google.com`
-- `grok.com`
+Copy and edit `batch.config.json`:
 
-## Preferred Install And Run
-
-Start the desktop GUI without cloning this repo:
-
-```bash
-npx @agentify/desktop
-```
-
-Equivalent explicit GUI command:
-
-```bash
-npx @agentify/desktop gui
-```
-
-If you prefer a global install:
-
-```bash
-npm install -g @agentify/desktop
-agentify-desktop
-```
-
-If you want the older repo-clone and local source workflow, use [DEVELOPMENT_FROM_SOURCE.md](DEVELOPMENT_FROM_SOURCE.md).
-
-## MCP Server
-
-Run the MCP server over stdio:
-
-```bash
-npx @agentify/desktop mcp
-```
-
-Show newly-created browser tabs while debugging:
-
-```bash
-npx @agentify/desktop mcp --show-tabs
-```
-
-With a global install:
-
-```bash
-agentify-desktop-mcp
-agentify-desktop-mcp --show-tabs
-```
-
-## Register With MCP Clients
-
-Codex:
-
-```bash
-codex mcp add agentify-desktop -- npx -y @agentify/desktop mcp
-```
-
-Claude Code:
-
-```bash
-claude mcp add --transport stdio agentify-desktop -- npx -y @agentify/desktop mcp
-```
-
-OpenCode config example:
-
-```json
+```jsonc
 {
-  "mcp": {
-    "agentify-desktop": {
-      "type": "local",
-      "command": ["npx", "-y", "@agentify/desktop", "mcp"],
-      "enabled": true
+  "concurrency": 1,            // max entry directories in parallel
+  "timeoutMs": 900000,         // per-PDF timeout (also covers thinking + first-run sign-in)
+  "show": true,                // show the Chrome windows
+  "temporaryChat": true,       // use temporary chats (no project, no history)
+  "randomPerSubdir": true,     // one random PDF from each subdirectory of pdfDir
+  "status": {
+    "successCode": 0,          // STATUS_CODE that means "done"
+    "continueCodes": [70, 80], // codes that trigger a "continue" nudge in the same chat
+    "continueMessage": "continue",
+    "maxContinue": 3,          // max "continue" nudges per chat
+    "maxRetry": 1              // max fresh-chat retries for other non-zero codes
+  },
+  "chrome": { "profileMode": "isolated" },
+  "entries": [
+    {
+      "name": "coo",
+      "pdfDir": "C:\\data\\coo_merged_output",  // parent folder; each subdir has PDFs
+      "template": "C:\\data\\generator.py",
+      "promptFile": "C:\\data\\prompt.txt",     // or "prompt": "...inline..."
+      "outDir": "C:\\data\\output"              // optional; default <pdfDir>/output
     }
-  }
+  ]
 }
 ```
 
-Use `--show-tabs` at the end of the command while debugging:
+## Status handling
+
+The script reads the last `STATUS_CODE: N` line in each reply and acts on it:
+
+- **`0`** (or any code in `successCode`) → success; save the generated files.
+- codes in **`continueCodes`** (default `70`, `80`) → send `"continue"` in the **same
+  chat** to finish, up to `maxContinue` times.
+- any other **non-zero** code → **retry** the whole prompt in a **fresh chat**, up to
+  `maxRetry` times.
+- if the reply has **no** `STATUS_CODE`, outputs are saved anyway (with a warning).
+
+Exhausted attempts are logged as failures with the final status code; the batch
+continues to the next PDF.
+
+## Run
 
 ```bash
-codex mcp add agentify-desktop -- npx -y @agentify/desktop mcp --show-tabs
+node run-batch.mjs --config batch.config.json --show
+# or
+npm run batch -- --config batch.config.json
 ```
 
-## First Run
+Flags (override the config): `--concurrency N`, `--timeout-ms MS`, `--show`,
+`--headless`, `--regular-chat` (use normal chats instead of temporary), `--debug`.
 
-1. Start the app:
+Run just one (or a few) of the entry directories by `name`:
 
 ```bash
-npx @agentify/desktop
+node run-batch.mjs --config batch.config.json --only invoices
+node run-batch.mjs --config batch.config.json --only invoices,receipts
 ```
 
-2. In the Control Center, create or show a ChatGPT tab.
+Chrome overrides via env: `AGENTIFY_DESKTOP_CHROME_BIN`,
+`AGENTIFY_DESKTOP_CHROME_DEBUG_PORT`, `AGENTIFY_DESKTOP_CHROME_PROFILE_MODE`,
+`AGENTIFY_DESKTOP_CHROME_PROFILE_NAME`.
 
-3. Sign in to the target vendor in the browser window.
+### First run
 
-4. Register the MCP server with your CLI.
+A Chrome window opens on `chatgpt.com`. Sign in once. The session is stored in an
+isolated profile under `~/.agentify-desktop/chrome-user-data` and reused on later
+runs, so you only sign in again when it expires.
 
-5. Ask your MCP client to use Agentify:
+## Output
 
-```text
-Use Agentify Desktop with tab key repo-triage.
-Ask ChatGPT to summarize this repo in 8 bullets and list the top 3 risky areas to change first.
-Return the answer and keep the tab key stable for follow-ups.
-```
+Per PDF, outputs go to `<outDir>/<subdir>/` (with `randomPerSubdir`) or
+`<outDir>/NN-<pdfname>/` otherwise:
 
-The core loop is:
+- the downloaded generated files (e.g. `generator.py`, `manifest.json`, …),
+- `<pdf>.response.txt` — the chat's full reply text (including any `continue` turns).
 
-- keep a real signed-in browser session open locally
-- call it from an MCP client
-- reuse a stable tab key across follow-up prompts
+At the end the script prints a per-entry summary listing each chat's `STATUS_CODE`,
+attempt count, and file count. Exit code is non-zero if any PDF failed.
 
-## Useful MCP Tools
+## Notes
 
-The MCP server registers `agentify_*` tools, including:
+- A first-PDF failure (or no download matching `schemaNamePattern`) aborts **that
+  entry only**; other entries keep running. A later-PDF failure is logged and the
+  entry continues.
+- ChatGPT DOM selectors live in `selectors.json`. If ChatGPT's UI changes, drop a
+  `selectors.override.json` in `~/.agentify-desktop/` to patch them without editing
+  the file.
+- Automating a logged-in ChatGPT session may be subject to rate limits; keep
+  `concurrency` modest.
 
-- `agentify_query`: send a prompt to a stable tab and return the assistant response.
-- `agentify_read_page`: read visible page text from a tab.
-- `agentify_navigate`: navigate a tab to a URL.
-- `agentify_ensure_ready`: wait for login, CAPTCHA, or UI readiness.
-- `agentify_show` / `agentify_hide`: bring windows forward or minimize them.
-- `agentify_status`: inspect tab and readiness state.
-- `agentify_tabs`, `agentify_tab_create`, `agentify_tab_close`: manage tabs.
-- `agentify_save_artifacts`, `agentify_list_artifacts`, `agentify_open_artifacts_folder`: manage generated files/images.
-- `agentify_save_bundle`, `agentify_list_bundles`: save and reuse context bundles.
-- `agentify_add_watch_folder`, `agentify_list_watch_folders`, `agentify_remove_watch_folder`: manage watched folders.
+## License
 
-## Artifact Workflow
-
-Generate an image or file in a stable tab:
-
-```json
-{
-  "tool": "agentify_query",
-  "arguments": {
-    "key": "ui-concepts",
-    "prompt": "Generate 3 clean UI concept images for a compact desktop developer tool. Keep backgrounds neutral and avoid text."
-  }
-}
-```
-
-Save the generated images locally:
-
-```json
-{
-  "tool": "agentify_save_artifacts",
-  "arguments": {
-    "key": "ui-concepts",
-    "mode": "images",
-    "maxImages": 3
-  }
-}
-```
-
-Reattach one of the returned file paths in a follow-up:
-
-```json
-{
-  "tool": "agentify_query",
-  "arguments": {
-    "key": "ui-concepts",
-    "prompt": "Use the attached concept image and create a more minimal variant with stronger contrast.",
-    "attachments": ["/absolute/path/to/concept.png"]
-  }
-}
-```
-
-## Codebase Context Workflow
-
-Ask Agentify to pack local files or folders into a prompt:
-
-```json
-{
-  "tool": "agentify_query",
-  "arguments": {
-    "key": "repo-review",
-    "prompt": "Summarize this codebase in 8 bullets and list the top 3 risky files to change first.",
-    "contextPaths": ["/absolute/path/to/repo"]
-  }
-}
-```
-
-Control context size:
-
-```json
-{
-  "tool": "agentify_query",
-  "arguments": {
-    "key": "repo-review",
-    "prompt": "Focus only on rendering and state management.",
-    "contextPaths": ["/absolute/path/to/repo"],
-    "maxContextChars": 120000,
-    "maxContextFiles": 80,
-    "maxContextInlineFiles": 30
-  }
-}
-```
-
-The tool result includes `packedContextSummary` so you can see what was included, attached, or skipped.
-
-## Browser Backend
-
-Agentify Desktop supports two browser backends:
-
-- `chrome-cdp`: launches or attaches to a Chrome-family browser over Chrome DevTools Protocol. This is the default and recommended backend.
-- `electron`: embedded windows managed by Agentify Desktop. Use this only as an explicit fallback.
-
-Chrome CDP is the default because SSO providers commonly block embedded Electron login:
-
-```bash
-npx @agentify/desktop
-```
-
-Optional Chrome CDP settings:
-
-```bash
-AGENTIFY_DESKTOP_CHROME_DEBUG_PORT=9333 npx @agentify/desktop
-AGENTIFY_DESKTOP_CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" npx @agentify/desktop
-```
-
-You can also pass GUI flags:
-
-```bash
-npx @agentify/desktop gui --browser-backend chrome-cdp
-npx @agentify/desktop gui --browser-backend electron
-npx @agentify/desktop gui --chrome-debug-port 9333
-```
-
-Chrome CDP profile modes:
-
-- `Agentify isolated profile`: safest default.
-- `Existing Chrome profile`: reuses your normal Chrome session. Fully quit Chrome first so the profile is not already locked.
-
-## CAPTCHA And Login Policy
-
-Agentify Desktop does not bypass CAPTCHAs or use third-party solvers. If a verification or login challenge appears, automation pauses, brings the relevant window forward, and waits for you to complete the step manually.
-
-If your account uses Google, Microsoft, or Apple SSO, keep auth popups enabled in the Control Center. If embedded login remains unreliable, use Chrome CDP.
-
-## Windows Notes
-
-Use Node.js 20 or 22 on Windows. Agentify Desktop is tested against Windows in CI, including the npm CLI launcher path.
-
-Chrome CDP is still the recommended backend on Windows because Google and Microsoft SSO can block embedded Electron login. Agentify looks for Chrome, Chromium, Brave, and Microsoft Edge in the usual install locations and on `PATH`.
-
-If Chrome CDP cannot find your browser, set the executable explicitly:
-
-```powershell
-$env:AGENTIFY_DESKTOP_CHROME_BIN = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-npx @agentify/desktop
-```
-
-## Local Data And Privacy
-
-Agentify Desktop is local-first:
-
-- The local API binds to `127.0.0.1`.
-- The local API requires a bearer token stored under `~/.agentify-desktop/`.
-- Electron browser data is stored under `~/.agentify-desktop/electron-user-data/`.
-- Chrome CDP profile data is stored under `~/.agentify-desktop/chrome-user-data/` unless you choose an existing profile.
-- Artifacts, bundles, logs, and state are stored under `~/.agentify-desktop/`.
-
-Anyone with access to your machine account may be able to access local session data. Treat the machine account as the security boundary.
-
-## Environment Variables
-
-- `AGENTIFY_DESKTOP_STATE_DIR`: override the local state directory.
-- `AGENTIFY_DESKTOP_PORT`: choose the local API port.
-- `AGENTIFY_DESKTOP_SHOW_TABS=true`: show newly-created tabs by default.
-- `AGENTIFY_DESKTOP_MAX_TABS`: cap parallel tabs.
-- `AGENTIFY_DESKTOP_BROWSER_BACKEND=electron|chrome-cdp`: choose browser backend.
-- `AGENTIFY_DESKTOP_CHROME_BIN`: choose Chrome/Chromium executable.
-- `AGENTIFY_DESKTOP_CHROME_DEBUG_PORT`: choose Chrome debug port.
-- `AGENTIFY_DESKTOP_CHROME_PROFILE_MODE=isolated|existing`: choose Chrome profile mode.
-- `AGENTIFY_DESKTOP_CHROME_PROFILE_NAME`: choose an existing Chrome profile name.
-
-## Development From Source
-
-Source checkout, quickstart script usage, local build commands, and source-only debugging notes live in [DEVELOPMENT_FROM_SOURCE.md](DEVELOPMENT_FROM_SOURCE.md).
-
-## Package Commands
-
-The npm package exposes these commands:
-
-- `agentify-desktop`: default GUI launcher, with `mcp` subcommand support.
-- `agentify-desktop-gui`: explicit GUI alias.
-- `agentify-desktop-mcp`: explicit MCP alias.
-
-Examples:
-
-```bash
-npx @agentify/desktop
-npx @agentify/desktop mcp
-npx -p @agentify/desktop agentify-desktop-mcp
-```
-
-## License And Trademarks
-
-The code is licensed under `MPL-2.0`. Agentify trademarks and branding are not included in that license. See [TRADEMARKS.md](TRADEMARKS.md).
+`MPL-2.0`. See `LICENSE`. Trademarks are not included in that license — see
+`TRADEMARKS.md`.

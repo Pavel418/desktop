@@ -1,96 +1,12 @@
 {
-  "name": "@agentify/desktop",
-  "version": "0.2.4",
-  "description": "Agentify Desktop control center and MCP server for local AI web sessions",
+  "name": "pdf-chatgpt-batch",
+  "version": "0.3.0",
+  "description": "Headless batch driver: run directories of PDFs through ChatGPT (with a per-directory Python template + schema chaining) and download the generated files",
   "license": "MPL-2.0",
   "type": "module",
-  "main": "main.mjs",
-  "bin": {
-    "agentify-desktop": "bin/agentify-desktop.mjs",
-    "agentify-desktop-gui": "bin/agentify-desktop.mjs",
-    "agentify-desktop-mcp": "bin/agentify-desktop.mjs"
-  },
-  "files": [
-    "CHANGELOG.md",
-    "README.md",
-    "SECURITY.md",
-    "TRADEMARKS.md",
-    "artifact-store.mjs",
-    "browser-backend.mjs",
-    "bundle-store.mjs",
-    "chatgpt-controller.mjs",
-    "chrome-cdp-backend.mjs",
-    "config.mjs",
-    "context-packer.mjs",
-    "electron-browser-backend.mjs",
-    "http-api.mjs",
-    "main.mjs",
-    "mcp-lib.mjs",
-    "mcp-server.mjs",
-    "orchestrator.mjs",
-    "orchestrator/",
-    "popup-policy.mjs",
-    "selectors.json",
-    "shutdown.mjs",
-    "state.mjs",
-    "tab-manager.mjs",
-    "ui/",
-    "vendors.json",
-    "watch-folder.mjs",
-    "bin/"
-  ],
+  "main": "run-batch.mjs",
   "scripts": {
-    "start": "electron .",
-    "mcp": "node mcp-server.mjs",
-    "orchestrator": "node orchestrator.mjs",
-    "test": "node --test tests/*.test.mjs",
-    "dist": "electron-builder"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "electron": "^39.8.7",
-    "zod": "^3.22.3"
-  },
-  "devDependencies": {
-    "electron-builder": "^26.8.1"
-  },
-  "overrides": {
-    "@hono/node-server": "^1.19.14",
-    "ajv": "^8.18.0",
-    "express-rate-limit": "^8.3.2",
-    "hono": "^4.12.14",
-    "path-to-regexp": "^8.4.2"
-  },
-  "publishConfig": {
-    "access": "public"
-  },
-  "build": {
-    "appId": "com.agentify.desktop",
-    "productName": "Agentify Desktop",
-    "files": [
-      "**/*",
-      "!dist/**",
-      "!tests/**"
-    ],
-    "directories": {
-      "output": "dist"
-    },
-    "mac": {
-      "category": "public.app-category.developer-tools",
-      "target": [
-        "dmg",
-        "zip"
-      ]
-    },
-    "win": {
-      "target": [
-        "nsis"
-      ]
-    },
-    "linux": {
-      "target": [
-        "AppImage"
-      ]
-    }
+    "batch": "node run-batch.mjs",
+    "test": "node --test tests/*.test.mjs"
   }
 }

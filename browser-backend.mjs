@@ -1,22 +1,7 @@
-export const SUPPORTED_BROWSER_BACKENDS = ['chrome-cdp', 'electron'];
-
-export function normalizeBrowserBackend(value) {
-  const raw = String(value || '').trim().toLowerCase();
-  if (!raw) return 'chrome-cdp';
-  if (raw === 'chrome' || raw === 'chrome_cdp' || raw === 'cdp') return 'chrome-cdp';
-  if (SUPPORTED_BROWSER_BACKENDS.includes(raw)) return raw;
-  return 'chrome-cdp';
-}
-
-export function resolveBrowserBackend({
-  argv = process.argv,
-  env = process.env,
-  settings = {}
-} = {}) {
-  const idx = Array.isArray(argv) ? argv.indexOf('--browser-backend') : -1;
-  const argValue = idx >= 0 ? argv[idx + 1] : null;
-  return normalizeBrowserBackend(argValue || env.AGENTIFY_DESKTOP_BROWSER_BACKEND || settings.browserBackend);
-}
+// Chrome launch configuration resolvers (argv > env > settings).
+// The batch script drives Chrome over CDP directly via ChromeCdpBrowserBackend
+// (chrome-cdp-backend.mjs); these helpers just resolve the executable, debug
+// port, and profile from CLI flags / environment variables.
 
 export function resolveChromeExecutablePath({
   argv = process.argv,
@@ -63,38 +48,4 @@ export function resolveChromeProfileName({
   const argValue = idx >= 0 ? argv[idx + 1] : null;
   const raw = String(argValue || env.AGENTIFY_DESKTOP_CHROME_PROFILE_NAME || settings.chromeProfileName || '').trim();
   return raw || 'Default';
-}
-
-export async function createBrowserBackend({
-  kind,
-  stateDir,
-  windowDefaults,
-  userAgent,
-  popupPolicy,
-  onChanged,
-  chromeExecutablePath,
-  chromeDebugPort,
-  chromeProfileMode,
-  chromeProfileName
-} = {}) {
-  const normalized = normalizeBrowserBackend(kind);
-  if (normalized === 'chrome-cdp') {
-    const { ChromeCdpBrowserBackend } = await import('./chrome-cdp-backend.mjs');
-    return new ChromeCdpBrowserBackend({
-      stateDir,
-      userAgent,
-      onChanged,
-      executablePath: chromeExecutablePath,
-      debugPort: chromeDebugPort,
-      profileMode: chromeProfileMode,
-      profileName: chromeProfileName
-    });
-  }
-  const { ElectronBrowserBackend } = await import('./electron-browser-backend.mjs');
-  return new ElectronBrowserBackend({
-    windowDefaults,
-    userAgent,
-    popupPolicy,
-    onChanged
-  });
 }

@@ -35,11 +35,12 @@ class Mutex {
 }
 
 export class ChatGPTController {
-  constructor({ page, selectors, onBlocked, onUnblocked, stateDir }) {
+  constructor({ page, selectors, onBlocked, onUnblocked, stateDir, onDebug = null }) {
     this.page = page;
     this.selectors = selectors;
     this.onBlocked = onBlocked;
     this.onUnblocked = onUnblocked;
+    this.onDebug = typeof onDebug === 'function' ? onDebug : null;
     this.stateDir = stateDir;
     this.mutex = new Mutex();
     this.blocked = false;
@@ -307,10 +308,20 @@ export class ChatGPTController {
   }
 
   async #typeHuman(text) {
-    for (const ch of String(text)) {
+    // Insert per line. A raw "\n" fed to the composer is interpreted as Enter and
+    // SENDS the message, so newlines must be soft breaks (Shift+Enter). Inserting a
+    // whole line at once also keeps large prompts fast (one call per line, not per char).
+    const lines = String(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+    for (let i = 0; i < lines.length; i++) {
       this.#throwIfStopRequested();
-      await this.page.insertText(ch);
-      await sleep(jitter(12, 45));
+      if (i > 0) {
+        await this.#sendKey('Enter', { modifiers: ['shift'] });
+        await sleep(jitter(8, 24));
+      }
+      if (lines[i].length) {
+        await this.page.insertText(lines[i]);
+        await sleep(jitter(8, 24));
+      }
     }
   }
 
@@ -464,8 +475,40 @@ export class ChatGPTController {
     return false;
   }
 
+  // Before sending, wait out any in-flight upload: ChatGPT keeps the send button
+  // disabled while attachments upload, so we hold until it is enabled (or uploads
+  // clear). Prevents firing the prompt before files finish attaching.
+  async #waitForUploadsToSettle({ timeoutMs = 120_000, pollMs = 400, stableMs = 600 } = {}) {
+    const sendSel = JSON.stringify(this.selectors.sendButton);
+    const start = Date.now();
+    let readySince = null;
+    while (Date.now() - start < timeoutMs) {
+      this.#throwIfStopRequested();
+      const snap = await this.#eval(`(() => {
+        const root = document.querySelector('form') || document.querySelector('main') || document.body;
+        const uploading = !!root.querySelector('progress, [role="progressbar"], [class*="uploading" i], [aria-label*="uploading" i], [class*="progress" i][role]');
+        const visible = (n) => { const r = n.getBoundingClientRect(); const s = getComputedStyle(n); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+        const disabled = (n) => !!n.disabled || String(n.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+        const send = Array.from(document.querySelectorAll(${sendSel})).find(visible);
+        return { uploading, sendReady: !!send && !disabled(send), hasSend: !!send };
+      })()`);
+      if (!snap.uploading && (snap.sendReady || !snap.hasSend)) {
+        if (readySince == null) readySince = Date.now();
+        else if (Date.now() - readySince >= stableMs) {
+          this.#debug(`send-gate: ready after ${Date.now() - start}ms (sendReady=${snap.sendReady}, hasSend=${snap.hasSend})`);
+          return;
+        }
+      } else {
+        readySince = null;
+      }
+      await sleep(pollMs);
+    }
+    this.#debug(`send-gate: timed out after ${timeoutMs}ms waiting for send to become ready`);
+  }
+
   async #clickSend() {
     await this.#emitProgress({ phase: 'sending_prompt' });
+    await this.#waitForUploadsToSettle();
     const sendSel = JSON.stringify(this.selectors.sendButton);
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const res = await this.#eval(`(() => {
@@ -689,52 +732,159 @@ export class ChatGPTController {
     }
   }
 
+  #debug(msg) {
+    try {
+      this.onDebug?.(String(msg));
+    } catch {}
+  }
+
+  // Force a fresh top-level chat (outside any project) by clicking ChatGPT's
+  // "New chat" control, so batch runs never inherit a project context.
+  async #startNewChat() {
+    const clicked = await this.#eval(`(() => {
+      const a = document.querySelector('a[data-testid="create-new-chat-button"]')
+        || Array.from(document.querySelectorAll('a,button,[role="button"]')).find(e => /new chat/i.test(((e.getAttribute('aria-label')||'') + ' ' + (e.textContent||'')).trim()));
+      if (a) { a.click(); return true; }
+      return false;
+    })()`);
+    this.#debug(`newchat: create-new-chat control ${clicked ? 'clicked' : 'NOT found'}`);
+    if (clicked) {
+      await sleep(800);
+      await this.ensureReady({ timeoutMs: 30_000 }).catch(() => {});
+    }
+  }
+
   async #attachFiles(files) {
     if (!files?.length) return;
     await this.#emitProgress({ phase: 'uploading_files' });
     const absFiles = files.map((p) => path.resolve(p));
     for (const f of absFiles) await fs.access(f);
+    const baseNames = absFiles.map((f) => path.basename(f));
+    this.#debug(`attach: uploading ${absFiles.length} file(s): ${baseNames.join(', ')}`);
 
-    // Best-effort: click the paperclip/attach UI, then set <input type=file> via DevTools protocol.
-    await this.#eval(`(() => {
-      const candidates = Array.from(document.querySelectorAll('button, [role=\"button\"]'));
-      const attach = candidates.find(b => /attach|upload|paperclip/i.test((b.getAttribute('aria-label')||'') + ' ' + (b.textContent||'')));
-      if (attach) attach.click();
-      return true;
-    })()`);
+    // Let the composer finish hydrating: if we set the hidden <input type=file>
+    // before ChatGPT's React handler is wired up, the set is silently dropped and
+    // nothing uploads. Focus the composer, wait, then set the input and RE-SET on
+    // each retry until the "Remove file" chips appear. This can be flaky on
+    // back-to-back chats, so the retry budget is generous.
+    await this.#eval(`(() => { const e = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]'); if (e) e.focus(); return true; })()`).catch(() => {});
+    await sleep(1200);
+    let settle = { detected: false, matched: 0, chips: 0, uploading: false, waitedMs: 0 };
+    const maxAttempts = 8;
+    for (let attempt = 1; attempt <= maxAttempts && !settle.detected; attempt++) {
+      let info = null;
+      try {
+        info = await this.page.setFileInputFiles(absFiles);
+        this.#debug(`attach: set attempt ${attempt} (inputs found=${info?.found ?? '?'}, set=${info?.set ?? '?'})`);
+      } catch (e1) {
+        // No file input yet — click the attach control to surface it, then retry.
+        const clicked = await this.#eval(`(() => {
+          const cands = Array.from(document.querySelectorAll('button, [role="button"]'));
+          const b = cands.find(x => /attach|upload|paperclip|add photos|add files/i.test(((x.getAttribute('aria-label')||'') + ' ' + (x.textContent||'')).trim()));
+          if (b) { b.click(); return (b.getAttribute('aria-label') || b.textContent || '').trim().slice(0, 60) || 'button'; }
+          return null;
+        })()`);
+        this.#debug(`attach: set attempt ${attempt} found no input (${e1?.message}); attach control ${clicked ? `clicked ("${clicked}")` : 'NOT found'}`);
+        await sleep(500);
+        await this.#sendKey('Escape').catch(() => {});
+        continue;
+      }
 
-    await this.page.setFileInputFiles(absFiles);
+      settle = await this.#waitForAttachments({ baseNames, timeoutMs: 20_000, maxQuietMs: 6000 });
+      this.#debug(
+        `attach: attempt ${attempt} -> detected=${settle.detected} matchedNames=${settle.matched}/${baseNames.length} ` +
+          `chips=${settle.chips} uploading=${settle.uploading} waitedMs=${settle.waitedMs}`
+      );
+      if (!settle.detected) {
+        // Nudge the composer to become interactive before the next re-set.
+        await this.#eval(`(() => { const e = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]'); if (e) e.focus(); return true; })()`).catch(() => {});
+        await sleep(900);
+      }
+    }
+
+    if (!settle.detected) {
+      if (this.onDebug) {
+        const dump = await this.#eval(
+          `(() => { const f = document.querySelector('form') || document.querySelector('main'); return f ? f.outerHTML.slice(0, 4000) : '(no form/main)'; })()`
+        );
+        this.#debug(`attach: composer HTML (truncated):\n${dump}`);
+      }
+      const err = new Error('attachment_not_registered');
+      err.data = { files: baseNames, ...settle };
+      throw err;
+    }
   }
 
-  async #waitForAssistantStable({ timeoutMs = 5 * 60_000, stableMs = 1500, pollMs = 400 } = {}) {
+  // Poll the composer until the uploaded files register (name chips appear and any
+  // upload spinner clears), or bail early if nothing is happening.
+  async #waitForAttachments({ baseNames = [], timeoutMs = 120_000, stableMs = 800, pollMs = 400, maxQuietMs = 8000 } = {}) {
+    const start = Date.now();
+    // Match on the filename stem: the composer renders the name and extension
+    // separately, so "file_123.pdf" won't appear as one contiguous string.
+    const stems = baseNames.map((n) => String(n).replace(/\.[^.]+$/, '').toLowerCase());
+    const stemsJson = JSON.stringify(stems);
+    const expected = baseNames.length;
+    let quietSince = null;
+    let last = { detected: false, matched: 0, chips: 0, uploading: false, waitedMs: 0 };
+
+    while (Date.now() - start < timeoutMs) {
+      const snap = await this.#eval(`(() => {
+        const stems = ${stemsJson};
+        const root = document.querySelector('form') || document.querySelector('main') || document.body;
+        const text = (root.innerText || '').toLowerCase();
+        const matched = stems.filter((n) => n && text.includes(n)).length;
+        // ChatGPT renders each attachment with a "Remove file N: <name>" button.
+        const chips = root.querySelectorAll('button[aria-label*="remove file" i], [data-testid*="attachment" i]').length;
+        const uploading = !!root.querySelector('progress, [role="progressbar"], [class*="uploading" i], [aria-label*="uploading" i]');
+        return { matched, chips, uploading };
+      })()`);
+
+      // Consider it ready once we see a chip (or matched name) for every file.
+      const detected = snap.chips >= expected || snap.matched >= expected || snap.chips > 0;
+      last = { detected, matched: snap.matched, chips: snap.chips, uploading: !!snap.uploading, waitedMs: Date.now() - start };
+
+      const enough = snap.chips >= expected || snap.matched >= expected;
+      if (enough && !snap.uploading) {
+        await sleep(stableMs);
+        last.waitedMs = Date.now() - start;
+        return last;
+      }
+      if (!detected && !snap.uploading) {
+        if (quietSince == null) quietSince = Date.now();
+        else if (Date.now() - quietSince > maxQuietMs) return last; // nothing happening — give up early
+      } else {
+        quietSince = null;
+      }
+      await sleep(pollMs);
+    }
+    return last;
+  }
+
+  async #waitForAssistantStable({ timeoutMs = 5 * 60_000, stableMs = 2000, pollMs = 500 } = {}) {
     await this.#emitProgress({ phase: 'waiting_for_response', blocked: false, blockedKind: null, blockedTitle: null });
     const assistantSel = JSON.stringify(this.selectors.assistantMessage);
     const stopSel = JSON.stringify(this.selectors.stopButton);
-    const sendSel = JSON.stringify(this.selectors.sendButton);
     const start = Date.now();
     let last = '';
     let lastChange = Date.now();
-    let stopGoneAt = null;
+    let sawStop = false; // have we observed generation actually running?
     let continueClicks = 0;
 
     while (Date.now() - start < timeoutMs) {
       this.#throwIfStopRequested();
+      // The stop button (data-testid=stop-button) is present the whole time the
+      // model is busy — through the "thinking" phase AND while streaming the answer.
+      // It disappears only when fully done. Read ONLY the last assistant node's text
+      // (never the whole page, or we'd capture the prompt/thinking as a false answer).
       const snap = await this.#eval(`(() => {
         const stop = !!document.querySelector(${stopSel});
-        const send = Array.from(document.querySelectorAll(${sendSel})).find((n) => {
-          const r = n.getBoundingClientRect();
-          const style = window.getComputedStyle(n);
-          return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-        });
-        const sendEnabled = send ? !send.disabled : true;
         const nodes = Array.from(document.querySelectorAll(${assistantSel}));
         const lastNode = nodes[nodes.length - 1];
-        const fallbackMainText = ((document.querySelector('main') || document.body)?.innerText || '').trim();
-        const txt = (lastNode?.innerText || fallbackMainText).trim();
+        const txt = (lastNode?.innerText || '').trim();
+        const codeCount = lastNode ? lastNode.querySelectorAll('pre code').length : 0;
         const hasContinue = Array.from(document.querySelectorAll('button, a')).some(b => /continue generating/i.test((b.textContent||'').trim()));
-        const hasRegenerate = Array.from(document.querySelectorAll('button, a')).some(b => /regenerate/i.test((b.textContent||'').trim()));
-        const hasError = /something went wrong|try again|error/i.test(txt) && txt.length < 500;
-        return { stop, sendEnabled, txt, count: nodes.length, usedFallback: !lastNode, hasError, hasContinue, hasRegenerate };
+        const hasError = /something went wrong|try again|error generating/i.test(txt) && txt.length < 500;
+        return { stop, txt, count: nodes.length, codeCount, hasContinue, hasError };
       })()`);
 
       const txt = String(snap?.txt || '');
@@ -742,40 +892,37 @@ export class ChatGPTController {
         last = txt;
         lastChange = Date.now();
       }
+      if (snap?.stop) sawStop = true;
 
-      // Some providers expose unrelated visible "stop/cancel" controls.
-      // Treat "generating" as stop-visible only when send is not enabled.
-      const generating = !!snap?.stop && !snap?.sendEnabled;
-      if (generating) stopGoneAt = null;
-      else if (stopGoneAt == null) stopGoneAt = Date.now();
-
-      const dynamicStableMs = Math.max(stableMs, txt.length > 8000 ? 3000 : txt.length > 2000 ? 2200 : stableMs);
-      const stable = Date.now() - lastChange >= dynamicStableMs;
-      const stopGoneLongEnough = stopGoneAt != null && Date.now() - stopGoneAt >= 800;
-
+      // Click "continue generating" if it appears while not actively streaming.
       if (!snap?.stop && snap?.hasContinue && continueClicks < 3) {
         continueClicks += 1;
         await this.#eval(`(() => {
           const btn = Array.from(document.querySelectorAll('button, a')).find(b => /continue generating/i.test((b.textContent||'').trim()));
           if (btn) btn.click();
         })()`);
-        await sleep(250);
+        await sleep(300);
         continue;
       }
 
-      const readyByNodes = (snap?.count || 0) > 0;
-      const fallbackWaited = !!snap?.usedFallback && (Date.now() - start >= 2500);
-      const fallbackStableLongEnough = txt.length > 0 && (Date.now() - lastChange >= Math.max(dynamicStableMs, 5000));
-      const done =
-        (!generating && stopGoneLongEnough && snap?.sendEnabled && stable && txt.length > 0 && (readyByNodes || fallbackWaited)) ||
-        (!generating && fallbackStableLongEnough && (readyByNodes || fallbackWaited));
+      const dynamicStableMs = Math.max(stableMs, txt.length > 8000 ? 3500 : txt.length > 2000 ? 2500 : stableMs);
+      const stable = Date.now() - lastChange >= dynamicStableMs;
+      // Allow completion only once generation has actually begun (we saw the stop
+      // button, or enough time passed for an instant reply) — never during the
+      // pre-send / thinking-with-empty-node window.
+      const started = sawStop || Date.now() - start > 5000;
+
+      const done = started && !snap?.stop && txt.length > 0 && stable;
       if (done) {
         const extra = await this.#eval(`(() => {
           const nodes = Array.from(document.querySelectorAll(${assistantSel}));
           const lastNode = nodes[nodes.length - 1];
           const codes = Array.from(lastNode?.querySelectorAll('pre code') || []).map(c => {
             const cls = String(c.className || '');
-            const lang = (cls.match(/language-([a-z0-9_-]+)/i) || [])[1] || null;
+            const pre = c.closest('pre');
+            const lang = (cls.match(/language-([a-z0-9_-]+)/i) || [])[1]
+              || (String(pre?.querySelector('[class*="language-"]')?.className || '').match(/language-([a-z0-9_-]+)/i) || [])[1]
+              || null;
             return { language: lang, text: (c.innerText || '').trim() };
           }).filter(c => c.text);
           return { codeBlocks: codes };
@@ -791,14 +938,32 @@ export class ChatGPTController {
     throw err;
   }
 
-  async query({ prompt, attachments = [], timeoutMs = 10 * 60_000, onProgress = null } = {}) {
+  async query({ prompt, attachments = [], timeoutMs = 10 * 60_000, onProgress = null, newChat = false } = {}) {
     if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('missing_prompt');
     if (prompt.length > 200_000) throw new Error('prompt_too_large');
     const run = { kind: 'query', requested: false, requestedAt: null, reason: null, onProgress };
     this.currentRun = run;
     try {
       await this.ensureReady({ timeoutMs });
+      if (newChat) await this.#startNewChat();
       await this.#attachFiles(attachments);
+      await this.#typePrompt(prompt);
+      await this.#clickSend();
+      return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000) });
+    } finally {
+      if (this.currentRun === run) this.currentRun = null;
+    }
+  }
+
+  // Send a follow-up message in the CURRENT chat (no new chat, no attachments) and
+  // wait for the assistant's reply. Used for "continue" nudges.
+  async followUp({ text, timeoutMs = 10 * 60_000, onProgress = null } = {}) {
+    const prompt = String(text || '');
+    if (!prompt.trim()) throw new Error('missing_prompt');
+    const run = { kind: 'query', requested: false, requestedAt: null, reason: null, onProgress };
+    this.currentRun = run;
+    try {
+      await this.ensureReady({ timeoutMs });
       await this.#typePrompt(prompt);
       await this.#clickSend();
       return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000) });
@@ -959,6 +1124,18 @@ export class ChatGPTController {
     }
 
     return saved;
+  }
+
+  // Download ChatGPT "entity" file buttons (generated files rendered as clickable
+  // filename buttons with no href). Requires the CDP backend's download capture.
+  async downloadLastAssistantEntities({ outDir = path.join(this.stateDir, 'downloads') } = {}) {
+    if (typeof this.page.downloadEntityFiles !== 'function') return [];
+    try {
+      return await this.page.downloadEntityFiles({ outDir, debug: (m) => this.#debug(`entity: ${m}`) });
+    } catch (e) {
+      this.#debug(`entity-download failed: ${e?.message}`);
+      return [];
+    }
   }
 
   async getLastAssistantDownloads({ maxFiles = 6 } = {}) {

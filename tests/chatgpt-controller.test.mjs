@@ -37,6 +37,7 @@ test('chatgpt-controller: send falls back to requestSubmit on the active compose
         return true;
       }
       if (js.includes('already_generating')) return { ok: true, requestSubmit: true, host: 'chatgpt.com' };
+      if (js.includes('sendReady')) return { uploading: false, sendReady: true, hasSend: true };
       if (js.includes('promptLen')) {
         waitForSendChecks += 1;
         return waitForSendChecks >= 2

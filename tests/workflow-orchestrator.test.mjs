@@ -35,6 +35,85 @@ test('parseHandoff returns null when no handoff object is present', () => {
   assert.equal(parseHandoff('```json\n{ "foo": 1 }\n```'), null);
 });
 
+// Regression: a naive non-greedy brace regex (`\{[\s\S]*?\}`) truncates at the FIRST
+// closing brace after a match, which cuts a real handoff off mid-way through its own
+// nested `evidence` array. This is the exact shape a live run produced: narrative prose,
+// then a properly fenced ```json handoff whose `evidence` is an array of {check, result,
+// details} objects, with an apostrophe inside one "details" string.
+const REAL_WORLD_HANDOFF_TEXT = [
+  'Preflight passed. Failed checks: none.',
+  "The template edit boundary is present, with the stable runtime beginning after the end marker.",
+  '',
+  '```json',
+  JSON.stringify({
+    run_id: 'RUN-0001',
+    role: 'contract_auditor',
+    mode: 'preflight',
+    stage_status: 'passed',
+    recommended_status_code: null,
+    evidence: [
+      { check: 'syntax_and_import', result: 'passed', details: 'generator.py parsed and imported cleanly.' },
+      { check: 'target_pdf_raster', result: 'passed', details: "It's rendered at 200 DPI as a 1700x2200 RGB image." }
+    ],
+    new_issues: [],
+    verified_issues: [],
+    required_reruns: [],
+    next_role: 'generator_engineer'
+  }, null, 2),
+  '```',
+  ''
+].join('\n');
+
+test('parseHandoff: real-world shape with narrative prose + nested evidence array parses correctly', () => {
+  const h = parseHandoff(REAL_WORLD_HANDOFF_TEXT);
+  assert.ok(h, 'handoff should parse');
+  assert.equal(h.stage_status, 'passed');
+  assert.equal(h.next_role, 'generator_engineer');
+  assert.equal(h.evidence.length, 2);
+  assert.equal(h.evidence[1].details, "It's rendered at 200 DPI as a 1700x2200 RGB image.");
+});
+
+test('parseHandoff: works with a bare ``` fence (no "json" language tag)', () => {
+  const text = REAL_WORLD_HANDOFF_TEXT.replace('```json', '```');
+  const h = parseHandoff(text);
+  assert.ok(h, 'handoff should parse without a json tag');
+  assert.equal(h.stage_status, 'passed');
+  assert.equal(h.evidence.length, 2);
+});
+
+test('parseHandoff: works with no fence at all (raw JSON after prose)', () => {
+  const text = REAL_WORLD_HANDOFF_TEXT.replace(/```json\n/, '').replace(/\n```\n?$/, '\n');
+  const h = parseHandoff(text);
+  assert.ok(h, 'handoff should parse without any fence');
+  assert.equal(h.stage_status, 'passed');
+});
+
+test('parseHandoff: tolerates a trailing comma before a closing bracket', () => {
+  const text = [
+    '```json',
+    '{ "role": "qa_auditor", "stage_status": "passed", "evidence": [1, 2,], "new_issues": [], }',
+    '```'
+  ].join('\n');
+  const h = parseHandoff(text);
+  assert.ok(h, 'handoff should parse despite the trailing commas');
+  assert.equal(h.stage_status, 'passed');
+});
+
+test('parseHandoff: skips an unrelated decoy JSON blob (e.g. a pasted report.json) before the real handoff', () => {
+  const text = [
+    'Here is the report I generated:',
+    '```json',
+    '{"scope": "sample_generation", "status_code": 0, "checks": {}}',
+    '```',
+    'And here is my handoff:',
+    REAL_WORLD_HANDOFF_TEXT
+  ].join('\n');
+  const h = parseHandoff(text);
+  assert.ok(h, 'handoff should parse past the decoy blob');
+  assert.equal(h.stage_status, 'passed');
+  assert.equal(h.role, 'contract_auditor');
+});
+
 test('mergeReruns unions explicit reruns with issue-domain derived reruns, in QA order', () => {
   const modes = mergeReruns(['edge'], [{ domain: 'reconstruction', status: 'open' }]);
   // reconstruction -> background, baseline, edge ; plus explicit edge

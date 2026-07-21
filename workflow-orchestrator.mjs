@@ -92,9 +92,56 @@ export const PERSISTENT_FILES = ['generator.py', 'manifest.json', 'generator_rep
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-// Extract the handoff object from a reply. A reply may contain several JSON blocks (e.g.
-// the visual-review envelope AND the handoff), so pick the LAST fenced ```json block that
-// parses and carries a stage_status; fall back to a bare {...} with stage_status.
+// Extract every balanced top-level {...} object appearing anywhere in `text`. This is
+// deliberately fence-agnostic: it ignores markdown fence markers, language tags (or
+// their absence), and narrative prose entirely, and only tracks JSON string literals
+// (double-quoted, escape-aware) so that braces/brackets INSIDE a string value — or
+// nested objects/arrays like a handoff's evidence/new_issues entries — never truncate
+// the match. A naive non-greedy regex (`\{[\s\S]*?\}`) stops at the FIRST closing brace
+// after a match, which cuts a real handoff off mid-way through its first nested
+// evidence/issue object; this scanner tracks actual nesting depth instead.
+function extractJsonObjects(text) {
+  const src = String(text || '');
+  const objects = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escapeNext = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (inString) {
+      if (escapeNext) escapeNext = false;
+      else if (ch === '\\') escapeNext = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === '}') {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0 && start !== -1) {
+          objects.push(src.slice(start, i + 1));
+          start = -1;
+        }
+      }
+    }
+  }
+  return objects;
+}
+
+// Repair the single most common LLM JSON slip: a trailing comma before a closing
+// brace/bracket (e.g. from an item added last-minute without removing the prior comma).
+function stripTrailingCommas(jsonText) {
+  return jsonText.replace(/,(\s*[}\]])/g, '$1');
+}
+
+// A parsed object counts as a handoff only once normalised: it must carry a string
+// stage_status, and its list fields default to [] so downstream code never has to
+// null-check them.
 function _normaliseHandoff(obj) {
   if (!obj || typeof obj !== 'object' || typeof obj.stage_status !== 'string') return null;
   for (const key of ['evidence', 'new_issues', 'verified_issues', 'required_reruns']) {
@@ -103,23 +150,24 @@ function _normaliseHandoff(obj) {
   return obj;
 }
 
+// Extract the handoff object from a reply. A reply may contain several JSON objects
+// (e.g. a pasted report.json, the visual-review envelope, AND the handoff itself), in
+// or out of markdown fences, with or without a "json" language tag. Scan the WHOLE
+// text for balanced top-level objects and take the LAST one (scanning backward) that
+// parses and carries a stage_status — matching the shared contract's "keep the
+// handoff block last" rule regardless of how the model formatted it.
 export function parseHandoff(text) {
-  const src = String(text || '');
-  const candidates = [];
-  const fence = /```json\s*([\s\S]*?)```/gi;
-  let m;
-  while ((m = fence.exec(src)) !== null) candidates.push(m[1]);
-  if (candidates.length === 0) {
-    const braceRe = /\{[\s\S]*?"stage_status"[\s\S]*?\}/gi;
-    let bm;
-    while ((bm = braceRe.exec(src)) !== null) candidates.push(bm[0]);
-  }
-  for (let i = candidates.length - 1; i >= 0; i--) {
+  const objects = extractJsonObjects(text);
+  for (let i = objects.length - 1; i >= 0; i--) {
     let obj;
     try {
-      obj = JSON.parse(candidates[i].trim());
+      obj = JSON.parse(objects[i]);
     } catch {
-      continue;
+      try {
+        obj = JSON.parse(stripTrailingCommas(objects[i]));
+      } catch {
+        continue;
+      }
     }
     const norm = _normaliseHandoff(obj);
     if (norm) return norm;

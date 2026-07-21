@@ -22,8 +22,22 @@ PREFLIGHT CHECKS (before any template work begins)
 5. Confirm manifest advertises the scan-only contract: scan_only=true, uses_ocr=false,
    uses_pdf_text_layer=false, requires_external_visual_review=true,
    visual_review_schema_version present, pdf_support.default_enabled=false.
-6. Run `python generator.py self-test` and confirm it passes (exit 0) on the base file.
-7. Confirm the target scanned PDF can be a render_document()/audit input.
+6. Run `python generator.py self-test`. IMPORTANT: the pristine base template is a
+   scanned template that ships intentionally LOCKED — STATIC_TEXT_CATALOG is empty and
+   STATIC_TEXT_CATALOG_COMPLETE is False (both inside the edit zone). So on the base file
+   self-test is EXPECTED to exit 30 with only the static-text-lock error(s)
+   ("STATIC_TEXT_CATALOG_COMPLETE is False ..." / empty-catalog). Preflight PASSES as long
+   as self-test runs and every reported error is solely one of those pre-adaptation
+   static-text locks. Treat ANY OTHER self-test error (missing/invalid public API,
+   missing manifest field, invalid bbox/table geometry, duplicate keys, invalid presence
+   or missing-policy, etc.) as a real preflight failure (code 30). Do NOT require exit 0
+   here — self-test going green (exit 0, valid=true) is enforced later, after the
+   Generator Engineer transcribes the scan's static lines into STATIC_TEXT_CATALOG and
+   sets STATIC_TEXT_CATALOG_COMPLETE=True during implementation.
+7. Confirm the target scanned PDF can be a render_document()/audit input. On the pristine
+   base a render/annotation attempt returning status 50 because of the same static-text
+   lock is EXPECTED and not a preflight failure — verify only that the PDF is accepted as
+   a source and renders as an image (one target page, correct dimensions).
 8. Search statically for any OCR or PDF-text-extraction usage that must not be present.
 9. Record any genuine runtime defect that would require a minimal change outside the
    edit zone (justify it; do not perform the change here).

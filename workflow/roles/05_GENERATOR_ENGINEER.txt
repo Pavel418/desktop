@@ -25,6 +25,12 @@ IMPLEMENTATION MODE
 
 1. Write the full EDIT-ZONE plan (metadata, geometry, FIELD_CATALOG, STATIC_TEXT_CATALOG,
    ERASE_SPECS, sample data). Keep GENERATOR_ID/DOCUMENT_TYPE/TEMPLATE_VERSION correct.
+   For this scanned template you MUST transcribe every readable static line from the
+   Architect's plan into STATIC_TEXT_CATALOG and, once it is complete and verified against
+   the scan, set STATIC_TEXT_CATALOG_COMPLETE=True. The base ships locked
+   (empty catalog, flag False); until you complete the catalog and flip this flag,
+   self-test exits 30, render annotation returns 50, and edge-case generation is locked.
+   Never set the flag True with an empty or partial catalog.
 2. Do not weaken or bypass the runtime's enforcement: max_chars before drawing, no
    truncation/ellipsis, wrapping per field policy, shrink only to min_font_size, fail
    with TEXT_CANNOT_FIT when complete text cannot fit, glyph-coverage checks,

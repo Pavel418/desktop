@@ -12,5 +12,7 @@ yarn-error.log*
 TODO_*.md
 private-workflows/
 
-# Local batch input/output data (PDFs, generated files, chat logs).
+# Local batch input/output data (target PDFs, generated files, chat logs).
+# The agentic workflow itself (role prompts, WORKFLOW.md, base generator.py) is tracked
+# under workflow/ — only the bulky/local sample data under input/ is ignored.
 /input/

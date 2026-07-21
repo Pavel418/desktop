@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- Replaced the single-shot prompt mode with an **agentic, role-separated workflow**. For each PDF the driver now runs one ChatGPT chat through a fixed sequence of roles — Contract Auditor (preflight) → Template Analyst → Template Architect → Generator Engineer → QA Auditor (template, background, baseline, edge, regression) → Repair loop → package (audit phase 2 with a visual-review envelope) → Contract Auditor (release) → Final Auditor — with creation and approval separated, evidence-driven stage gates, targeted repair reruns, and the two-phase `audit` + visual-review-envelope contract of `generator.py`.
+- Added `workflow-orchestrator.mjs` (the mechanical Controller: gate state machine, structured-handoff parsing, append-only issue log, rerun dependency map, causal status-code selection) and rewrote `run-batch.mjs` to drive it.
+- The agentic workflow documents are now tracked in the repo under `workflow/` (`WORKFLOW.md`, `roles/*.txt`, and the base `generator.py`).
+- `batch.config.json` now takes `baseGenerator` + `workflowDir` (instead of `template` + `promptFile`) and a `workflow` block (`maxRepairRounds`, `perTurnTimeoutMs`, `successCode`, `maxRetry`).
+
+### Removed
+- Removed the monolithic single prompt (`input/prompt.txt`), the `continueCodes`/`continueMessage`/`maxContinue` "continue" nudging, the fresh-chat status-code retry policy, and schema chaining (`chainSchema`). Only the agentic workflow remains.
+
 ## 0.3.0 - 2026-07-20
 
 ### Changed

@@ -1,0 +1,50 @@
+ROLE: CONTROLLER (reference)
+
+The mechanical controller is the external JS orchestrator (workflow-orchestrator.mjs).
+It, not a model turn, owns stage order, gate enforcement, issue routing, rerun
+calculation, and the final status code. This file documents the control policy so every
+role knows how it is being driven; the orchestrator implements it in code.
+
+MISSION
+
+Control stage order, artifact ownership, issue routing, and reruns. Never edit or
+approve document artifacts.
+
+POLICY
+
+1. Assign one run_id per PDF and open one fresh (temporary) chat with the target PDF and
+   generator.py attached.
+2. Verify the source scan and base generator exist before starting.
+3. Drive roles in the required order (see WORKFLOW.md execution sequence).
+4. Ensure only the designated writer role modifies each artifact; the writer is always
+   followed by an independent auditor (creation != approval).
+5. Reject incomplete or unparseable handoffs (re-ask once, then treat as blocked/99).
+6. Never advance past a failed or blocked mandatory gate.
+7. Route every issue to the role that owns its root cause.
+8. Compute dependency-based reruns from the rerun map; rerun only what changed, then one
+   clean full regression.
+9. Ensure every fixed issue is independently verified before release.
+10. Ensure every one of the 17 edge cases has its own individual result.
+11. Route to Final Auditor only after the clean regression passes and phase-2 audit
+    (with the visual-review envelope) returns 0.
+12. Select the global failure code from the causal failing stage, not the highest code.
+13. Preserve every secondary error in generator_report.json.
+
+GATES (in order)
+
+- preflight:   Contract Auditor (preflight) passed.
+- template:    QA Auditor (template) passed.
+- background:  QA Auditor (background) passed.
+- baseline:    QA Auditor (baseline) passed for normal + stress samples.
+- edge:        QA Auditor (edge) passed for all 17 cases individually.
+- regression:  QA Auditor (regression) clean full run passed with no repairs during it.
+- release:     Contract Auditor (release) passed AND phase-2 audit returned 0.
+- final:       Final Auditor passed.
+
+DO NOT
+
+- Edit generator.py, geometry, or labels.
+- Approve visual quality.
+- Treat missing reviews as passes.
+- Assign global status 0 before final approval.
+- Skip a failed stage because later artifacts look plausible.

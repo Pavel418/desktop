@@ -1,11 +1,18 @@
 #!/usr/bin/env node
-// Batch driver: for each "entry directory", run its PDFs through ChatGPT and
-// download the files ChatGPT generates.
+// Batch driver for the agentic document-generator workflow.
+//
+// For each "entry directory" of target scanned PDFs, and for each selected PDF, this
+// opens one fresh ChatGPT chat (with the PDF and the base generator.py attached) and
+// runs the multi-role agentic workflow (workflow-orchestrator.mjs): Contract Auditor →
+// Template Analyst → Template Architect → Generator Engineer → QA Auditor (template,
+// background, baseline, edge, regression) → Repair loop → package (audit phase 2 with a
+// visual-review envelope) → Contract Auditor (release) → Final Auditor. Creation and
+// approval are separated, gates are enforced, repairs rerun only what changed, and the
+// run ends by downloading the three persistent files (generator.py, manifest.json,
+// generator_report.json) and recording the numeric status.
 //
 //   - Entry directories run in PARALLEL (bounded by `concurrency`).
 //   - PDFs WITHIN an entry run STRICTLY SEQUENTIALLY.
-//   - The first PDF of an entry makes ChatGPT emit a "schema" file; that file is
-//     then attached to every later PDF in the same entry.
 //   - Each PDF is its own fresh ChatGPT chat.
 //
 // Usage:
@@ -20,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { ChromeCdpBrowserBackend } from './chrome-cdp-backend.mjs';
 import { ChatGPTController } from './chatgpt-controller.mjs';
 import { defaultStateDir } from './state.mjs';
+import { WorkflowOrchestrator, loadRoles } from './workflow-orchestrator.mjs';
 import {
   resolveChromeExecutablePath,
   resolveChromeDebugPort,
@@ -74,53 +82,27 @@ async function loadConfig(configPath) {
   return parsed;
 }
 
-async function resolvePrompt(entry) {
-  if (typeof entry.prompt === 'string' && entry.prompt.trim()) return entry.prompt;
-  if (typeof entry.promptFile === 'string' && entry.promptFile.trim()) {
-    return await fs.readFile(path.resolve(entry.promptFile), 'utf8');
-  }
-  throw new Error(`entry "${entry.name}" needs a "prompt" or "promptFile"`);
-}
-
 async function normalizeEntry(entry, index, defaults = {}) {
   const name = String(entry.name || `entry-${index + 1}`);
   if (!entry.pdfDir) throw new Error(`entry "${name}" is missing "pdfDir"`);
-  if (!entry.template) throw new Error(`entry "${name}" is missing "template"`);
+
+  const baseGeneratorRaw = entry.baseGenerator || entry.template;
+  if (!baseGeneratorRaw) throw new Error(`entry "${name}" is missing "baseGenerator"`);
+  if (!entry.workflowDir) throw new Error(`entry "${name}" is missing "workflowDir"`);
 
   const pdfDir = path.resolve(entry.pdfDir);
-  const template = path.resolve(entry.template);
+  const baseGenerator = path.resolve(baseGeneratorRaw);
+  const workflowDir = path.resolve(entry.workflowDir);
   const outDir = entry.outDir ? path.resolve(entry.outDir) : path.join(pdfDir, 'output');
-  const schemaNamePattern = String(entry.schemaNamePattern || 'schema');
   const randomOne = entry.randomOne ?? defaults.randomOne ?? false;
   const randomPerSubdir = entry.randomPerSubdir ?? defaults.randomPerSubdir ?? false;
-  const chainSchema = entry.chainSchema ?? defaults.chainSchema ?? false;
-  const prompt = await resolvePrompt(entry);
 
-  await fs.access(template); // fail fast if the template file is missing
+  await fs.access(baseGenerator); // fail fast if the base generator is missing
+  const roles = await loadRoles(workflowDir); // fail fast if the role prompts are missing
   const stat = await fs.stat(pdfDir).catch(() => null);
   if (!stat?.isDirectory()) throw new Error(`entry "${name}": pdfDir is not a directory: ${pdfDir}`);
 
-  return { name, pdfDir, template, outDir, schemaNamePattern, randomOne, randomPerSubdir, chainSchema, prompt };
-}
-
-const CODE_LANG_EXT = {
-  python: 'py', py: 'py', json: 'json', javascript: 'js', js: 'js', typescript: 'ts', ts: 'ts',
-  bash: 'sh', sh: 'sh', shell: 'sh', text: 'txt', markdown: 'md', md: 'md', html: 'html',
-  xml: 'xml', csv: 'csv', yaml: 'yaml', yml: 'yaml', sql: 'sql'
-};
-
-// Persist each fenced code block from a reply as its own file.
-async function writeCodeBlocks(codeBlocks, outDir, stem) {
-  const written = [];
-  for (let c = 0; c < codeBlocks.length; c++) {
-    const cb = codeBlocks[c] || {};
-    const ext = CODE_LANG_EXT[String(cb.language || '').toLowerCase()] || 'txt';
-    const name = codeBlocks.length === 1 ? `${stem}.${ext}` : `${stem}-${c + 1}.${ext}`;
-    const p = path.join(outDir, name);
-    await fs.writeFile(p, String(cb.text || ''));
-    written.push({ path: p, name });
-  }
-  return written;
+  return { name, pdfDir, baseGenerator, workflowDir, roles, outDir, randomOne, randomPerSubdir };
 }
 
 async function listPdfs(dir) {
@@ -140,6 +122,16 @@ async function loadSelectors(stateDir) {
   } catch {
     return defaults;
   }
+}
+
+// Render the multi-turn transcript to a readable text log.
+function renderTranscript(transcript) {
+  return (transcript || [])
+    .map((t, i) => {
+      const head = `----- turn ${i + 1}: ${t.role}${t.mode ? '/' + t.mode : ''}${t.reask ? ' (re-ask)' : ''} -----`;
+      return `${head}\n${t.text || ''}`;
+    })
+    .join('\n\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +154,7 @@ export async function runPool(items, limit, worker) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-entry processing (sequential inside; schema threaded forward)
+// PDF selection
 // ---------------------------------------------------------------------------
 
 function defaultMakeController(opts) {
@@ -201,24 +193,23 @@ async function selectPdfs(entry) {
   return all.map((p) => ({ path: p, group: '' }));
 }
 
-// Extract the last "STATUS_CODE: N" from a reply. Returns null if absent.
-export function parseStatusCode(text) {
-  const all = String(text || '').match(/STATUS_CODE:\s*(\d+)/gi);
-  if (!all || !all.length) return null;
-  const n = Number((all[all.length - 1].match(/(\d+)/) || [])[1]);
-  return Number.isFinite(n) ? n : null;
-}
+// ---------------------------------------------------------------------------
+// Per-entry processing (sequential inside)
+// ---------------------------------------------------------------------------
 
-const DEFAULT_STATUS_POLICY = {
+const DEFAULT_WORKFLOW_CONFIG = {
+  maxRepairRounds: 4,
+  perTurnTimeoutMs: 900000,
   successCode: 0,
-  continueCodes: new Set([70, 80]),
-  continueMessage: 'continue',
-  maxContinue: 3,
   maxRetry: 1
 };
 
-export async function processEntry({ entry, backend, selectors, stateDir, show, timeoutMs, debug = false, chatUrl = 'https://chatgpt.com/', newChat = true, statusPolicy = DEFAULT_STATUS_POLICY, makeController = defaultMakeController }) {
-  const summary = { name: entry.name, schema: null, pdfs: [], aborted: false };
+export async function processEntry({
+  entry, backend, selectors, stateDir, show, timeoutMs, debug = false,
+  chatUrl = 'https://chatgpt.com/', newChat = true,
+  workflowConfig = DEFAULT_WORKFLOW_CONFIG, makeController = defaultMakeController
+}) {
+  const summary = { name: entry.name, pdfs: [], aborted: false };
   const pdfs = await selectPdfs(entry);
 
   if (pdfs.length === 0) {
@@ -227,11 +218,9 @@ export async function processEntry({ entry, backend, selectors, stateDir, show, 
   }
 
   await fs.mkdir(entry.outDir, { recursive: true });
-  const schemaRe = new RegExp(entry.schemaNamePattern, 'i');
-  const chainSchema = entry.chainSchema && pdfs.length > 1;
-  let schemaPath = null;
+  const maxRetry = Number.isFinite(workflowConfig.maxRetry) ? workflowConfig.maxRetry : 1;
 
-  log(`[${entry.name}] ${pdfs.length} PDF(s); output → ${entry.outDir}${chainSchema ? ' (schema chaining ON)' : ''}`);
+  log(`[${entry.name}] ${pdfs.length} PDF(s); workflow=${entry.workflowDir}; output → ${entry.outDir}`);
 
   for (let i = 0; i < pdfs.length; i++) {
     const pdf = pdfs[i].path;
@@ -241,17 +230,15 @@ export async function processEntry({ entry, backend, selectors, stateDir, show, 
     const iterOut = group
       ? path.join(entry.outDir, group)
       : path.join(entry.outDir, `${String(i + 1).padStart(2, '0')}-${stem}`);
-    const record = { pdf: path.basename(pdf), group, files: [], error: null, status: null, attempts: 0 };
-    const attachments = [pdf, entry.template, ...(chainSchema && schemaPath ? [schemaPath] : [])];
+    const record = { pdf: path.basename(pdf), group, files: [], error: null, status: null, attempts: 0, gatesPassed: [] };
 
-    let resolved = false; // success OR a final (non-retryable) outcome
-    for (let attempt = 0; attempt <= statusPolicy.maxRetry && !resolved; attempt++) {
+    let resolved = false;
+    for (let attempt = 0; attempt <= maxRetry && !resolved; attempt++) {
       record.attempts = attempt + 1;
-      const label = `${labelBase}${attempt > 0 ? ` [retry ${attempt}/${statusPolicy.maxRetry}]` : ''}`;
+      const label = `${labelBase}${attempt > 0 ? ` [retry ${attempt}/${maxRetry}]` : ''}`;
       let session = null;
-      const texts = [];
       try {
-        log(`[${label}] opening chat (attachments: ${attachments.map((a) => path.basename(a)).join(', ')})`);
+        log(`[${label}] opening chat (attachments: ${[pdf, entry.baseGenerator].map((a) => path.basename(a)).join(', ')})`);
         session = await backend.createSession({ url: chatUrl, show });
         const controller = makeController({
           page: session.page,
@@ -263,84 +250,54 @@ export async function processEntry({ entry, backend, selectors, stateDir, show, 
           onUnblocked: () => log(`[${label}] resolved — continuing`)
         });
 
-        const result = await controller.query({ prompt: entry.prompt, attachments, timeoutMs, newChat });
-        texts.push(String(result?.text || ''));
-        let status = parseStatusCode(result?.text);
-        log(`[${label}] STATUS_CODE ${status ?? 'none'} (${String(result?.text || '').length} chars)`);
+        const orchestrator = new WorkflowOrchestrator({
+          roles: entry.roles,
+          config: workflowConfig,
+          log: (msg) => log(`[${label}] ${msg}`)
+        });
 
-        // "continue" nudges in the SAME chat while the status is a continue code.
-        let continues = 0;
-        while (status != null && statusPolicy.continueCodes.has(status) && continues < statusPolicy.maxContinue) {
-          continues += 1;
-          log(`[${label}] STATUS_CODE ${status} → sending "${statusPolicy.continueMessage}" (${continues}/${statusPolicy.maxContinue})`);
-          const cont = await controller.followUp({ text: statusPolicy.continueMessage, timeoutMs });
-          texts.push(`\n----- continue ${continues} -----\n${String(cont?.text || '')}`);
-          const s2 = parseStatusCode(cont?.text);
-          if (s2 != null) status = s2;
-          log(`[${label}] after continue ${continues}: STATUS_CODE ${status ?? 'none'}`);
-        }
-        record.status = status;
+        const res = await orchestrator.run({
+          pdf,
+          baseGenerator: entry.baseGenerator,
+          outDir: iterOut,
+          controller,
+          timeoutMs,
+          newChat,
+          runId: `RUN-${String(i + 1).padStart(4, '0')}`
+        });
 
-        // Always log the full chat text (temp chats are not saved by ChatGPT).
+        record.status = res.statusCode;
+        record.gatesPassed = res.gatesPassed;
+        record.files = res.files.map((f) => f.path);
+
+        // Persist the transcript and issue log (temporary chats aren't saved by ChatGPT).
         await fs.mkdir(iterOut, { recursive: true });
-        await fs.writeFile(path.join(iterOut, `${stem}.response.txt`), texts.join('\n'));
+        await fs.writeFile(path.join(iterOut, `${stem}.response.txt`), renderTranscript(res.transcript));
+        await fs.writeFile(path.join(iterOut, `${stem}.issues.json`), JSON.stringify(res.issues, null, 2));
 
-        // status 0 (success) or absent → save outputs; a retry code → retry.
-        if (status === statusPolicy.successCode || status == null) {
-          const entities = await controller.downloadLastAssistantEntities({ outDir: iterOut });
-          const files = await controller.downloadLastAssistantFiles({ maxFiles: 20, outDir: iterOut });
-          const written = await writeCodeBlocks(Array.isArray(result?.codeBlocks) ? result.codeBlocks : [], iterOut, stem);
-          const savedNames = [...entities, ...files, ...written].map((f) => ({ path: f.path, name: f.name }));
-          record.files = savedNames.map((s) => s.path);
-          log(`[${label}] STATUS_CODE ${status ?? 'none'} → saved ${entities.length} file button(s) + ${files.length} link(s) + ${written.length} code block(s) → ${iterOut}`);
-          if (status == null) log(`[${label}] ⚠ no STATUS_CODE in reply — saved outputs anyway`);
-          if (savedNames.length === 0) log(`[${label}] ⚠ reply produced no files`);
+        log(`[${label}] status ${res.statusCode} | gates: ${res.gatesPassed.join('→') || 'none'} | ${res.files.length} file(s)`);
 
-          if (chainSchema && i === 0) {
-            const schema = savedNames.find((f) => schemaRe.test(f.name));
-            if (!schema) {
-              record.error = `schema_not_found_in_first_iteration (got: ${savedNames.map((f) => f.name).join(', ') || 'nothing'})`;
-              summary.aborted = true;
-              log(`[${entry.name}] aborting entry (first iteration produced no schema to chain)`);
-            } else {
-              schemaPath = path.join(entry.outDir, `schema${path.extname(schema.name) || '.json'}`);
-              await fs.copyFile(schema.path, schemaPath);
-              summary.schema = schemaPath;
-              log(`[${label}] schema identified → ${schemaPath}`);
-            }
-          }
+        if (res.success) {
+          if (res.files.length === 0) log(`[${label}] ⚠ success status but no persistent files captured`);
           resolved = true;
-        } else if (attempt < statusPolicy.maxRetry) {
-          log(`[${label}] STATUS_CODE ${status} → retrying in a fresh chat`);
-          // loop continues with a new attempt
+        } else if (attempt < maxRetry) {
+          log(`[${label}] status ${res.statusCode} (failed at ${res.failedStage}) → retrying in a fresh chat`);
         } else {
-          // Retries exhausted (or a continue code that never reached success):
-          // keep whatever files were produced, record the failing status.
-          const entities = await controller.downloadLastAssistantEntities({ outDir: iterOut }).catch(() => []);
-          record.files = entities.map((f) => f.path);
-          record.error = `status_${status}`;
-          log(`[${label}] STATUS_CODE ${status} → giving up (saved ${entities.length} file(s))`);
+          record.error = `status_${res.statusCode}${res.failedStage ? `@${res.failedStage}` : ''}`;
+          log(`[${label}] status ${res.statusCode} → giving up`);
           resolved = true;
         }
       } catch (err) {
         record.error = err?.message || String(err);
         log(`[${label}] ERROR: ${record.error}`);
-        try {
-          if (texts.length) { await fs.mkdir(iterOut, { recursive: true }); await fs.writeFile(path.join(iterOut, `${stem}.response.txt`), texts.join('\n')); }
-        } catch {}
-        if (attempt >= statusPolicy.maxRetry) {
-          if (chainSchema && i === 0) { summary.aborted = true; log(`[${entry.name}] aborting entry (first iteration failed)`); }
-          resolved = true;
-        } else {
-          log(`[${label}] → retrying in a fresh chat after error`);
-        }
+        if (attempt >= maxRetry) resolved = true;
+        else log(`[${label}] → retrying in a fresh chat after error`);
       } finally {
         if (session) await session.close().catch(() => {});
       }
     }
 
     summary.pdfs.push(record);
-    if (summary.aborted) break;
   }
 
   return summary;
@@ -355,7 +312,7 @@ async function main() {
   const config = await loadConfig(configPath);
 
   const show = argFlag('--headless') ? false : argFlag('--show') ? true : config.show !== false;
-  const timeoutMs = Number(argValue('--timeout-ms', config.timeoutMs || 600000));
+  const timeoutMs = Number(argValue('--timeout-ms', config.timeoutMs || 900000));
 
   // --only <name>[,<name>...] runs just the named entry directories.
   const onlyArg = argValue('--only', null);
@@ -370,24 +327,21 @@ async function main() {
   }
 
   const debug = argFlag('--debug') || config.debug === true;
-  // Temporary chats are never in a project, aren't saved to history, and start
-  // fresh each time — so no "New chat" click is needed.
+  // Temporary chats are never in a project, aren't saved to history, and start fresh.
   const temporaryChat = argFlag('--regular-chat') ? false : config.temporaryChat !== false;
   const chatUrl = temporaryChat ? 'https://chatgpt.com/?temporary-chat=true' : 'https://chatgpt.com/';
   const newChat = !temporaryChat;
 
-  const sc = config.status || {};
-  const statusPolicy = {
-    successCode: Number.isFinite(sc.successCode) ? sc.successCode : 0,
-    continueCodes: new Set((Array.isArray(sc.continueCodes) ? sc.continueCodes : [70, 80]).map(Number)),
-    continueMessage: typeof sc.continueMessage === 'string' ? sc.continueMessage : 'continue',
-    maxContinue: Number.isFinite(sc.maxContinue) ? sc.maxContinue : 3,
-    maxRetry: Number.isFinite(sc.maxRetry) ? sc.maxRetry : 1
+  const wf = config.workflow || {};
+  const workflowConfig = {
+    maxRepairRounds: Number.isFinite(wf.maxRepairRounds) ? wf.maxRepairRounds : DEFAULT_WORKFLOW_CONFIG.maxRepairRounds,
+    perTurnTimeoutMs: Number.isFinite(wf.perTurnTimeoutMs) ? wf.perTurnTimeoutMs : timeoutMs,
+    successCode: Number.isFinite(wf.successCode) ? wf.successCode : 0,
+    maxRetry: Number.isFinite(wf.maxRetry) ? wf.maxRetry : DEFAULT_WORKFLOW_CONFIG.maxRetry
   };
   const entryDefaults = {
     randomOne: argFlag('--random-one') ? true : config.randomOne === true,
-    randomPerSubdir: config.randomPerSubdir === true,
-    chainSchema: config.chainSchema === true
+    randomPerSubdir: config.randomPerSubdir === true
   };
   const entries = [];
   for (let i = 0; i < selected.length; i++) {
@@ -411,15 +365,15 @@ async function main() {
 
   log(`Config: ${configPath}`);
   log(`Entries: ${entries.length} | parallel: ${concurrency} | timeout: ${timeoutMs}ms | window: ${show ? 'visible' : 'hidden'} | chat: ${temporaryChat ? 'temporary' : 'regular'}${debug ? ' | debug: ON' : ''}`);
+  log(`Workflow: maxRepairRounds=${workflowConfig.maxRepairRounds} | maxRetry=${workflowConfig.maxRetry} | successCode=${workflowConfig.successCode}`);
   log('Starting Chrome…');
   await backend.start();
 
   let summaries;
   try {
     summaries = await runPool(entries, concurrency, (entry) =>
-      processEntry({ entry, backend, selectors, stateDir, show, timeoutMs, debug, chatUrl, newChat, statusPolicy }).catch((err) => ({
+      processEntry({ entry, backend, selectors, stateDir, show, timeoutMs, debug, chatUrl, newChat, workflowConfig }).catch((err) => ({
         name: entry.name,
-        schema: null,
         pdfs: [],
         aborted: true,
         fatal: err?.message || String(err)
@@ -436,16 +390,13 @@ async function main() {
     const okCount = s.pdfs.filter((p) => !p.error).length;
     const errCount = s.pdfs.filter((p) => p.error).length;
     const totalFiles = s.pdfs.reduce((n, p) => n + p.files.length, 0);
-    log(
-      `• ${s.name}: ${okCount} ok, ${errCount} failed, ${totalFiles} file(s)` +
-        `${s.schema ? `, schema=${path.basename(s.schema)}` : ''}` +
-        `${s.aborted ? ' [ABORTED]' : ''}`
-    );
+    log(`• ${s.name}: ${okCount} ok, ${errCount} failed, ${totalFiles} file(s)${s.aborted ? ' [ABORTED]' : ''}`);
     if (s.fatal) log(`    fatal: ${s.fatal}`);
     for (const p of s.pdfs) {
-      const st = p.status != null ? `STATUS_CODE ${p.status}` : 'no status';
+      const st = p.status != null ? `status ${p.status}` : 'no status';
       const attempts = p.attempts > 1 ? `, ${p.attempts} attempts` : '';
-      log(`    ${p.error ? '✗' : '✓'} ${p.group || p.pdf} (${p.pdf}): ${st}${attempts}${p.error ? ` — ${p.error}` : ` — ${p.files.length} file(s)`}`);
+      const gates = p.gatesPassed && p.gatesPassed.length ? `, gates ${p.gatesPassed.join('→')}` : '';
+      log(`    ${p.error ? '✗' : '✓'} ${p.group || p.pdf} (${p.pdf}): ${st}${attempts}${gates}${p.error ? ` — ${p.error}` : ` — ${p.files.length} file(s)`}`);
     }
     if (errCount > 0 || s.aborted || s.fatal) hadError = true;
   }

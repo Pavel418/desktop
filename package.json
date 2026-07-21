@@ -1,7 +1,7 @@
 {
   "name": "pdf-chatgpt-batch",
   "version": "0.3.0",
-  "description": "Headless batch driver: run directories of PDFs through ChatGPT (with a per-directory Python template + schema chaining) and download the generated files",
+  "description": "Headless batch driver: adapt a synthetic-document generator to directories of scanned PDFs via an agentic, role-separated ChatGPT workflow, and download the generated files",
   "license": "MPL-2.0",
   "type": "module",
   "main": "run-batch.mjs",

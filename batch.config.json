@@ -4,11 +4,10 @@
   "show": true,
   "debug": true,
   "temporaryChat": true,
-  "status": {
+  "workflow": {
+    "maxRepairRounds": 4,
+    "perTurnTimeoutMs": 900000,
     "successCode": 0,
-    "continueCodes": [70, 80],
-    "continueMessage": "continue",
-    "maxContinue": 3,
     "maxRetry": 1
   },
   "chrome": {
@@ -19,9 +18,8 @@
       "name": "coo",
       "pdfDir": "C:/Users/Pavel/Documents/GitHub/desktop/input/coo_merged_output",
       "randomPerSubdir": true,
-      "chainSchema": false,
-      "template": "C:/Users/Pavel/Documents/GitHub/desktop/input/generator.py",
-      "promptFile": "C:/Users/Pavel/Documents/GitHub/desktop/input/prompt.txt",
+      "baseGenerator": "C:/Users/Pavel/Documents/GitHub/desktop/workflow/generator.py",
+      "workflowDir": "C:/Users/Pavel/Documents/GitHub/desktop/workflow",
       "outDir": "C:/Users/Pavel/Documents/GitHub/desktop/input/output"
     }
   ]

@@ -1,0 +1,82 @@
+ROLE: TEMPLATE ARCHITECT
+
+MISSION
+
+Convert the approved scan inventory into one complete EDIT-ZONE plan for generator.py:
+the exact metadata, geometry, FIELD_CATALOG entries, ERASE_SPECS, STATIC_TEXT_CATALOG,
+and table structure the Generator Engineer will write into the "GPT TEMPLATE EDIT ZONE".
+Do not edit generator.py in this role; produce the plan and the master overlay intent.
+
+INPUTS
+
+- scan_inventory.json and the source page image
+- The base generator's canonical schema (`python generator.py schema`) and manifest
+  (`python generator.py describe`) so you reuse existing canonical keys and constraints.
+
+A. PAGE AND TABLE GEOMETRY
+
+1. Define the selected page index, reference size, and reference DPI (set BASE_SIZE,
+   BASE_DPI, SOURCE_PAGE_INDEX, TEMPLATE_VERSION).
+2. Choose TEMPLATE_CONTENT_MODE (scanned/digital/hybrid), STATIC_TEXT_MODE
+   (manual/pdf/hybrid), and BORDER_DETECTION_MODE with a threshold appropriate to the scan.
+3. Define each top-level table bbox; treat a visually continuous grid as one table;
+   split only genuinely independent grids; number tables in sorted visual order.
+4. Define logical rows, columns, anchor cells, row spans, column spans; prove every
+   logical position has exactly one owner, no overlaps, no gaps, valid continuations,
+   every cell inside its table.
+
+B. STATIC TEXT
+
+1. Catalog every readable, visually contiguous static line for STATIC_TEXT_CATALOG with
+   exact text, bbox, angle, table/cell, and reading order (top-to-bottom, then left-to-right).
+2. Do not merge separate visible lines into one entry.
+3. Record top-level text regions outside tables.
+
+C. FIELDS (one F(...) spec per writable/populated variable area)
+
+For every field define: local_key, canonical_key, semantic_type, presence
+(required|recommended|optional), missing_policy (error|omit|blank|synthesize|derive),
+boundary_bbox, reference_bbox/container_bbox when applicable, max_chars, max_lines,
+font_size, min_font_size, font family/weight, alignment, placement strategy + bounded
+jitter, padding, collision group when shared, item_strategy (first|join) for list data,
+source/derivation sources when applicable, and a short description.
+
+D. NATURAL PLACEMENT
+
+No unconstrained random placement. Each field defines a production anchor, bounded
+horizontal/vertical jitter, alignment, baseline group where applicable, line spacing,
+character-wrap permission, and a legibility threshold.
+
+E. SEMANTICS
+
+1. Reuse shared canonical concepts (common.*). Use a document namespace (cmr.*, coo.*,
+   ...) only when no shared concept fits. Never leave canonical_key empty.
+2. Keep shipper, exporter, seller, consignor, carrier, consignee, importer, buyer, and
+   other roles distinct. Declare aliases explicitly.
+3. Do not create signature_present/stamp_present/logo_present or other boolean presence
+   fields.
+4. Declare list strategy explicitly; do not bind list data permanently to item zero.
+
+F. RECONSTRUCTION
+
+Define every ERASE_SPECS region: variable content to remove, static text to preserve or
+redraw, borders to preserve, texture/shading to restore, semantic images to preserve.
+Prefer local_median/clone erase methods; use solid_white only where the source is
+genuinely uniform white.
+
+OUTPUT (temporary)
+
+- template_spec.json  (the full EDIT-ZONE plan above, machine-readable)
+- master_overlay intent: the plan must be renderable as an overlay showing table IDs,
+  cell keys, field keys, field/container boundaries, reconstruction regions,
+  semantic-image boxes, and top-level layout elements. (The generator's audit renders
+  the authoritative master_overlay.png from the applied edit zone; this plan must match it.)
+
+PASS CONDITIONS
+
+- Every writable region is represented or explicitly excluded.
+- Every field is inside its container; every table grid is complete.
+- Every field has complete semantics and constraints.
+- Every readable table-text line has a cell assignment.
+
+RETURN the shared handoff object with evidence and next_role.

@@ -439,11 +439,17 @@ class ChromeCdpPageAdapter {
   // Download → capture the download via CDP → close the preview.
   async downloadEntityFiles({ outDir, previewTimeoutMs = 120_000, downloadTimeoutMs = 60_000, debug = () => {} } = {}) {
     await fs.mkdir(outDir, { recursive: true });
+    debug(`downloadPath=${outDir}`);
     try {
       await this.client.send('Browser.setDownloadBehavior', { behavior: 'allowAndName', downloadPath: outDir, eventsEnabled: true });
-    } catch {
+      debug('setDownloadBehavior ok (allowAndName)');
+    } catch (e) {
+      debug(`Browser.setDownloadBehavior failed: ${e?.message}; trying Page.setDownloadBehavior`);
       try { await this.client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: outDir }, this.sessionId); } catch {}
     }
+    // Diagnostics: log every download event regardless of correlation.
+    const offGB = this.client.on('Browser.downloadWillBegin', (p) => debug(`WILLBEGIN guid=${String(p.guid).slice(0, 8)} name=${p.suggestedFilename} url=${String(p.url || '').slice(0, 60)}`));
+    const offGP = this.client.on('Browser.downloadProgress', (p) => { if (p.state !== 'inProgress') debug(`PROGRESS ${p.state} guid=${String(p.guid).slice(0, 8)} recv=${p.receivedBytes} total=${p.totalBytes}`); });
 
     const findLabels = `(() => {
       const nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
@@ -457,9 +463,16 @@ class ChromeCdpPageAdapter {
       }
       return Array.from(new Set(out));
     })()`;
-    const labels = await this.evaluate(findLabels);
+    // The file buttons can render a moment after the reply text settles — poll.
+    let labels = [];
+    const findStart = Date.now();
+    while (Date.now() - findStart < 20_000) {
+      labels = await this.evaluate(findLabels);
+      if (Array.isArray(labels) && labels.length) break;
+      await sleep(1500);
+    }
     debug(`found ${Array.isArray(labels) ? labels.length : 0} file button(s): ${JSON.stringify(labels)}`);
-    if (!Array.isArray(labels) || !labels.length) return [];
+    if (!Array.isArray(labels) || !labels.length) { offGB(); offGP(); return []; }
 
     const closePreview = async () => {
       await this.evaluate(`(() => {
@@ -498,36 +511,52 @@ class ChromeCdpPageAdapter {
       }
       if (!ready) { debug(`preview for "${label}" not ready in time`); await closePreview(); continue; }
 
-      // Arm download capture, then click the Download button.
-      const capture = new Promise((resolve) => {
-        let guid = null; let name = null;
-        const offBegin = this.client.on('Browser.downloadWillBegin', (p) => { if (!guid) { guid = p.guid; name = p.suggestedFilename || label; } });
-        const offProg = this.client.on('Browser.downloadProgress', (p) => {
-          if (guid && p.guid === guid && (p.state === 'completed' || p.state === 'canceled')) { offBegin(); offProg(); resolve({ guid, name, state: p.state }); }
-        });
-        setTimeout(() => { offBegin(); offProg(); resolve(guid ? { guid, name, state: 'timeout' } : null); }, downloadTimeoutMs);
+      // The browser's own download of the file cancels at 0 bytes (the click's
+      // context is torn down), but downloadWillBegin still tells us the file's
+      // authenticated URL. Capture that URL, then fetch the bytes IN-PAGE with the
+      // session cookies and write them ourselves.
+      const urlCapture = new Promise((resolve) => {
+        const off = this.client.on('Browser.downloadWillBegin', (p) => { off(); resolve({ url: p.url, name: p.suggestedFilename || label }); });
+        setTimeout(() => { off(); resolve(null); }, downloadTimeoutMs);
       });
       await this.evaluate(`(() => {
         const d = document.querySelectorAll('[role="dialog"]'); const l = d[d.length - 1]; if (!l) return false;
         const b = Array.from(l.querySelectorAll('button,[role="button"]')).find(x => /^download$/i.test((x.getAttribute('aria-label')||'').trim()));
         if (b) { b.click(); return true; } return false;
       })()`);
-      const res = await capture;
-      debug(`download "${label}" -> ${res ? res.state : 'no-event'}`);
+      const dl = await urlCapture;
+      if (!dl || !dl.url) { debug(`no download URL for "${label}"`); await closePreview(); continue; }
 
-      if (res && res.guid && res.state === 'completed') {
-        const src = path.join(outDir, res.guid);
-        const cleaned = String(res.name || label).replace(/[\\/:*?"<>|]+/g, '-');
-        const parsed = path.parse(cleaned);
-        let finalName = cleaned;
-        for (let s = 1; s < 1000; s++) {
-          try { await fs.access(path.join(outDir, finalName)); finalName = `${parsed.name}-${s}${parsed.ext}`; } catch { break; }
-        }
-        try { await fs.rename(src, path.join(outDir, finalName)); saved.push({ path: path.join(outDir, finalName), name: finalName }); }
-        catch { try { await fs.access(path.join(outDir, cleaned)); saved.push({ path: path.join(outDir, cleaned), name: cleaned }); } catch {} }
+      const fetched = await this.evaluate(`(async () => {
+        try {
+          const r = await fetch(${JSON.stringify(dl.url)}, { credentials: 'include' });
+          if (!r.ok) return { error: 'http_' + r.status };
+          const b = await r.blob();
+          if (b.size > 50 * 1024 * 1024) return { error: 'too_large_' + b.size };
+          const dataUrl = await new Promise((res, rej) => { const fr = new FileReader(); fr.onerror = () => rej(new Error('reader')); fr.onload = () => res(String(fr.result || '')); fr.readAsDataURL(b); });
+          return { dataUrl, size: b.size };
+        } catch (e) { return { error: String((e && e.message) || e) }; }
+      })()`);
+      const m = fetched && fetched.dataUrl ? String(fetched.dataUrl).match(/^data:[^;]*;base64,(.+)$/) : null;
+      if (!m) {
+        debug(`fetch "${label}" failed: ${fetched?.error || 'no data'}`);
+        await closePreview();
+        continue;
       }
+      const buf = Buffer.from(m[1], 'base64');
+      const cleaned = String(dl.name || label).replace(/[\\/:*?"<>|]+/g, '-');
+      const parsed = path.parse(cleaned);
+      let finalName = cleaned;
+      for (let s = 1; s < 1000; s++) {
+        try { await fs.access(path.join(outDir, finalName)); finalName = `${parsed.name}-${s}${parsed.ext}`; } catch { break; }
+      }
+      await fs.writeFile(path.join(outDir, finalName), buf);
+      saved.push({ path: path.join(outDir, finalName), name: finalName });
+      debug(`saved "${finalName}" (${buf.length} bytes)`);
       await closePreview();
     }
+    offGB();
+    offGP();
     return saved;
   }
 

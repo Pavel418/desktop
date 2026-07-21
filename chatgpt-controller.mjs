@@ -860,7 +860,7 @@ export class ChatGPTController {
     return last;
   }
 
-  async #waitForAssistantStable({ timeoutMs = 5 * 60_000, stableMs = 2000, pollMs = 500 } = {}) {
+  async #waitForAssistantStable({ timeoutMs = 5 * 60_000, stableMs = 2000, pollMs = 500, requiredStopAbsentMs = 5000 } = {}) {
     await this.#emitProgress({ phase: 'waiting_for_response', blocked: false, blockedKind: null, blockedTitle: null });
     const assistantSel = JSON.stringify(this.selectors.assistantMessage);
     const stopSel = JSON.stringify(this.selectors.stopButton);
@@ -868,6 +868,7 @@ export class ChatGPTController {
     let last = '';
     let lastChange = Date.now();
     let sawStop = false; // have we observed generation actually running?
+    let stopAbsentSince = null; // when the stop button was last continuously absent
     let continueClicks = 0;
 
     while (Date.now() - start < timeoutMs) {
@@ -892,7 +893,8 @@ export class ChatGPTController {
         last = txt;
         lastChange = Date.now();
       }
-      if (snap?.stop) sawStop = true;
+      if (snap?.stop) { sawStop = true; stopAbsentSince = null; }
+      else if (stopAbsentSince == null) { stopAbsentSince = Date.now(); }
 
       // Click "continue generating" if it appears while not actively streaming.
       if (!snap?.stop && snap?.hasContinue && continueClicks < 3) {
@@ -902,6 +904,7 @@ export class ChatGPTController {
           if (btn) btn.click();
         })()`);
         await sleep(300);
+        stopAbsentSince = null;
         continue;
       }
 
@@ -911,8 +914,12 @@ export class ChatGPTController {
       // button, or enough time passed for an instant reply) — never during the
       // pre-send / thinking-with-empty-node window.
       const started = sawStop || Date.now() - start > 5000;
+      // The code-interpreter flow toggles the stop button between phases (thinking,
+      // running python, writing). Require it to be CONTINUOUSLY absent for a few
+      // seconds so we don't mistake a between-phase gap for completion.
+      const stopGoneLongEnough = stopAbsentSince != null && Date.now() - stopAbsentSince >= requiredStopAbsentMs;
 
-      const done = started && !snap?.stop && txt.length > 0 && stable;
+      const done = started && stopGoneLongEnough && txt.length > 0 && stable;
       if (done) {
         const extra = await this.#eval(`(() => {
           const nodes = Array.from(document.querySelectorAll(${assistantSel}));

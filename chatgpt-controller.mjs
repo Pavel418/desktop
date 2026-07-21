@@ -5,6 +5,27 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// A composer snapshot ({chips, matched, uploading}) only proves EVERY requested file
+// attached when its chip/name-match count reaches the expected count — a single chip
+// (or match) is not enough when more than one file was requested. Exported so the
+// exact boolean the retry loop relies on can be unit-tested without driving real
+// browser timing.
+export function attachmentsComplete(snapshot, expectedCount) {
+  const chips = Number(snapshot?.chips) || 0;
+  const matched = Number(snapshot?.matched) || 0;
+  return chips >= expectedCount || matched >= expectedCount;
+}
+
+// Signature of an attachment snapshot used to detect genuine stalls (no new chip or
+// match count between polls), independent of whether any file has attached yet. Two
+// snapshots with the same key represent no progress since the last poll.
+export function attachmentProgressKey(snapshot) {
+  const chips = Number(snapshot?.chips) || 0;
+  const matched = Number(snapshot?.matched) || 0;
+  const uploading = snapshot?.uploading ? 1 : 0;
+  return `${chips}:${matched}:${uploading}`;
+}
+
 function jitter(minMs, maxMs) {
   const min = Math.max(0, Number(minMs) || 0);
   const max = Math.max(min, Number(maxMs) || 0);
@@ -769,9 +790,15 @@ export class ChatGPTController {
     // back-to-back chats, so the retry budget is generous.
     await this.#eval(`(() => { const e = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]'); if (e) e.focus(); return true; })()`).catch(() => {});
     await sleep(1200);
+    // `detected` (from #waitForAttachments) only means "at least one chip appeared" —
+    // it is NOT proof every requested file attached. Gate the retry loop and the final
+    // success check on `complete`, which requires a chip/name match for every file, so
+    // a partially-attached set (e.g. only the PDF, not generator.py) is retried and, if
+    // it never completes, reported as a failure instead of silently proceeding.
+    const complete = (s) => attachmentsComplete(s, baseNames.length);
     let settle = { detected: false, matched: 0, chips: 0, uploading: false, waitedMs: 0 };
     const maxAttempts = 8;
-    for (let attempt = 1; attempt <= maxAttempts && !settle.detected; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts && !complete(settle); attempt++) {
       let info = null;
       try {
         info = await this.page.setFileInputFiles(absFiles);
@@ -795,14 +822,16 @@ export class ChatGPTController {
         `attach: attempt ${attempt} -> detected=${settle.detected} matchedNames=${settle.matched}/${baseNames.length} ` +
           `chips=${settle.chips} uploading=${settle.uploading} waitedMs=${settle.waitedMs}`
       );
-      if (!settle.detected) {
-        // Nudge the composer to become interactive before the next re-set.
+      if (!complete(settle)) {
+        // Nudge the composer to become interactive before the next re-set. Re-setting
+        // ALL files (not just the missing one) is intentional: ChatGPT's composer
+        // input has no reliable per-file retry, so we resend the full set.
         await this.#eval(`(() => { const e = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]'); if (e) e.focus(); return true; })()`).catch(() => {});
         await sleep(900);
       }
     }
 
-    if (!settle.detected) {
+    if (!complete(settle)) {
       if (this.onDebug) {
         const dump = await this.#eval(
           `(() => { const f = document.querySelector('form') || document.querySelector('main'); return f ? f.outerHTML.slice(0, 4000) : '(no form/main)'; })()`
@@ -810,7 +839,7 @@ export class ChatGPTController {
         this.#debug(`attach: composer HTML (truncated):\n${dump}`);
       }
       const err = new Error('attachment_not_registered');
-      err.data = { files: baseNames, ...settle };
+      err.data = { files: baseNames, ...settle, expected: baseNames.length };
       throw err;
     }
   }
@@ -825,6 +854,7 @@ export class ChatGPTController {
     const stemsJson = JSON.stringify(stems);
     const expected = baseNames.length;
     let quietSince = null;
+    let lastProgressKey = null; // (chips, matched) signature of the last snapshot seen
     let last = { detected: false, matched: 0, chips: 0, uploading: false, waitedMs: 0 };
 
     while (Date.now() - start < timeoutMs) {
@@ -839,7 +869,8 @@ export class ChatGPTController {
         return { matched, chips, uploading };
       })()`);
 
-      // Consider it ready once we see a chip (or matched name) for every file.
+      // `detected` (any chip at all) is kept only for diagnostics/logging — it is NOT
+      // proof every requested file registered. Callers must gate success on `enough`.
       const detected = snap.chips >= expected || snap.matched >= expected || snap.chips > 0;
       last = { detected, matched: snap.matched, chips: snap.chips, uploading: !!snap.uploading, waitedMs: Date.now() - start };
 
@@ -849,11 +880,17 @@ export class ChatGPTController {
         last.waitedMs = Date.now() - start;
         return last;
       }
-      if (!detected && !snap.uploading) {
-        if (quietSince == null) quietSince = Date.now();
-        else if (Date.now() - quietSince > maxQuietMs) return last; // nothing happening — give up early
-      } else {
+      // Give up early on genuine STALLS: no new chip/match count for maxQuietMs, whether
+      // that count is zero (nothing attached yet) or stuck partway (e.g. 1 of 2 files —
+      // the earlier `detected` check alone would wrongly treat this as "keep waiting
+      // forever", hiding a partial attachment for the full timeoutMs).
+      const progressKey = attachmentProgressKey(snap);
+      if (progressKey !== lastProgressKey) {
+        lastProgressKey = progressKey;
         quietSince = null;
+      } else if (!snap.uploading) {
+        if (quietSince == null) quietSince = Date.now();
+        else if (Date.now() - quietSince > maxQuietMs) return last; // no progress — give up early
       }
       await sleep(pollMs);
     }

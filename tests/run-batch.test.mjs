@@ -32,11 +32,13 @@ function passingControllerFactory(recorder, { unparseable = false } = {}) {
     let first = true;
     const reply = (message) => {
       const { role, mode } = roleFromMessage(message);
+      const runId = String(message).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
       if (unparseable) return { text: 'no handoff here' };
       const handoff = {
-        run_id: 'RUN-0001', role, mode, stage_status: 'passed',
-        recommended_status_code: role === 'final_auditor' ? 0 : null,
-        evidence: [], new_issues: [], verified_issues: [], required_reruns: [], next_role: null
+        run_id: runId, role, mode, stage_status: 'passed',
+        recommended_status_code: role === 'final_auditor' || (role === 'controller' && mode === 'finalize') ? 0 : null,
+        artifacts: [{ path: `temporary/${role}-${mode || 'default'}.json`, sha256: 'a'.repeat(64) }],
+        new_issues: [], verified_issues: [], required_reruns: [], next_role: null
       };
       return { text: `notes\n\`\`\`json\n${JSON.stringify(handoff)}\n\`\`\`` };
     };

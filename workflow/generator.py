@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -221,6 +222,9 @@ TEMPLATE_VERSION = "2.0.0"
 SOURCE_PAGE_INDEX = 0
 BASE_DPI = 200
 BASE_SIZE = (1654, 2339)  # Width, height of the normalized reference render in pixels.
+# SHA-256 of selected-page RGB pixel bytes rendered at BASE_DPI. The adapted
+# generator must set this before release; it locks page selection and geometry.
+TEMPLATE_PIXEL_SHA256 = ""
 TEMPLATE_CONTENT_MODE: TemplateContentMode = "scanned"
 STATIC_TEXT_MODE: StaticTextMode = "manual"
 BORDER_DETECTION_MODE: BorderDetectionMode = "dark_ink"
@@ -1141,7 +1145,23 @@ def _to_1000(box: Sequence[float], width: int, height: int) -> list[int]:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    _write_text_atomic(path, text)
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 
@@ -1303,7 +1323,6 @@ def _edge_record(profile: str) -> dict[str, Any]:
 # deterministic regression checks, and an external visual-review handshake.
 # =============================================================================
 
-import os
 import sys
 import unicodedata
 from collections import defaultdict
@@ -1314,7 +1333,7 @@ try:
 except Exception:  # Optional. Pillow fallback remains available.
     TTFont = None  # type: ignore[assignment]
 
-VISUAL_REVIEW_SCHEMA_VERSION = "synthetic-document-visual-review/1.0"
+VISUAL_REVIEW_SCHEMA_VERSION = "synthetic-document-visual-review/1.2"
 VISUAL_REVIEW_REQUIRED_CHECKS = (
     "template_geometry",
     "background_reconstruction",
@@ -1323,6 +1342,10 @@ VISUAL_REVIEW_REQUIRED_CHECKS = (
     "visible_text_coverage",
     "natural_placement",
     "no_source_residue",
+    "geometry_fidelity",
+    "typography_fidelity",
+    "preserved_pixel_integrity",
+    "no_artificial_degradation",
 )
 
 EDGE_CASE_NAMES = (
@@ -1395,6 +1418,7 @@ REQUIRED_SAMPLE_METRICS = (
 REQUIRED_GENERATOR_CHECKS = (
     "syntax_import",
     "self_test",
+    "template_lock",
     "normal_render",
     "weird_render",
     "edge_cases",
@@ -1458,6 +1482,31 @@ def _render_pdf_page(pdf_path: Path, dpi: int) -> Image.Image:
     stat = pdf_path.stat()
     cached = _render_pdf_page_cached(str(pdf_path.resolve()), stat.st_mtime_ns, stat.st_size, dpi, SOURCE_PAGE_INDEX)
     return cached.copy()
+
+
+def _rendered_pixel_sha256(image: Image.Image) -> str:
+    return hashlib.sha256(image.convert("RGB").tobytes()).hexdigest()
+
+
+def _verify_template_lock(source_pdf: Path) -> None:
+    if not re.fullmatch(r"[a-f0-9]{64}", TEMPLATE_PIXEL_SHA256, flags=re.IGNORECASE):
+        raise GeneratorError(
+            30,
+            "TEMPLATE_PIXEL_LOCK_MISSING",
+            "self_test",
+            "TEMPLATE_PIXEL_SHA256 must contain the approved selected-page rendered-pixel hash.",
+        )
+    reference = _render_pdf_page(source_pdf, BASE_DPI).convert("RGB")
+    if reference.size != BASE_SIZE:
+        reference = reference.resize(BASE_SIZE, Image.Resampling.LANCZOS)
+    actual = _rendered_pixel_sha256(reference)
+    if actual.lower() != TEMPLATE_PIXEL_SHA256.lower():
+        raise GeneratorError(
+            10,
+            "TEMPLATE_PIXEL_MISMATCH",
+            "input_validation",
+            f"Selected-page rendered-pixel hash mismatch: expected {TEMPLATE_PIXEL_SHA256}, got {actual}.",
+        )
 
 
 class GeneratorError(Exception):
@@ -2466,7 +2515,7 @@ def _render_document_impl(
         try:
             otsl = _build_otsl(table, cells_by_table[table.table_id], all_text, sx, sy)
             validate_otsl(otsl)
-            otsl_path.write_text(otsl, encoding="utf-8")
+            _write_text_atomic(otsl_path, otsl)
         except Exception as exc:
             otsl_errors.append(_error("OTSL_INVALID", "table_otsl_validation", str(exc), artifact=f"labels/tables/table_{index:03d}.otsl.txt"))
 
@@ -2544,6 +2593,32 @@ def _render_document_impl(
     return report
 
 
+def _remove_output_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def _publish_output_directory(staged: Path, destination: Path) -> None:
+    """Publish one completed output tree while preserving the prior tree on failure."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    backup: Path | None = None
+    if destination.exists() or destination.is_symlink():
+        backup = Path(tempfile.mkdtemp(prefix=f".{destination.name}.backup-", dir=destination.parent))
+        backup.rmdir()
+        os.replace(destination, backup)
+    try:
+        os.replace(staged, destination)
+    except Exception:
+        if backup is not None and backup.exists() and not destination.exists():
+            os.replace(backup, destination)
+        raise
+    else:
+        if backup is not None:
+            _remove_output_path(backup)
+
+
 def render_document(
     source_pdf: str | Path,
     record: Mapping[str, Any],
@@ -2560,7 +2635,10 @@ def render_document(
     placement_profile: str = "natural",
 ) -> dict[str, Any]:
     output_path = Path(output_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    staged = Path(tempfile.mkdtemp(prefix=f".{output_path.name}.stage-", dir=output_path.parent))
     try:
+        _verify_template_lock(Path(source_pdf))
         if TEMPLATE_CONTENT_MODE == "scanned" and not STATIC_TEXT_CATALOG_COMPLETE:
             raise GeneratorError(
                 50,
@@ -2568,10 +2646,10 @@ def render_document(
                 "table_text_bbox_validation",
                 "Scan-only rendering is locked until every readable static table-text line is visually cataloged and independently reviewed.",
             )
-        return _render_document_impl(
+        report = _render_document_impl(
             source_pdf,
             record,
-            output_path,
+            staged,
             output_pdf=output_pdf,
             input_mode=input_mode,
             key_map=key_map,
@@ -2591,10 +2669,21 @@ def render_document(
         report = _make_report(70, "persistent_output", str(exc), {}, {}, errors=[_error("PERSISTENT_OUTPUT_WRITE_FAILED", "persistent_output", str(exc))])
     except Exception as exc:
         report = _make_report(99, "unexpected", str(exc), {}, {}, errors=[_error("UNEXPECTED_ERROR", "unexpected", str(exc))])
+
+    # A failed render publishes only its failure report, so a previous successful
+    # document can never masquerade as the result of the failed request.
+    if report.get("status_code") != 0:
+        _remove_output_path(staged)
+        staged.mkdir(parents=True, exist_ok=True)
+        _write_json(staged / "report.json", report)
     try:
-        _write_json(output_path / "report.json", report)
-    except Exception:
-        pass
+        _publish_output_directory(staged, output_path)
+    except PermissionError as exc:
+        _remove_output_path(staged)
+        return _make_report(70, "persistent_output", str(exc), {}, {}, errors=[_error("PERSISTENT_OUTPUT_WRITE_FAILED", "persistent_output", str(exc))])
+    except Exception as exc:
+        _remove_output_path(staged)
+        return _make_report(99, "unexpected", str(exc), {}, {}, errors=[_error("OUTPUT_PUBLISH_FAILED", "unexpected", str(exc))])
     return report
 
 
@@ -2720,6 +2809,7 @@ def get_generator_manifest() -> dict[str, Any]:
         "page_index": SOURCE_PAGE_INDEX,
         "reference_page_size": list(BASE_SIZE),
         "reference_dpi": BASE_DPI,
+        "template_pixel_sha256": TEMPLATE_PIXEL_SHA256,
         "supported_input_modes": ["canonical", "local"],
         "supported_output_formats": ["png", "pdf"],
         "pdf_support": {"supported": True, "default_enabled": False},
@@ -2739,6 +2829,7 @@ def get_generator_manifest() -> dict[str, Any]:
         "scan_only": True,
         "uses_ocr": False,
         "uses_pdf_text_layer": False,
+        "artificial_degradation": False,
         "static_text_catalog_complete": STATIC_TEXT_CATALOG_COMPLETE,
         "requires_external_visual_review": True,
         "visual_review_schema_version": VISUAL_REVIEW_SCHEMA_VERSION,
@@ -2890,14 +2981,28 @@ def self_test() -> dict[str, Any]:
         required_manifest = {
             "contract_version", "output_contract_version", "canonical_schema_version", "canonical_schema_digest",
             "generator_id", "document_type", "template_version", "page_index", "reference_page_size",
-            "reference_dpi", "supported_input_modes", "supported_output_formats", "pdf_support", "local_fields",
+            "reference_dpi", "template_pixel_sha256", "supported_input_modes", "supported_output_formats", "pdf_support", "local_fields",
             "local_to_canonical_mappings", "field_constraints", "required_canonical_keys", "recommended_canonical_keys",
             "optional_canonical_keys", "synthesizable_keys", "derived_keys", "table_definitions",
-            "supported_annotation_formats", "otsl_tokens", "status_codes",
+            "supported_annotation_formats", "otsl_tokens", "status_codes", "scan_only", "uses_ocr",
+            "uses_pdf_text_layer", "artificial_degradation", "requires_external_visual_review",
+            "visual_review_schema_version",
         }
         missing_manifest = required_manifest - set(manifest)
         if missing_manifest:
             errors.append(f"Manifest missing fields: {sorted(missing_manifest)}")
+        if not re.fullmatch(r"[a-f0-9]{64}", str(manifest.get("template_pixel_sha256", "")), flags=re.IGNORECASE):
+            errors.append("Template rendered-pixel hash is not locked")
+        if (
+            manifest.get("scan_only") is not True
+            or manifest.get("uses_ocr") is not False
+            or manifest.get("uses_pdf_text_layer") is not False
+        ):
+            errors.append("Manifest does not declare strict scan-only operation")
+        if manifest.get("artificial_degradation") is not False:
+            errors.append("Manifest must declare artificial_degradation=false")
+        if manifest.get("visual_review_schema_version") != VISUAL_REVIEW_SCHEMA_VERSION:
+            errors.append("Manifest visual-review schema version is stale")
         first = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         second = json.dumps(get_generator_manifest(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if first != second:
@@ -3509,7 +3614,10 @@ def _required_visual_artifacts(output_root: Path) -> set[str]:
                 required.add(relative)
             if relative.endswith("maximum_permitted_character_length/coverage.json"):
                 required.add(relative)
-    return {relative for relative in required if (output_root / relative).is_file()}
+    # Keep mandatory paths in the set even when the artifact is absent. Filtering them
+    # out here would let an incomplete review envelope pass simply because a required
+    # artifact was never produced.
+    return required
 
 
 def _validate_visual_review(
@@ -3521,12 +3629,21 @@ def _validate_visual_review(
     if review is None:
         return False, [_error("VISUAL_REVIEW_REQUIRED", "visual_quality", "External full-resolution visual review is required before status 0", artifact="_audit_artifacts/artifact_manifest.json")]
     errors: list[dict[str, Any]] = []
-    expected_keys = {"schema_version", "generator_id", "template_version", "status", "checks", "reviewed_artifacts", "issues"}
+    expected_keys = {
+        "schema_version", "generator_id", "template_version", "writer_role", "reviewer_role",
+        "status", "checks", "reviewed_artifacts", "issues",
+    }
     if set(review) != expected_keys:
         errors.append(_error("VISUAL_REVIEW_SCHEMA", "visual_quality", "Visual-review envelope has the wrong top-level schema"))
         return False, errors
     if review["schema_version"] != VISUAL_REVIEW_SCHEMA_VERSION or review["generator_id"] != GENERATOR_ID or review["template_version"] != TEMPLATE_VERSION:
         errors.append(_error("VISUAL_REVIEW_IDENTITY", "visual_quality", "Visual-review identity or version mismatch"))
+    writer_role = review.get("writer_role")
+    reviewer_role = review.get("reviewer_role")
+    if not isinstance(writer_role, str) or not writer_role or not isinstance(reviewer_role, str) or not reviewer_role:
+        errors.append(_error("VISUAL_REVIEW_ROLE_IDENTITY", "visual_quality", "Writer and reviewer role identities are required"))
+    elif writer_role == reviewer_role:
+        errors.append(_error("VISUAL_REVIEW_SELF_APPROVAL", "visual_quality", "The artifact writer cannot approve the visual review"))
     if review["status"] != "passed":
         errors.append(_error("VISUAL_REVIEW_FAILED", "visual_quality", "External visual review did not pass"))
     checks = review.get("checks", {})
@@ -3641,6 +3758,12 @@ def audit_generator(
     warnings.extend(structural.get("warnings", []))
     errors.extend(_error("SELF_TEST", "self_test", message, artifact="generator.py") for message in structural.get("errors", []))
 
+    try:
+        _verify_template_lock(source)
+        checks["template_lock"] = True
+    except GeneratorError as exc:
+        errors.append(exc.as_error())
+
     normal_report: dict[str, Any] = {}
     weird_report: dict[str, Any] = {}
     normal_contract: dict[str, Any] = {}
@@ -3652,6 +3775,8 @@ def audit_generator(
     synthesis_deterministic = False
 
     try:
+        if not checks["template_lock"]:
+            raise GeneratorError(10, "TEMPLATE_LOCK_FAILED", "input_validation", "Source scan does not match the approved template lock.")
         _draw_master_overlay(source, work / "master_overlay.png")
         background = _prepare_background(source, BASE_DPI)
         background.save(work / "reconstructed_background.png")
@@ -3664,7 +3789,7 @@ def audit_generator(
     except Exception as exc:
         errors.append(_error("BACKGROUND_ARTIFACT_FAILURE", "rendering", str(exc), artifact="_audit_artifacts/reconstructed_background.png"))
 
-    if structural["valid"]:
+    if structural["valid"] and checks["template_lock"]:
         normal_dir = work / "normal"
         weird_dir = work / "weird"
         normal_report = _render_document_impl(source, _local_normal_record(), normal_dir / "sample", output_pdf=True, input_mode="local", key_map=None, allow_synthesis=False, require_required=False, dpi=BASE_DPI, seed=seed, scenario="normal", placement_profile="natural", debug_dir=normal_dir / "debug")
@@ -3759,10 +3884,14 @@ def audit_generator(
         status_code = 20
     elif not checks["self_test"]:
         status_code = 30
+    elif not checks["template_lock"]:
+        status_code = 10
     elif not machine_valid:
         if any(error["stage"] in {"annotation_validation", "layout_validation", "table_otsl_validation", "table_text_bbox_validation", "key_information_validation", "output_validation"} for error in errors):
             status_code = 50
-        elif any(error["stage"] in {"rendering", "input_validation"} for error in errors):
+        elif any(error["stage"] == "input_validation" for error in errors):
+            status_code = 10
+        elif any(error["stage"] == "rendering" for error in errors):
             status_code = 40
         else:
             status_code = 60

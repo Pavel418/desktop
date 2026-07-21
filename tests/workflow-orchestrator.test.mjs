@@ -116,8 +116,8 @@ test('parseHandoff: skips an unrelated decoy JSON blob (e.g. a pasted report.jso
 
 test('mergeReruns unions explicit reruns with issue-domain derived reruns, in QA order', () => {
   const modes = mergeReruns(['edge'], [{ domain: 'reconstruction', status: 'open' }]);
-  // reconstruction -> background, baseline, edge ; plus explicit edge
-  assert.deepEqual(modes, ['background', 'baseline', 'edge']);
+  // reconstruction -> background, baseline, fidelity, edge ; plus explicit edge
+  assert.deepEqual(modes, ['background', 'baseline', 'fidelity', 'edge']);
 });
 
 test('mergeReruns ignores unknown rerun names and domains', () => {
@@ -150,6 +150,13 @@ test('IssueLog: repair marks fixed, only auditor verifies, blocking counts unver
   assert.equal(log.blockingForRelease().length, 0);
 });
 
+test('IssueLog accepts v3 handoffs that reference new issues by ID', () => {
+  const log = new IssueLog();
+  log.addNew(['ISSUE-STRING-1']);
+  assert.equal(log.snapshot()[0].issue_id, 'ISSUE-STRING-1');
+  assert.equal(log.snapshot()[0].status, 'open');
+});
+
 // ---------------------------------------------------------------------------
 // Scripted controller for end-to-end orchestration
 // ---------------------------------------------------------------------------
@@ -176,6 +183,7 @@ function scriptedController(recorder, { fail = {}, severity = 'minor', domain = 
   return () => {
     const reply = (message) => {
       const { role, mode } = roleFromMessage(message);
+      const runId = String(message).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
       const key = mode ? `${role}/${mode}` : role;
       recorder.turns.push(key);
       let stage_status = 'passed';
@@ -186,9 +194,10 @@ function scriptedController(recorder, { fail = {}, severity = 'minor', domain = 
         new_issues = [{ issue_id: `ISSUE-${key}`, severity, domain, code: 'X', stage: mode || role, status: 'open' }];
       }
       const handoff = {
-        run_id: 'RUN-0001', role, mode, stage_status,
-        recommended_status_code: role === 'final_auditor' ? 0 : null,
-        evidence: [], new_issues, verified_issues: [], required_reruns: [], next_role: null
+        run_id: runId, role, mode, stage_status,
+        recommended_status_code: role === 'final_auditor' || (role === 'controller' && mode === 'finalize') ? 0 : null,
+        artifacts: [{ path: `temporary/${key}.json`, sha256: 'a'.repeat(64) }],
+        new_issues, verified_issues: [], required_reruns: [], next_role: null
       };
       return { text: `notes\n\`\`\`json\n${JSON.stringify(handoff)}\n\`\`\`` };
     };
@@ -227,8 +236,9 @@ test('run(): happy path passes every gate and returns status 0 with the 3 persis
   assert.equal(res.success, true);
   for (const g of GATES) assert.ok(res.gatesPassed.includes(g), `gate ${g} should pass`);
   assert.deepEqual(res.files.map((f) => f.name).sort(), [...PERSISTENT_FILES].sort());
-  // First turn is the preflight contract auditor; the plan is walked in order.
-  assert.equal(recorder.turns[0], 'contract_auditor/preflight');
+  // The Controller opens the run before preflight; the plan is walked in order.
+  assert.equal(recorder.turns[0], 'controller/start');
+  assert.equal(recorder.turns.at(-1), 'controller/finalize');
 });
 
 test('run(): a recoverable QA gate that fails once is repaired and then passes', async () => {
@@ -244,6 +254,20 @@ test('run(): a recoverable QA gate that fails once is repaired and then passes',
   assert.ok(res.gatesPassed.includes('baseline'));
   // The repair engineer was invoked during recovery.
   assert.ok(recorder.turns.includes('repair_engineer'), 'repair engineer should run');
+  assert.ok(recorder.turns.includes('generator_engineer/repair'), 'generator writer should apply the repair plan');
+});
+
+test('run(): template geometry repair is applied by Template Architect', async () => {
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  const orch = new WorkflowOrchestrator({ roles: makeRoles(), config: { perTurnTimeoutMs: 1000, maxRepairRounds: 2 } });
+  const res = await orch.run({
+    pdf: t.pdf, baseGenerator: t.gen, outDir: t.out,
+    controller: scriptedController(recorder, { fail: { 'qa_auditor/template': 1 }, severity: 'minor', domain: 'geometry' })()
+  });
+  assert.equal(res.success, true);
+  assert.ok(recorder.turns.filter((turn) => turn === 'template_architect').length >= 2);
+  assert.ok(recorder.turns.includes('repair_engineer'));
 });
 
 test('run(): a QA gate that never recovers fails with the causal domain code', async () => {
@@ -258,6 +282,20 @@ test('run(): a QA gate that never recovers fails with the causal domain code', a
   assert.equal(res.statusCode, 60, 'typography domain -> visual quality 60');
   assert.equal(res.failedStage, 'baseline');
   assert.ok(!res.gatesPassed.includes('baseline'));
+});
+
+test('run(): a failed creation stage stops before its auditor', async () => {
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  const orch = new WorkflowOrchestrator({ roles: makeRoles(), config: { perTurnTimeoutMs: 1000 } });
+  const res = await orch.run({
+    pdf: t.pdf, baseGenerator: t.gen, outDir: t.out,
+    controller: scriptedController(recorder, { fail: { 'generator_engineer/background': 1 }, domain: 'reconstruction' })()
+  });
+  assert.equal(res.success, false);
+  assert.equal(res.statusCode, 60);
+  assert.equal(res.failedStage, 'background');
+  assert.ok(!recorder.turns.includes('qa_auditor/background'));
 });
 
 test('run(): an unparseable handoff aborts with status 99', async () => {
@@ -287,4 +325,25 @@ test('PLAN covers every gate exactly once and separates creation from approval',
   for (const g of GATES) assert.ok(auditGates.includes(g), `PLAN must open gate ${g}`);
   // Every writer step is followed later by an auditor (no gate is opened by a writer).
   assert.ok(PLAN.every((s) => !(s.kind === 'write' && s.gate)));
+  assert.deepEqual(
+    PLAN.map(({ role, mode }) => `${role}/${mode || '-'}`),
+    [
+      'controller/start',
+      'contract_auditor/preflight',
+      'template_analyst/-',
+      'template_architect/-',
+      'qa_auditor/template',
+      'generator_engineer/background',
+      'qa_auditor/background',
+      'generator_engineer/implementation',
+      'qa_auditor/baseline',
+      'qa_auditor/fidelity',
+      'qa_auditor/edge',
+      'qa_auditor/regression',
+      'generator_engineer/package',
+      'contract_auditor/release',
+      'final_auditor/-',
+      'controller/finalize'
+    ]
+  );
 });

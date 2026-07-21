@@ -25,11 +25,11 @@ import path from 'node:path';
 
 // Ordered gates (see workflow/WORKFLOW.md "Stage gates").
 export const GATES = [
-  'preflight', 'template', 'background', 'baseline', 'edge', 'regression', 'release', 'final'
+  'preflight', 'template', 'background', 'baseline', 'fidelity', 'edge', 'regression', 'release', 'final'
 ];
 
 // QA modes that a repair round can re-run.
-export const QA_MODES = ['template', 'background', 'baseline', 'edge', 'regression'];
+export const QA_MODES = ['template', 'background', 'baseline', 'fidelity', 'edge', 'regression'];
 
 // Role -> prompt file (under <workflowDir>/roles).
 export const ROLE_FILES = {
@@ -48,29 +48,33 @@ export const ROLE_FILES = {
 // writes an artifact is always followed by an independent auditor. `gate` marks the gate
 // an audit step opens.
 export const PLAN = [
+  { role: 'controller', mode: 'start', gate: null, kind: 'control' },
   { role: 'contract_auditor', mode: 'preflight', gate: 'preflight', kind: 'audit' },
   { role: 'template_analyst', mode: null, gate: null, kind: 'write' },
   { role: 'template_architect', mode: null, gate: null, kind: 'write' },
-  { role: 'generator_engineer', mode: 'implementation', gate: null, kind: 'write' },
   { role: 'qa_auditor', mode: 'template', gate: 'template', kind: 'audit' },
+  { role: 'generator_engineer', mode: 'background', gate: null, kind: 'write' },
   { role: 'qa_auditor', mode: 'background', gate: 'background', kind: 'audit' },
+  { role: 'generator_engineer', mode: 'implementation', gate: null, kind: 'write' },
   { role: 'qa_auditor', mode: 'baseline', gate: 'baseline', kind: 'audit' },
+  { role: 'qa_auditor', mode: 'fidelity', gate: 'fidelity', kind: 'audit' },
   { role: 'qa_auditor', mode: 'edge', gate: 'edge', kind: 'audit' },
   { role: 'qa_auditor', mode: 'regression', gate: 'regression', kind: 'audit' },
   { role: 'generator_engineer', mode: 'package', gate: null, kind: 'write' },
   { role: 'contract_auditor', mode: 'release', gate: 'release', kind: 'audit' },
-  { role: 'final_auditor', mode: null, gate: 'final', kind: 'audit' }
+  { role: 'final_auditor', mode: null, gate: 'final', kind: 'audit' },
+  { role: 'controller', mode: 'finalize', gate: null, kind: 'control' }
 ];
 
 // Repair dependency map: issue domain -> QA modes that must rerun (07_REPAIR_ENGINEER).
 export const RERUN_MAP = {
-  runtime: ['template', 'background', 'baseline', 'edge', 'regression'],
+  runtime: ['regression'],
   geometry: ['template', 'background', 'baseline', 'edge'],
-  reconstruction: ['background', 'baseline', 'edge'],
+  reconstruction: ['background', 'baseline', 'fidelity', 'edge'],
   typography: ['baseline', 'edge'],
   placement: ['baseline', 'edge'],
   annotation: ['baseline', 'edge'],
-  semantics: ['baseline'],
+  semantics: ['template', 'baseline'],
   compatibility: ['baseline'],
   packaging: ['regression']
 };
@@ -78,11 +82,13 @@ export const RERUN_MAP = {
 // Causal status codes (match generator.py STATUS_CODES).
 const DOMAIN_CODE = {
   runtime: 20, compatibility: 20, semantics: 30, geometry: 50, annotation: 50,
-  reconstruction: 60, typography: 60, placement: 60, packaging: 70
+  reconstruction: 60, typography: 60, placement: 60, fidelity: 60, packaging: 70
 };
 const STAGE_CODE = {
-  preflight: 30, template: 50, background: 60, baseline: 60, edge: 60,
-  regression: 99, release: 70, final: 99
+  preflight: 30, template: 50, background: 60, baseline: 60, fidelity: 60, edge: 60,
+  regression: 99, release: 70, final: 99,
+  start: 20, finalize: 20,
+  template_analyst: 50, template_architect: 50, implementation: 20, package: 70
 };
 const SEVERITY_RANK = { critical: 3, major: 2, minor: 1, info: 0 };
 
@@ -148,6 +154,29 @@ function _normaliseHandoff(obj) {
     if (!Array.isArray(obj[key])) obj[key] = [];
   }
   return obj;
+}
+
+const HANDOFF_STATUSES = new Set(['passed', 'failed', 'blocked', 'ready_for_review']);
+
+// Validate the v3 inter-agent envelope at the orchestration boundary. Artifact entries
+// are hash-bound; only control turns may omit artifact evidence.
+function handoffValidationError(handoff, step, runId) {
+  if (!handoff || handoff.run_id !== runId) return 'run_id mismatch';
+  if (handoff.role !== step.role) return 'role mismatch';
+  if ((handoff.mode ?? null) !== (step.mode ?? null)) return 'mode mismatch';
+  if (!HANDOFF_STATUSES.has(handoff.stage_status)) return 'invalid stage_status';
+  if (handoff.recommended_status_code != null && !Number.isFinite(Number(handoff.recommended_status_code))) {
+    return 'recommended_status_code must be numeric or null';
+  }
+  if (!Array.isArray(handoff.artifacts)) return 'artifacts must be an array';
+  if (step.kind !== 'control' && handoff.artifacts.length === 0) return 'artifact evidence is required';
+  for (const artifact of handoff.artifacts) {
+    if (!artifact || typeof artifact.path !== 'string' || !artifact.path) return 'artifact path is missing';
+    if (typeof artifact.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(artifact.sha256)) {
+      return `artifact hash is invalid: ${artifact.path}`;
+    }
+  }
+  return null;
 }
 
 // Extract the handoff object from a reply. A reply may contain several JSON objects
@@ -218,6 +247,7 @@ export class IssueLog {
   }
 
   _ingest(record, { defaultStatus } = {}) {
+    if (typeof record === 'string' && record) record = { issue_id: record };
     if (!record || typeof record !== 'object') return;
     const id = String(record.issue_id || `ISSUE-${this.issues.length + 1}`);
     const existing = this._byId.get(id);
@@ -274,7 +304,7 @@ export class IssueLog {
 
 const DEFAULT_CONFIG = {
   maxRepairRounds: 4,
-  perTurnTimeoutMs: 900000,
+  perTurnTimeoutMs: 7_200_000,
   successCode: 0,
   reAskOnBadHandoff: true
 };
@@ -291,17 +321,15 @@ export class WorkflowOrchestrator {
   // Compose the message text for one role turn.
   _composeMessage(step, ctx, { includeShared }) {
     const parts = [];
+    parts.push('===== SHARED ADAPTATION CONTRACT =====');
+    parts.push(this.roles.shared.trim());
     if (includeShared) {
-      parts.push('===== SHARED ADAPTATION CONTRACT =====');
-      parts.push(this.roles.shared.trim());
       parts.push(
         `\nInputs attached to this chat: the target scanned PDF (${ctx.pdfName}) and the base generator.py. ` +
-        `Save the generator as generator.py in your working directory and drive it with its CLI. ` +
-        `Run id: ${ctx.runId}.`
+        `Save the generator as generator.py in your working directory and drive it with its CLI.`
       );
-    } else {
-      parts.push('(The shared adaptation contract from the first message still applies.)');
     }
+    parts.push(`\nActive run id: ${ctx.runId}. Use this exact value in the handoff.`);
     parts.push(`\n===== ROLE: ${step.role.toUpperCase()}${step.mode ? ` (mode: ${step.mode})` : ''} =====`);
     parts.push((this.roles[step.role] || '').trim());
     if (step.mode) parts.push(`\nAct in mode: ${step.mode}.`);
@@ -352,16 +380,22 @@ export class WorkflowOrchestrator {
     let text = String(result?.text || '');
     transcript.push({ role: step.role, mode: step.mode, text });
     let handoff = parseHandoff(text);
+    let validationError = handoff ? handoffValidationError(handoff, step, ctx.runId) : 'handoff JSON not found';
+    if (validationError) handoff = null;
     if (!handoff && this.config.reAskOnBadHandoff) {
-      this.log(`  · ${step.role}${step.mode ? '/' + step.mode : ''}: no valid handoff — re-asking once`);
+      this.log(`  · ${step.role}${step.mode ? '/' + step.mode : ''}: invalid handoff (${validationError}) — re-asking once`);
       const reask = await controller.followUp({
         text: 'Your previous reply did not end with a valid shared-handoff JSON block. ' +
-          'Reply again with ONLY the required fenced ```json handoff object for the same role and mode.',
+          `Reply again with ONLY the required fenced \`\`\`json handoff object. Required identity: ` +
+          `run_id=${ctx.runId}, role=${step.role}, mode=${step.mode ?? 'null'}. ` +
+          'Include an artifacts array and a valid SHA-256 for every listed artifact.',
         timeoutMs: sendOpts.timeoutMs
       });
       text = String(reask?.text || '');
       transcript.push({ role: step.role, mode: step.mode, text, reask: true });
       handoff = parseHandoff(text);
+      validationError = handoff ? handoffValidationError(handoff, step, ctx.runId) : 'handoff JSON not found';
+      if (validationError) handoff = null;
     }
     return { handoff, result, text };
   }
@@ -373,27 +407,58 @@ export class WorkflowOrchestrator {
       const assigned = state.issues.open();
       this.log(`  ↻ repair round ${round}/${this.config.maxRepairRounds} for "${gate}" gate (${assigned.length} open issue(s))`);
 
-      // 1) Repair Engineer addresses the open issues.
+      // 1) Repair Engineer diagnoses the root cause and plans the smallest change.
       const repairTurn = await this._turn(
         controller,
         { role: 'repair_engineer', mode: null, gate },
         { ...state.ctx, gate, assignedIssues: assigned,
-          extra: 'Fix the smallest root-cause domain, re-run self-test and audit phase 1, mark issues fixed, and list required_reruns.' },
+          extra: 'Plan the smallest root-cause correction and list exact required_reruns. Do not edit or verify artifacts; the owning writer applies the change next.' },
         { first: false, timeoutMs: this.config.perTurnTimeoutMs },
         transcript
       );
       if (!repairTurn.handoff) return { recovered: false, code: 99, stage: gate };
+      if (!['passed', 'ready_for_review'].includes(repairTurn.handoff.stage_status)) {
+        return { recovered: false, code: selectFailureCode(state.issues.snapshot(), gate), stage: gate };
+      }
       state.issues.addNew(repairTurn.handoff.new_issues);
-      // A Repair Engineer may mark an issue fixed, never verified — so the ids it reports
-      // addressed (in verified_issues) are downgraded to "fixed" here.
-      state.issues.markFixed(repairTurn.handoff.verified_issues);
 
-      const rerunModes = mergeReruns(repairTurn.handoff.required_reruns, state.issues.open());
+      // 2) The owning writer applies the plan. Template geometry/semantics belongs to
+      // Template Architect; all generator/runtime/reconstruction concerns belong to
+      // Generator Engineer repair mode.
+      const domains = new Set(assigned.map((issue) => String(issue?.domain || '').toLowerCase()).filter(Boolean));
+      const architectOwned = gate === 'template' || domains.has('geometry') || domains.has('semantics');
+      const generatorOwned = gate !== 'template' || [...domains].some((domain) => !['geometry', 'semantics'].includes(domain));
+      const writerSteps = [];
+      if (architectOwned) writerSteps.push({ role: 'template_architect', mode: null, kind: 'write' });
+      if (generatorOwned) writerSteps.push({ role: 'generator_engineer', mode: 'repair', kind: 'write' });
+
+      const writerReruns = [];
+      for (const writerStep of writerSteps) {
+        const writerTurn = await this._turn(
+          controller,
+          writerStep,
+          { ...state.ctx, gate, assignedIssues: assigned,
+            extra: 'Apply the Repair Engineer plan in your owned domain. Mark addressed issue IDs fixed, never verified, and return exact required_reruns.' },
+          { first: false, timeoutMs: this.config.perTurnTimeoutMs },
+          transcript
+        );
+        if (!writerTurn.handoff || !['passed', 'ready_for_review'].includes(writerTurn.handoff.stage_status)) {
+          return { recovered: false, code: selectFailureCode(state.issues.snapshot(), gate), stage: gate };
+        }
+        state.issues.addNew(writerTurn.handoff.new_issues);
+        state.issues.markFixed(writerTurn.handoff.verified_issues);
+        writerReruns.push(...writerTurn.handoff.required_reruns);
+      }
+
+      const rerunModes = mergeReruns(
+        [...repairTurn.handoff.required_reruns, ...writerReruns],
+        state.issues.open()
+      );
       // Always re-run at least the failing gate's own mode if it is a QA mode.
       const modes = rerunModes.length ? rerunModes : (QA_MODES.includes(gate) ? [gate] : []);
       this.log(`    reruns: ${modes.join(', ') || '(none)'}`);
 
-      // 2) Re-run the affected QA modes (independent auditor).
+      // 3) Re-run the affected QA modes (independent auditor).
       let gatePassed = false;
       for (const mode of modes) {
         const qaStep = { role: 'qa_auditor', mode, gate: mode };
@@ -469,7 +534,25 @@ export class WorkflowOrchestrator {
       // Apply issue-log transitions.
       state.issues.addNew(turn.handoff.new_issues);
       if (step.kind === 'audit') state.issues.markVerified(turn.handoff.verified_issues);
-      else state.issues.markFixed(turn.handoff.verified_issues);
+      else if (step.kind === 'write') state.issues.markFixed(turn.handoff.verified_issues);
+
+      // Creation roles may hand off either a completed stage or an artifact that is
+      // ready for independent review. Fail closed on blocked, failed, or unknown
+      // statuses instead of continuing to an auditor with incomplete artifacts.
+      if (step.kind !== 'audit' && !['passed', 'ready_for_review'].includes(turn.handoff.stage_status)) {
+        failedStage = step.mode || step.role;
+        const rec = Number(turn.handoff.recommended_status_code);
+        statusCode = Number.isFinite(rec) && rec !== 0
+          ? rec
+          : selectFailureCode(state.issues.snapshot(), failedStage);
+        this.log(`  ✗ "${failedStage}" ${step.kind} stage failed → status ${statusCode}`);
+        break;
+      }
+
+      if (step.role === 'controller' && step.mode === 'finalize') {
+        const rec = turn.handoff.recommended_status_code;
+        if (rec != null && Number.isFinite(Number(rec))) statusCode = Number(rec);
+      }
 
       // Capture the persistent files while they are freshly produced by the package turn.
       if (step.role === 'generator_engineer' && step.mode === 'package') {
@@ -488,7 +571,7 @@ export class WorkflowOrchestrator {
         }
 
         // Non-recoverable stages (preflight/release/final): abort with a causal code.
-        if (!['template', 'background', 'baseline', 'edge', 'regression'].includes(step.gate)) {
+        if (!QA_MODES.includes(step.gate)) {
           failedStage = step.gate;
           const rec = Number(turn.handoff.recommended_status_code);
           statusCode = Number.isFinite(rec) && rec !== 0

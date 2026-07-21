@@ -1,12 +1,12 @@
 {
   "concurrency": 1,
-  "timeoutMs": 900000,
+  "timeoutMs": 7200000,
   "show": true,
   "debug": true,
   "temporaryChat": true,
   "workflow": {
     "maxRepairRounds": 4,
-    "perTurnTimeoutMs": 900000,
+    "perTurnTimeoutMs": 7200000,
     "successCode": 0,
     "maxRetry": 1
   },

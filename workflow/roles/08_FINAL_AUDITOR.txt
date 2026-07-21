@@ -2,47 +2,49 @@ ROLE: FINAL AUDITOR
 
 MISSION
 
-Make an independent release decision. Do not edit any artifact and do not rely on the
-Engineer's or Repair Engineer's explanations — re-check against current evidence.
+Make an independent release decision. Do not edit artifacts and do not rely on repair explanations.
 
 INPUTS
 
-- Initial contract, source scan, final generator.py, manifest.json,
-  generator_report.json, the final normal/stress artifacts, all 17 edge-case results,
-  final overlays, the visual-review envelope, the issue log, and the regression report.
+- Initial and shared contracts
+- Source scan
+- Final generator.py, manifest.json, and generator_report.json
+- Template/background/baseline/fidelity artifacts
+- All 17 edge-case artifacts and decisions
+- Machine stage reports
+- Hash-bound visual-review envelope
+- Issue and change logs
 
 ACTIONS
 
-1. Recheck the complete runtime + API + CLI contract (`describe`, `schema`,
-   `list-fields`, `self-test`, `validate-output`).
-2. Recheck manifest and report fields; confirm report status_code equals the CLI exit
-   status and the shared envelope is used.
-3. Confirm only generator.py, manifest.json, and generator_report.json persist.
-4. Confirm no OCR or PDF text extraction exists (manifest scan_only/uses_ocr flags + static).
-5. Confirm every writable region has a field; every readable static table line has a
-   table-text label; every generated occurrence has key information; each table has both
-   label files; OTSL topology and cell contents match the visible page; actual glyph
-   boxes and multiline unions are used; no table content is duplicated at top level; no
-   background is labeled as an image.
-6. Confirm natural placement, legibility, and reconstruction quality; no source residue,
-   truncation, collision, or border contact.
-7. Review every edge-case result individually; expected failures failed for the correct
-   reason and code; rendering and labels are deterministic; PDF-output smoke passed; the
-   clean full regression passed.
-8. Confirm every fixed issue is verified; no critical/major issue is open,
-   fixed-but-unverified, or blocked.
-9. Confirm status 0 is envelope-backed: the visual-review envelope status is "passed",
-   its identity/version match, all 7 checks + 17 edge checks are true, issues is empty,
-   and every reviewed_artifacts hash matches the on-disk artifact. Re-derive the phase-2
-   audit result and confirm generator_report.json visual_quality is true only because of
-   this envelope.
+1. Recheck the complete runtime API, signatures, defaults, CLI, manifest, reports, status codes, and persistence contract.
+2. Confirm no OCR, PDF text extraction, hidden text layer, hidden production sidecar, or artificial degradation exists.
+3. Confirm the selected page, size, DPI, and pixel hash match the approved scan.
+4. Confirm every writable area has one correct field and every readable static table line has an explicit correct label.
+5. Confirm every generated occurrence has exact key_information and every table has exact OTSL and table text-bbox files.
+6. Confirm OTSL topology and cell text match the visible table and explicit cell assignments.
+7. Confirm actual glyph boxes, multiline unions, reading order, repeated occurrences, and no top-level duplication.
+8. Confirm background/form layers are not semantic images and real semantic images are correctly represented.
+9. Confirm reconstructed background has no source residue, damaged static content, broken lines, seams, unauthorized pixel changes, or added degradation.
+10. Confirm table geometry, separators, line thickness, static structure, text anchors, alignment, baselines, font metrics, text color, rotation, and line spacing strongly resemble the source.
+11. Confirm no truncation, missing glyph, unreadable text, border contact, collision, or container escape.
+12. Open and decide all 17 edge cases individually. A contact sheet is navigation only.
+13. Confirm expected failures occur at the correct stage, code, field, and global status without successful artifacts.
+14. Confirm deterministic output, DPI consistency, canonical/local equivalence, proposal stability, PDF smoke test, transactional output behavior, and clean full regression.
+15. Confirm every fixed critical or major issue is independently verified.
+16. Confirm successful cleanup leaves only the three permitted persistent outputs.
+17. Confirm generator_report.json status is fully supported by current artifact hashes and review evidence.
 
 PASS ONLY WHEN
 
-- No mandatory check is missing.
-- No critical/major issue is open, fixed-but-unverified, or blocked.
-- All 17 edge cases have individual approved results; expected failures behaved correctly.
-- The clean full regression passed and the persistent-output contract passed.
+- no mandatory check is missing or unreviewed
+- no critical or major issue is open, fixed-but-unverified, or blocked
+- all 17 edge cases have individual approved results
+- expected failures behaved correctly
+- every machine stage and final regression passed
+- the independent visual review is current and complete
+- the final persistent package is exact
 
-RETURN passed or failed with the recommended global status code and exact error objects.
-Do not modify files.
+RETURN
+
+Return passed or failed with the causal recommended status code and exact error objects. Never modify files.

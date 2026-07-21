@@ -29,20 +29,21 @@ own target PDFs, one base generator (`baseGenerator`), and the agentic workflow 
   append-only issue log, and drives targeted repair reruns:
 
   ```
-  Contract Auditor (preflight) → Template Analyst → Template Architect →
-  Generator Engineer (edit zone, self-test, audit phase 1) →
-  QA Auditor (template → background → baseline → edge → regression) →
+  Controller (start) → Contract Auditor (preflight) → Template Analyst → Template Architect →
+  QA Auditor (template) → Generator Engineer (background) →
+  QA Auditor (background) → Generator Engineer (implementation) →
+  QA Auditor (baseline → fidelity → edge → regression) →
   Repair loop (targeted reruns) → build visual-review envelope →
   Generator Engineer (package: audit phase 2 with the envelope → status 0) →
-  Contract Auditor (release) → Final Auditor
+  Contract Auditor (release) → Final Auditor → Controller (finalize)
   ```
 
   Creation and approval are separated (a role that writes an artifact never approves it),
-  and each role ends its turn with a structured JSON handoff the orchestrator routes on.
-- The generator's **two-phase `audit`** provides the machine/visual split: phase 1 renders
-  reviewable artifacts and returns status 60; the QA/Final roles review them at full
-  resolution and emit a **visual-review envelope** (hash-verified); phase 2 consumes the
-  envelope and returns 0 only if it is complete, current, and passing. Status 0 is
+  and each role ends its turn with a hash-bound structured JSON handoff the orchestrator routes on.
+- Memory-heavy generator checks run as **isolated machine stages** with stage reports and
+  checkpoints. QA/Final roles review the resulting artifacts at full resolution and emit
+  a **visual-review envelope**; packaging consumes that envelope and returns 0 only if
+  the complete machine run and independent review are current and passing. Status 0 is
   therefore impossible without a genuine external visual review. See
   [workflow/WORKFLOW.md](workflow/WORKFLOW.md).
 - On success only **`generator.py`**, **`manifest.json`**, and **`generator_report.json`**
@@ -62,13 +63,13 @@ Copy and edit `batch.config.json`:
 ```jsonc
 {
   "concurrency": 1,            // max entry directories in parallel
-  "timeoutMs": 900000,         // per-turn timeout (also covers thinking + first-run sign-in)
+  "timeoutMs": 7200000,        // per-turn response timeout (2 hours)
   "show": true,                // show the Chrome windows
   "temporaryChat": true,       // use temporary chats (no project, no history)
   "randomPerSubdir": true,     // one random PDF from each subdirectory of pdfDir
   "workflow": {
     "maxRepairRounds": 4,      // repair→rerun rounds allowed per recoverable QA gate
-    "perTurnTimeoutMs": 900000,// timeout per role turn (defaults to timeoutMs)
+    "perTurnTimeoutMs": 7200000,// timeout per role turn (defaults to timeoutMs)
     "successCode": 0,          // final status that means "done"
     "maxRetry": 1              // max whole-workflow retries in a fresh chat on failure
   },
@@ -93,9 +94,10 @@ Each role turn ends with a structured handoff (`stage_status` +
 
 - An **auditor** turn that reports `stage_status: "passed"` (with no unresolved
   critical/major issue) opens its gate.
-- A recoverable **QA gate** failure (template, background, baseline, edge, regression)
-  triggers a **repair loop**: the Repair Engineer fixes the smallest root-cause domain
-  and only the affected QA modes rerun (dependency map in
+- A recoverable **QA gate** failure (template, background, baseline, fidelity, edge, regression)
+  triggers a **repair loop**: the Repair Engineer plans the smallest root-cause fix,
+  the owning Template Architect or Generator Engineer applies it, and only the affected
+  QA modes rerun (dependency map in
   [workflow/roles/07_REPAIR_ENGINEER.txt](workflow/roles/07_REPAIR_ENGINEER.txt)), up to
   `maxRepairRounds`.
 - A non-recoverable stage failure (preflight, release, final) or an exhausted repair loop
@@ -105,8 +107,8 @@ Each role turn ends with a structured handoff (`stage_status` +
   visual quality, `70` persistent output, `80` partial, `99` internal).
 - The whole workflow is retried in a **fresh chat** up to `maxRetry` times on failure.
 
-Status **0** requires the Final Auditor to pass and the phase-2 `audit` (with the
-visual-review envelope) to have returned 0. Exhausted attempts are logged as failures; the
+Status **0** requires the Final Auditor to pass, the Controller to finalize, and packaging
+with the visual-review envelope to have returned 0. Exhausted attempts are logged as failures; the
 batch continues to the next PDF.
 
 ## Run

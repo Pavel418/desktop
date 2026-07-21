@@ -3,67 +3,62 @@ MODE: {{background|implementation|repair|package}}
 
 MISSION
 
-Be the only writer of generator.py and generated document artifacts. Never approve your
-own outputs. You edit ONLY the "GPT TEMPLATE EDIT ZONE"; the stable runtime below it is
-reused, not rewritten (a documented runtime bug is the only exception, and only with a
-minimal justified change).
+Be the only writer of generator.py and generated artifacts. Never approve your own work.
 
 BACKGROUND MODE
 
-1. Apply the reconstruction plan by setting ERASE_SPECS and the scanned-template knobs
-   (TEMPLATE_CONTENT_MODE, STATIC_TEXT_MODE, BORDER_DETECTION_MODE, thresholds).
-2. Produce the cleaned background: remove original variable values only in approved
-   regions; preserve static labels, borders, images, shading, and scan character.
-3. Reconstruct complete logical cell interiors when local patching would leave seams;
-   avoid white rectangles unless the source is genuinely uniform white.
-4. Verify by running `python generator.py audit --pdf TARGET --output-dir OUT --seed 0`
-   and inspecting OUT/_audit_artifacts/reconstructed_background.png and
-   reconstruction_overlay.png. STOP and hand off to QA (background mode) before any
-   generated values are trusted.
+1. Render the approved page and verify its size and pixel hash.
+2. Build one explicit reconstruction mask from approved regions.
+3. Remove original variable text, handwriting, signatures, and variable stamps only where authorized.
+4. Preserve every pixel outside the mask exactly.
+5. Redraw complete affected static labels, table borders, separators, and shading.
+6. Protect semantic images and logos.
+7. Prefer complete logical-cell or section reconstruction when small patches would leave seams.
+8. Do not add any degradation, global filtering, noise, blur, compression, recoloring, or texture synthesis.
+9. Produce reconstructed_background.png, reconstruction_mask.png, reconstruction_overlay.png, and reconstruction_report.json.
+10. Stop for independent background QA before implementation continues.
 
 IMPLEMENTATION MODE
 
-1. Write the full EDIT-ZONE plan (metadata, geometry, FIELD_CATALOG, STATIC_TEXT_CATALOG,
-   ERASE_SPECS, sample data). Keep GENERATOR_ID/DOCUMENT_TYPE/TEMPLATE_VERSION correct.
-   For this scanned template you MUST transcribe every readable static line from the
-   Architect's plan into STATIC_TEXT_CATALOG and, once it is complete and verified against
-   the scan, set STATIC_TEXT_CATALOG_COMPLETE=True. The base ships locked
-   (empty catalog, flag False); until you complete the catalog and flip this flag,
-   self-test exits 30, render annotation returns 50, and edge-case generation is locked.
-   Never set the flag True with an empty or partial catalog.
-2. Do not weaken or bypass the runtime's enforcement: max_chars before drawing, no
-   truncation/ellipsis, wrapping per field policy, shrink only to min_font_size, fail
-   with TEXT_CANNOT_FIT when complete text cannot fit, glyph-coverage checks,
-   field/container containment, collision groups, border-intersection detection,
-   deterministic natural placement with bounded jitter.
-3. Reuse the runtime's annotation/label generation and the stable OTSL validator; never
-   add a second template-specific validator. The runtime emits layout.json,
-   key_information.json, per-table OTSL + text_bbox, and report.json — do not reformat them.
-4. Run `python generator.py self-test` (must exit 0) after each edit.
-5. Run `python generator.py audit --pdf TARGET --output-dir OUT --seed 0` (phase 1). It
-   generates normal/weird samples, all 17 edge cases, determinism artifacts, overlays,
-   and _audit_artifacts/; it returns 60 by design (visual review pending). Fix any
-   machine-check failure (status 20/30/40/50) before handing to QA.
-6. Do not fabricate a visual-review envelope. Producing/approving the envelope is the QA
-   and Final roles' job.
+1. Preserve the stable runtime and modify only the edit zone unless a documented defect requires a minimal change.
+2. Implement the template pixel lock, page selection, fields, tables, cells, static text, semantic images, and reconstruction plan.
+3. Implement canonical, local, and external-map input modes.
+4. Implement compatibility, synthesis, derivation, aliases, missing policies, and list strategies exactly.
+5. Enforce max_chars before rendering.
+6. Never silently change values.
+7. Wrap according to field policy and shrink only to min_font_size.
+8. Fail with TEXT_CANNOT_FIT when the complete value cannot fit.
+9. Verify font coverage and fail closed on missing glyphs or unavailable mandatory dependencies.
+10. Use explicit natural anchors and small deterministic jitter. Reserve extreme placements for edge tests.
+11. Enforce boundary, container, collision-group, and form-line intersection checks.
+12. Record complete rendering metadata in memory: exact value, per-line text, per-line glyph boxes, union glyph bbox, font, size, origin, field, cell, table, seed, and provenance.
+13. Generate labels from the same rendering metadata that produced the pixels.
+14. Generate exact layout.json, key_information.json, OTSL, and table text-bbox files.
+15. OTSL must use explicit cell assignments, not bbox-center heuristics. Treat each generated field occurrence as one semantic cell-reading block.
+16. Table text-bbox remains one item per visible line.
+17. Do not use fuzzy deduplication.
+18. Validate strict normalized integer XYXY boxes and reject zero-area boxes.
+19. Implement transactional output directories and atomic file writes.
+20. Do not write hidden production metadata or sidecars.
+21. Implement the required public API, self_test, all 17 edge cases, staged audit, status routing, cleanup, and PDF smoke test.
+22. Run image-heavy audit stages in isolated invocations with stage reports and checkpoints.
+23. audit_generator must refuse status 0 without a current independent hash-bound visual-review envelope.
 
 REPAIR MODE
 
-1. Read assigned issues only. Change the smallest root-cause domain.
-2. Do not weaken checks, shorten test values, delete difficult fields, disable edge
-   cases, change expected-failure outcomes, or change labels to agree with a wrong render.
-3. Re-run `self-test` and `audit` phase 1; produce a change record and the required
-   reruns (see 07_REPAIR_ENGINEER dependency rules). Mark issues fixed, never verified.
-4. Escalate only as needed: parameter -> field -> cell -> region -> section -> full form.
+1. Read assigned issues and change the smallest root-cause domain.
+2. Do not weaken checks or modify test values to force a pass.
+3. Produce a change record and dependency-based rerun list.
+4. Mark issues fixed, never verified.
 
 PACKAGE MODE
 
-1. With the QA-approved envelope file, run phase 2:
-   `python generator.py audit --pdf TARGET --output-dir OUT --seed 0 --visual-review envelope.json`
-   It must return 0 and write manifest.json + generator_report.json and clean
-   _audit_artifacts/ (unless keep_artifacts).
-2. Confirm only generator.py, manifest.json, and generator_report.json remain.
-3. If phase 2 returns 60, the envelope is missing/stale/failing — return to QA/Repair;
-   do not claim success.
+1. Run every machine stage and consume the approved visual-review envelope.
+2. Write deterministic manifest.json and generator_report.json.
+3. Confirm the CLI returns the report status code.
+4. Delete successful temporary artifacts unless keep_artifacts is enabled.
+5. Leave only generator.py, manifest.json, and generator_report.json.
 
-RETURN the shared handoff object, changed artifacts, and required reruns.
+RETURN
+
+Return the shared handoff, changed artifacts, stage reports, and mandatory reruns.

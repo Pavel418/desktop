@@ -3,10 +3,11 @@
 //
 // For each "entry directory" of target scanned PDFs, and for each selected PDF, this
 // opens one fresh ChatGPT chat (with the PDF and the base generator.py attached) and
-// runs the multi-role agentic workflow (workflow-orchestrator.mjs): Contract Auditor →
-// Template Analyst → Template Architect → Generator Engineer → QA Auditor (template,
-// background, baseline, edge, regression) → Repair loop → package (audit phase 2 with a
-// visual-review envelope) → Contract Auditor (release) → Final Auditor. Creation and
+// runs the multi-role agentic workflow (workflow-orchestrator.mjs): Controller → Contract
+// Auditor → Template Analyst → Template Architect → template QA → background build/review →
+// implementation → QA (baseline, fidelity, edge, regression) → Repair loop → package
+// (audit phase 2 with a visual-review envelope) → Contract Auditor (release) → Final
+// Auditor → Controller finalization. Creation and
 // approval are separated, gates are enforced, repairs rerun only what changed, and the
 // run ends by downloading the three persistent files (generator.py, manifest.json,
 // generator_report.json) and recording the numeric status.
@@ -23,9 +24,10 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { format } from 'node:util';
 
 import { ChromeCdpBrowserBackend } from './chrome-cdp-backend.mjs';
-import { ChatGPTController } from './chatgpt-controller.mjs';
+import { ATTACHMENT_RUNTIME_REVISION, ChatGPTController } from './chatgpt-controller.mjs';
 import { defaultStateDir } from './state.mjs';
 import { WorkflowOrchestrator, loadRoles } from './workflow-orchestrator.mjs';
 import {
@@ -55,8 +57,13 @@ function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
 }
 
+let activeRunLogPath = null;
+
 function log(...args) {
   console.log(...args);
+  if (activeRunLogPath) {
+    fs.appendFile(activeRunLogPath, `${new Date().toISOString()} ${format(...args)}\n`).catch(() => {});
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +297,7 @@ export async function processEntry({
       } catch (err) {
         record.error = err?.message || String(err);
         log(`[${label}] ERROR: ${record.error}`);
+        if (err?.data) log(`[${label}] ERROR DATA: ${JSON.stringify(err.data)}`);
         if (attempt >= maxRetry) resolved = true;
         else log(`[${label}] → retrying in a fresh chat after error`);
       } finally {
@@ -310,9 +318,13 @@ export async function processEntry({
 async function main() {
   const configPath = path.resolve(argValue('--config', 'batch.config.json'));
   const config = await loadConfig(configPath);
+  const stateDir = defaultStateDir();
+  await fs.mkdir(stateDir, { recursive: true });
+  activeRunLogPath = path.join(stateDir, 'batch-run.log');
+  await fs.writeFile(activeRunLogPath, '');
 
   const show = argFlag('--headless') ? false : argFlag('--show') ? true : config.show !== false;
-  const timeoutMs = Number(argValue('--timeout-ms', config.timeoutMs || 900000));
+  const timeoutMs = Number(argValue('--timeout-ms', config.timeoutMs || 7_200_000));
 
   // --only <name>[,<name>...] runs just the named entry directories.
   const onlyArg = argValue('--only', null);
@@ -352,7 +364,6 @@ async function main() {
   const concurrency = clamp(Number.isFinite(requestedConcurrency) ? requestedConcurrency : entries.length, 1, entries.length);
 
   const chromeSettings = config.chrome || {};
-  const stateDir = defaultStateDir();
   const selectors = await loadSelectors(stateDir);
 
   const backend = new ChromeCdpBrowserBackend({
@@ -364,6 +375,8 @@ async function main() {
   });
 
   log(`Config: ${configPath}`);
+  log(`Runtime source: ${fileURLToPath(import.meta.url)} | attachment=${ATTACHMENT_RUNTIME_REVISION}`);
+  log(`Persistent log: ${activeRunLogPath}`);
   log(`Entries: ${entries.length} | parallel: ${concurrency} | timeout: ${timeoutMs}ms | window: ${show ? 'visible' : 'hidden'} | chat: ${temporaryChat ? 'temporary' : 'regular'}${debug ? ' | debug: ON' : ''}`);
   log(`Workflow: maxRepairRounds=${workflowConfig.maxRepairRounds} | maxRetry=${workflowConfig.maxRetry} | successCode=${workflowConfig.successCode}`);
   log('Starting Chrome…');
@@ -406,7 +419,7 @@ async function main() {
 const isMain = path.resolve(process.argv[1] || '') === fileURLToPath(import.meta.url);
 if (isMain) {
   main().catch((err) => {
-    console.error(`fatal: ${err?.message || err}`);
+    log(`fatal: ${err?.message || err}`);
     process.exitCode = 1;
   });
 }

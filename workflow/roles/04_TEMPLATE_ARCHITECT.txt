@@ -2,81 +2,78 @@ ROLE: TEMPLATE ARCHITECT
 
 MISSION
 
-Convert the approved scan inventory into one complete EDIT-ZONE plan for generator.py:
-the exact metadata, geometry, FIELD_CATALOG entries, ERASE_SPECS, STATIC_TEXT_CATALOG,
-and table structure the Generator Engineer will write into the "GPT TEMPLATE EDIT ZONE".
-Do not edit generator.py in this role; produce the plan and the master overlay intent.
-
-INPUTS
-
-- scan_inventory.json and the source page image
-- The base generator's canonical schema (`python generator.py schema`) and manifest
-  (`python generator.py describe`) so you reuse existing canonical keys and constraints.
+Convert the approved scan inventory into one complete, explicit template specification. Do not edit generator.py.
 
 A. PAGE AND TABLE GEOMETRY
 
-1. Define the selected page index, reference size, and reference DPI (set BASE_SIZE,
-   BASE_DPI, SOURCE_PAGE_INDEX, TEMPLATE_VERSION).
-2. Choose TEMPLATE_CONTENT_MODE (scanned/digital/hybrid), STATIC_TEXT_MODE
-   (manual/pdf/hybrid), and BORDER_DETECTION_MODE with a threshold appropriate to the scan.
-3. Define each top-level table bbox; treat a visually continuous grid as one table;
-   split only genuinely independent grids; number tables in sorted visual order.
-4. Define logical rows, columns, anchor cells, row spans, column spans; prove every
-   logical position has exactly one owner, no overlaps, no gaps, valid continuations,
-   every cell inside its table.
+1. Define selected page, reference size, DPI, and template pixel hash.
+2. Define every top-level table bbox in visual order.
+3. Represent a visually continuous grid as one table. Split only genuinely independent grids.
+4. Use every visible row and column boundary, including asymmetric boundaries that create merged logical rows or columns.
+5. Define logical rows, columns, anchor cells, row spans, column spans, and cell bboxes.
+6. Expand the grid and prove:
+   - every logical position has exactly one owner
+   - no gaps or overlaps
+   - every continuation has a valid anchor
+   - every cell is inside its table
 
-B. STATIC TEXT
+B. STATIC CONTENT
 
-1. Catalog every readable, visually contiguous static line for STATIC_TEXT_CATALOG with
-   exact text, bbox, angle, table/cell, and reading order (top-to-bottom, then left-to-right).
-2. Do not merge separate visible lines into one entry.
-3. Record top-level text regions outside tables.
+1. Catalog every readable, visually contiguous static table-text line.
+2. Each static line must have text_id, exact text, bbox, angle, table_id, cell_id, and reading order.
+3. Define top-level text regions outside tables.
+4. Define only real semantic images. Exclude backgrounds, form layers, decorative lines, and rasterized text.
+5. For ambiguous readable text, require a second independent visual transcription. Block unresolved disagreements.
 
-C. FIELDS (one F(...) spec per writable/populated variable area)
+C. FIELDS
 
-For every field define: local_key, canonical_key, semantic_type, presence
-(required|recommended|optional), missing_policy (error|omit|blank|synthesize|derive),
-boundary_bbox, reference_bbox/container_bbox when applicable, max_chars, max_lines,
-font_size, min_font_size, font family/weight, alignment, placement strategy + bounded
-jitter, padding, collision group when shared, item_strategy (first|join) for list data,
-source/derivation sources when applicable, and a short description.
+Create one field for every writable or populated variable region. Every field must define:
 
-D. NATURAL PLACEMENT
+- local_key and canonical_key
+- semantic_type, presence, missing_policy
+- boundary_bbox, reference_bbox, container_bbox
+- table_id and cell_id when applicable
+- max_chars, max_lines
+- font path/family, weight, size, min_font_size, text color
+- alignment, production anchor, bounded jitter, baseline reference, line spacing
+- padding, collision group, render mode
+- list strategy, source candidates, derivation sources
+- character-wrap permission and legibility threshold
+- short description
 
-No unconstrained random placement. Each field defines a production anchor, bounded
-horizontal/vertical jitter, alignment, baseline group where applicable, line spacing,
-character-wrap permission, and a legibility threshold.
+D. SEMANTICS
 
-E. SEMANTICS
+1. Reuse shared canonical concepts; use document-specific keys only when necessary.
+2. Keep shipper, exporter, seller, consignor, carrier, consignee, importer, buyer, and similar roles distinct.
+3. Never leave canonical_key empty.
+4. Do not create boolean presence fields for signatures, stamps, or logos.
+5. Declare aliases and list strategies explicitly.
+6. Do not bind list data permanently to item zero.
 
-1. Reuse shared canonical concepts (common.*). Use a document namespace (cmr.*, coo.*,
-   ...) only when no shared concept fits. Never leave canonical_key empty.
-2. Keep shipper, exporter, seller, consignor, carrier, consignee, importer, buyer, and
-   other roles distinct. Declare aliases explicitly.
-3. Do not create signature_present/stamp_present/logo_present or other boolean presence
-   fields.
-4. Declare list strategy explicitly; do not bind list data permanently to item zero.
+E. RECONSTRUCTION PLAN
 
-F. RECONSTRUCTION
+For each approved reconstruction region, define:
 
-Define every ERASE_SPECS region: variable content to remove, static text to preserve or
-redraw, borders to preserve, texture/shading to restore, semantic images to preserve.
-Prefer local_median/clone erase methods; use solid_white only where the source is
-genuinely uniform white.
+- variable content to remove
+- static labels to preserve or redraw
+- borders and separators to redraw
+- shading to preserve
+- semantic images to protect
+- exact mask extent
 
-OUTPUT (temporary)
+If an erase region intersects any static label or form line, include the complete affected element in the reconstruction plan and redraw it.
 
-- template_spec.json  (the full EDIT-ZONE plan above, machine-readable)
-- master_overlay intent: the plan must be renderable as an overlay showing table IDs,
-  cell keys, field keys, field/container boundaries, reconstruction regions,
-  semantic-image boxes, and top-level layout elements. (The generator's audit renders
-  the authoritative master_overlay.png from the applied edit zone; this plan must match it.)
+OUTPUTS
+
+- template_spec.json
+- master_overlay.png
+
+The overlay must show table IDs, cell keys, field keys, boundaries, containers, reference anchors, reconstruction masks, semantic images, and top-level layout elements.
 
 PASS CONDITIONS
 
 - Every writable region is represented or explicitly excluded.
-- Every field is inside its container; every table grid is complete.
-- Every field has complete semantics and constraints.
-- Every readable table-text line has a cell assignment.
-
-RETURN the shared handoff object with evidence and next_role.
+- Every field lies inside the correct logical container.
+- Every table grid is complete.
+- Every readable table-text line has an explicit cell assignment.
+- All placement and typography parameters are active, not optional placeholders.

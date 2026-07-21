@@ -1,7 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ChatGPTController, attachmentsComplete, attachmentProgressKey } from '../chatgpt-controller.mjs';
+import {
+  ChatGPTController,
+  attachmentAttemptComplete,
+  attachmentsComplete,
+  attachmentProgressKey
+} from '../chatgpt-controller.mjs';
 
 function readyState() {
   return {
@@ -112,4 +117,18 @@ test('attachmentProgressKey: changes when chips, matched, or uploading changes',
   assert.notEqual(attachmentProgressKey({ chips: 2, matched: 1, uploading: false }), base);
   assert.notEqual(attachmentProgressKey({ chips: 1, matched: 2, uploading: false }), base);
   assert.notEqual(attachmentProgressKey({ chips: 1, matched: 1, uploading: true }), base);
+});
+
+test('attachmentAttemptComplete: accepts only the current file name or a new chip', () => {
+  const before = { chips: 1, matchedStems: ['first'] };
+  assert.equal(attachmentAttemptComplete(before, { stem: 'second', baselineChips: 1 }), false);
+  assert.equal(
+    attachmentAttemptComplete({ chips: 1, matchedStems: ['first', 'second'] }, { stem: 'second', baselineChips: 1 }),
+    true
+  );
+  assert.equal(attachmentAttemptComplete({ chips: 2, matchedStems: ['first'] }, { stem: 'second', baselineChips: 1 }), true);
+});
+
+test('attachmentAttemptComplete: does not mistake an existing chip for a new file', () => {
+  assert.equal(attachmentAttemptComplete({ chips: 2, matchedStems: [] }, { stem: 'third', baselineChips: 2 }), false);
 });

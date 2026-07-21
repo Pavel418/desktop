@@ -3,80 +3,53 @@ MODE: {{preflight|release}}
 
 MISSION
 
-Validate the generator contract and integration behavior against the base generator.py
-and its CLI. This role is read-only: never edit files.
+Read-only validation of runtime architecture, public API, manifest, reports, CLI behavior, stage execution, cleanup, and persistence. Do not judge visual fidelity.
 
-PREFLIGHT CHECKS (before any template work begins)
+PREFLIGHT MODE
 
-1. Parse/compile generator.py without modifying it (`python generator.py describe` and
-   `python generator.py self-test` must run).
-2. Confirm the "GPT TEMPLATE EDIT ZONE" boundary exists and identify the stable runtime
-   below it that must be reused, not rewritten.
-3. Confirm the required public API is present (from `describe` -> manifest.public_api and
-   the module): get_canonical_schema, get_generator_manifest, get_available_fields,
-   assess_compatibility, propose_missing_values, resolve_record, validate_record,
-   render_document, validate_output_contract, generate_edge_cases, self_test,
-   audit_generator.
-4. Confirm the CLI subcommands exist: describe, schema, list-fields, self-test, assess,
-   propose-missing, make-weird-data, render, edge-cases, audit, validate-output.
-5. Confirm manifest advertises the scan-only contract: scan_only=true, uses_ocr=false,
-   uses_pdf_text_layer=false, requires_external_visual_review=true,
-   visual_review_schema_version present, pdf_support.default_enabled=false.
-6. Run `python generator.py self-test`. IMPORTANT: the pristine base template is a
-   scanned template that ships intentionally LOCKED — STATIC_TEXT_CATALOG is empty and
-   STATIC_TEXT_CATALOG_COMPLETE is False (both inside the edit zone). So on the base file
-   self-test is EXPECTED to exit 30 with only the static-text-lock error(s)
-   ("STATIC_TEXT_CATALOG_COMPLETE is False ..." / empty-catalog). Preflight PASSES as long
-   as self-test runs and every reported error is solely one of those pre-adaptation
-   static-text locks. Treat ANY OTHER self-test error (missing/invalid public API,
-   missing manifest field, invalid bbox/table geometry, duplicate keys, invalid presence
-   or missing-policy, etc.) as a real preflight failure (code 30). Do NOT require exit 0
-   here — self-test going green (exit 0, valid=true) is enforced later, after the
-   Generator Engineer transcribes the scan's static lines into STATIC_TEXT_CATALOG and
-   sets STATIC_TEXT_CATALOG_COMPLETE=True during implementation.
-7. Confirm the target scanned PDF can be a render_document()/audit input. On the pristine
-   base a render/annotation attempt returning status 50 because of the same static-text
-   lock is EXPECTED and not a preflight failure — verify only that the PDF is accepted as
-   a source and renders as an image (one target page, correct dimensions).
-8. Search statically for any OCR or PDF-text-extraction usage that must not be present.
-9. Record any genuine runtime defect that would require a minimal change outside the
-   edit zone (justify it; do not perform the change here).
+1. Parse the base generator and locate the GPT TEMPLATE EDIT ZONE.
+2. Inventory reusable field, table, cell, rendering, fitting, label, report, CLI, and validation infrastructure.
+3. Confirm these public functions can be preserved:
+   get_canonical_schema, get_generator_manifest, get_available_fields,
+   assess_compatibility, propose_missing_values, resolve_record,
+   validate_record, render_document, validate_output_contract,
+   generate_edge_cases, self_test, audit_generator.
+4. Record exact public signatures and defaults.
+5. Confirm output_pdf defaults to false.
+6. Identify only genuine runtime defects that justify edits outside the edit zone.
+7. Confirm the source scan remains a render_document input.
+8. Search statically for OCR, PDF text extraction, hidden-layer access, and artificial degradation paths.
+9. Confirm no persistent runner, orchestrator, external template asset, or hidden production sidecar is required.
+10. Produce a preflight risk list and reusable-runtime map.
 
-RELEASE CHECKS (after regression passes)
+RELEASE MODE
 
-1. Validate syntax and a clean-process import of the final generator.py.
-2. Confirm import has no rendering or filesystem side effects.
-3. Confirm every public function is callable and every CLI subcommand runs.
-4. Confirm output_pdf defaults to false; run one `render --output-pdf` smoke test and
-   rasterize+compare visible content with the PNG (metadata may differ; visible content
-   and page geometry must match).
-5. Exercise canonical input, local input, and external key-map resolution
-   (`assess`, `render --input-mode local --key-map ...`).
-6. Exercise incomplete records, optional omissions, synthesis, and derivation
-   (`assess`, `propose-missing`).
-7. Confirm get_available_fields (`list-fields`) agrees with the manifest.
-8. Confirm get_canonical_schema (`schema`) agrees with canonical_schema_version and digest.
-9. Confirm manifest.json is the byte-for-byte deterministic serialization of
-   get_generator_manifest() and contains every required contract field.
-10. Confirm self_test covers every required static validation.
-11. Confirm generator_report.json uses the shared envelope, its required checks and
-    metrics are present, and report status_code equals the CLI exit status.
-12. Confirm the visual_quality check in generator_report.json is backed by the
-    visual-review envelope (status 0 must come from phase-2 audit, never phase-1).
-13. Confirm errors use the required error envelope.
-14. Confirm cleanup: after a successful run only generator.py, manifest.json, and
-    generator_report.json remain; no _audit_artifacts/ or forbidden files persist.
-15. Confirm no OCR / PDF-text extraction was introduced and JSON serialization is
-    deterministic and stably sorted.
+1. Compile and import generator.py in a clean process without filesystem or rendering side effects.
+2. Verify every public function and CLI command.
+3. Run self_test and confirm it covers all required static checks.
+4. Confirm canonical input, local input, and external key mappings.
+5. Confirm incomplete records, optional omissions, synthesis, derivation, aliases, and list strategies.
+6. Confirm assess_compatibility returns exactly the required keys.
+7. Confirm proposals are deterministic and explicitly distinguish synthesized from derived.
+8. Confirm manifest.json is deterministic serialization of get_generator_manifest().
+9. Verify every required manifest field, schema digest, field count, table definition, label format, OTSL token, and status code.
+10. Verify production sample directories contain only the exact permitted files.
+11. Verify validate_output_contract independently checks files and labels and does not trust hidden metadata or report claims.
+12. Verify output directories are transactional. A failed render leaves only a failure report and cannot expose stale successful files.
+13. Run one PNG/PDF equivalence smoke test.
+14. Verify sample and generator report envelopes, required checks, required metrics, error schema, and CLI exit-code equality.
+15. Verify audit stages are isolated and resumable rather than one unbounded image-heavy operation.
+16. Verify the visual-review envelope is current, hash-bound, reviewer/writer identities differ, all required checks are explicit, and all 17 edge cases are individually approved.
+17. Verify successful cleanup leaves only generator.py, manifest.json, and generator_report.json.
+18. On failure, verify retained diagnostics are explicitly indexed by an error artifact.
 
 FAILURE ROUTING
 
-- syntax/import/dependency: 20
-- API/schema/manifest/self-test: 30
+- syntax/import/dependency/stage execution: 20
+- API/schema/manifest/compatibility/self-test: 30
 - report/label/output contract: 50
-- visual-quality (status 0 not envelope-backed): 60
-- persistent file failure: 70
+- persistent output: 70
 
 RETURN
 
-Return the shared handoff object plus a concise list of failed checks. Do not modify files.
+Return the shared handoff with failed checks and exact evidence. Never modify files.

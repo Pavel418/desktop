@@ -1,6 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
+export const ATTACHMENT_RUNTIME_REVISION = 'per-file-composer-v2';
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -24,6 +26,15 @@ export function attachmentProgressKey(snapshot) {
   const matched = Number(snapshot?.matched) || 0;
   const uploading = snapshot?.uploading ? 1 : 0;
   return `${chips}:${matched}:${uploading}`;
+}
+
+// A single-file upload attempt succeeds when its filename becomes visible or the
+// composer gains a new attachment chip. The chip delta covers UI variants that
+// split or truncate filenames so a text match is not always possible.
+export function attachmentAttemptComplete(snapshot, { stem = '', baselineChips = 0 } = {}) {
+  const matchedStems = Array.isArray(snapshot?.matchedStems) ? snapshot.matchedStems : [];
+  const normalizedStem = String(stem || '').toLowerCase();
+  return (normalizedStem && matchedStems.includes(normalizedStem)) || (Number(snapshot?.chips) || 0) > baselineChips;
 }
 
 function jitter(minMs, maxMs) {
@@ -506,7 +517,8 @@ export class ChatGPTController {
     while (Date.now() - start < timeoutMs) {
       this.#throwIfStopRequested();
       const snap = await this.#eval(`(() => {
-        const root = document.querySelector('form') || document.querySelector('main') || document.body;
+        const prompt = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]');
+        const root = prompt?.closest('form') || prompt?.closest('[data-testid*="composer" i]') || document.querySelector('main') || document.body;
         const uploading = !!root.querySelector('progress, [role="progressbar"], [class*="uploading" i], [aria-label*="uploading" i], [class*="progress" i][role]');
         const visible = (n) => { const r = n.getBoundingClientRect(); const s = getComputedStyle(n); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
         const disabled = (n) => !!n.disabled || String(n.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
@@ -783,58 +795,78 @@ export class ChatGPTController {
     const baseNames = absFiles.map((f) => path.basename(f));
     this.#debug(`attach: uploading ${absFiles.length} file(s): ${baseNames.join(', ')}`);
 
-    // Let the composer finish hydrating: if we set the hidden <input type=file>
-    // before ChatGPT's React handler is wired up, the set is silently dropped and
-    // nothing uploads. Focus the composer, wait, then set the input and RE-SET on
-    // each retry until the "Remove file" chips appear. This can be flaky on
-    // back-to-back chats, so the retry budget is generous.
+    // Give React time to wire the hidden input's change handler before setting it.
     await this.#eval(`(() => { const e = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]'); if (e) e.focus(); return true; })()`).catch(() => {});
     await sleep(1200);
-    // `detected` (from #waitForAttachments) only means "at least one chip appeared" —
-    // it is NOT proof every requested file attached. Gate the retry loop and the final
-    // success check on `complete`, which requires a chip/name match for every file, so
-    // a partially-attached set (e.g. only the PDF, not generator.py) is retried and, if
-    // it never completes, reported as a failure instead of silently proceeding.
-    const complete = (s) => attachmentsComplete(s, baseNames.length);
-    let settle = { detected: false, matched: 0, chips: 0, uploading: false, waitedMs: 0 };
-    const maxAttempts = 8;
-    for (let attempt = 1; attempt <= maxAttempts && !complete(settle); attempt++) {
-      let info = null;
-      try {
-        info = await this.page.setFileInputFiles(absFiles);
-        this.#debug(`attach: set attempt ${attempt} (inputs found=${info?.found ?? '?'}, set=${info?.set ?? '?'})`);
-      } catch (e1) {
-        // No file input yet — click the attach control to surface it, then retry.
-        const clicked = await this.#eval(`(() => {
-          const cands = Array.from(document.querySelectorAll('button, [role="button"]'));
-          const b = cands.find(x => /attach|upload|paperclip|add photos|add files/i.test(((x.getAttribute('aria-label')||'') + ' ' + (x.textContent||'')).trim()));
-          if (b) { b.click(); return (b.getAttribute('aria-label') || b.textContent || '').trim().slice(0, 60) || 'button'; }
-          return null;
-        })()`);
-        this.#debug(`attach: set attempt ${attempt} found no input (${e1?.message}); attach control ${clicked ? `clicked ("${clicked}")` : 'NOT found'}`);
-        await sleep(500);
-        await this.#sendKey('Escape').catch(() => {});
-        continue;
+
+    // Upload files independently. Re-sending a whole partially successful batch can
+    // replace the input selection or trigger duplicate-file handling in ChatGPT.
+    let settle = await this.#readAttachmentSnapshot(baseNames);
+    const maxAttemptsPerFile = 5;
+    for (let fileIndex = 0; fileIndex < absFiles.length; fileIndex++) {
+      const file = absFiles[fileIndex];
+      const fileName = baseNames[fileIndex];
+      const stem = String(fileName).replace(/\.[^.]+$/, '').toLowerCase();
+      let registered = false;
+
+      for (let attempt = 1; attempt <= maxAttemptsPerFile && !registered; attempt++) {
+        const before = await this.#readAttachmentSnapshot(baseNames);
+        const baselineChips = Number(before.chips) || 0;
+        let info = null;
+        try {
+          info = await this.page.setFileInputFiles([file]);
+        } catch (firstError) {
+          const revealed = await this.#revealFileInput();
+          this.#debug(
+            `attach: ${fileName} attempt ${attempt} found no input (${firstError?.message}); ` +
+              `attachment UI ${revealed ? `opened (${revealed})` : 'NOT found'}`
+          );
+          if (!revealed) {
+            await sleep(500);
+            continue;
+          }
+          try {
+            info = await this.page.setFileInputFiles([file]);
+          } catch (secondError) {
+            this.#debug(`attach: ${fileName} attempt ${attempt} still has no input (${secondError?.message})`);
+            await sleep(500);
+            continue;
+          }
+        }
+
+        this.#debug(
+          `attach: ${fileName} set attempt ${attempt} (inputs found=${info?.found ?? '?'}, set=${info?.set ?? '?'})`
+        );
+        settle = await this.#waitForAttachments({
+          baseNames,
+          targetStem: stem,
+          baselineChips,
+          timeoutMs: 20_000,
+          maxQuietMs: 6000
+        });
+        registered = attachmentAttemptComplete(settle, { stem, baselineChips });
+        this.#debug(
+          `attach: ${fileName} attempt ${attempt} -> registered=${registered} matchedNames=${settle.matched}/${baseNames.length} ` +
+            `chips=${settle.chips} uploading=${settle.uploading} waitedMs=${settle.waitedMs}`
+        );
+        if (!registered) {
+          await this.#eval(`(() => { const e = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]'); if (e) e.focus(); return true; })()`).catch(() => {});
+          await sleep(900);
+        }
       }
 
-      settle = await this.#waitForAttachments({ baseNames, timeoutMs: 20_000, maxQuietMs: 6000 });
-      this.#debug(
-        `attach: attempt ${attempt} -> detected=${settle.detected} matchedNames=${settle.matched}/${baseNames.length} ` +
-          `chips=${settle.chips} uploading=${settle.uploading} waitedMs=${settle.waitedMs}`
-      );
-      if (!complete(settle)) {
-        // Nudge the composer to become interactive before the next re-set. Re-setting
-        // ALL files (not just the missing one) is intentional: ChatGPT's composer
-        // input has no reliable per-file retry, so we resend the full set.
-        await this.#eval(`(() => { const e = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]'); if (e) e.focus(); return true; })()`).catch(() => {});
-        await sleep(900);
+      if (!registered) {
+        const err = new Error('attachment_not_registered');
+        err.data = { file: fileName, files: baseNames, ...settle, expected: baseNames.length };
+        throw err;
       }
     }
 
-    if (!complete(settle)) {
+    settle = await this.#waitForAttachments({ baseNames, timeoutMs: 20_000, maxQuietMs: 6000 });
+    if (!attachmentsComplete(settle, baseNames.length)) {
       if (this.onDebug) {
         const dump = await this.#eval(
-          `(() => { const f = document.querySelector('form') || document.querySelector('main'); return f ? f.outerHTML.slice(0, 4000) : '(no form/main)'; })()`
+          `(() => { const p = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]'); const f = p?.closest('form') || p?.closest('[data-testid*="composer" i]') || document.querySelector('main'); return f ? f.outerHTML.slice(0, 4000) : '(no composer/main)'; })()`
         );
         this.#debug(`attach: composer HTML (truncated):\n${dump}`);
       }
@@ -844,60 +876,117 @@ export class ChatGPTController {
     }
   }
 
-  // Poll the composer until the uploaded files register (name chips appear and any
-  // upload spinner clears), or bail early if nothing is happening.
-  async #waitForAttachments({ baseNames = [], timeoutMs = 120_000, stableMs = 800, pollMs = 400, maxQuietMs = 8000 } = {}) {
-    const start = Date.now();
-    // Match on the filename stem: the composer renders the name and extension
-    // separately, so "file_123.pdf" won't appear as one contiguous string.
-    const stems = baseNames.map((n) => String(n).replace(/\.[^.]+$/, '').toLowerCase());
-    const stemsJson = JSON.stringify(stems);
-    const expected = baseNames.length;
-    let quietSince = null;
-    let lastProgressKey = null; // (chips, matched) signature of the last snapshot seen
-    let last = { detected: false, matched: 0, chips: 0, uploading: false, waitedMs: 0 };
-
-    while (Date.now() - start < timeoutMs) {
-      const snap = await this.#eval(`(() => {
-        const stems = ${stemsJson};
-        const root = document.querySelector('form') || document.querySelector('main') || document.body;
-        const text = (root.innerText || '').toLowerCase();
-        const matched = stems.filter((n) => n && text.includes(n)).length;
-        // ChatGPT renders each attachment with a "Remove file N: <name>" button.
-        const chips = root.querySelectorAll('button[aria-label*="remove file" i], [data-testid*="attachment" i]').length;
-        const uploading = !!root.querySelector('progress, [role="progressbar"], [class*="uploading" i], [aria-label*="uploading" i]');
-        return { matched, chips, uploading };
+  // Some ChatGPT variants hide the file input behind a two-stage "+" menu. Open
+  // the composer menu, then choose its file-upload item. Keep the menu open until
+  // CDP sets the input; pressing Escape here used to close it too early.
+  async #revealFileInput() {
+    const clickMatching = async (kind) =>
+      this.#eval(`(() => {
+        const visible = (n) => { const r = n.getBoundingClientRect(); const s = getComputedStyle(n); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+        const label = (n) => ((n.getAttribute('aria-label') || '') + ' ' + (n.getAttribute('title') || '') + ' ' + (n.getAttribute('data-testid') || '') + ' ' + (n.textContent || '')).trim();
+        const prompt = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]');
+        const composer = prompt?.closest('form') || prompt?.closest('[data-testid*="composer" i]');
+        const all = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"]')).filter(visible);
+        const local = composer ? all.filter((n) => composer.contains(n)) : [];
+        const direct = /upload from computer|upload files?|add photos?\\s*(?:&|and)\\s*files?|photos? and files?|files? from computer/i;
+        const trigger = /attach|paperclip|add files?|add photos?|upload|composer[-_ ]?plus|plus[-_ ]?button/i;
+        const rx = ${kind === 'direct' ? 'direct' : 'trigger'};
+        const pool = ${kind === 'direct' ? 'all' : '[...local, ...all]'};
+        const hit = pool.find((n) => rx.test(label(n)));
+        if (!hit) return null;
+        hit.click();
+        return label(hit).slice(0, 100) || ${JSON.stringify(kind)};
       })()`);
 
-      // `detected` (any chip at all) is kept only for diagnostics/logging — it is NOT
-      // proof every requested file registered. Callers must gate success on `enough`.
-      const detected = snap.chips >= expected || snap.matched >= expected || snap.chips > 0;
-      last = { detected, matched: snap.matched, chips: snap.chips, uploading: !!snap.uploading, waitedMs: Date.now() - start };
+    let clicked = await clickMatching('direct');
+    if (clicked) {
+      await sleep(350);
+      return clicked;
+    }
+    clicked = await clickMatching('trigger');
+    if (!clicked) return null;
+    await sleep(350);
+    const item = await clickMatching('direct');
+    await sleep(350);
+    return item ? `${clicked} -> ${item}` : clicked;
+  }
 
-      const enough = snap.chips >= expected || snap.matched >= expected;
+  async #readAttachmentSnapshot(baseNames = []) {
+    const stems = baseNames.map((n) => String(n).replace(/\.[^.]+$/, '').toLowerCase());
+    const stemsJson = JSON.stringify(stems);
+    const snap = await this.#eval(`(() => {
+      const stems = ${stemsJson};
+      const prompt = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]');
+      const root = prompt?.closest('form') || prompt?.closest('[data-testid*="composer" i]') || document.querySelector('main') || document.body;
+      const text = (root.innerText || '').toLowerCase();
+      const matchedStems = stems.filter((n) => n && text.includes(n));
+      const removeButtons = root.querySelectorAll('button[aria-label*="remove file" i], button[aria-label*="remove attachment" i]');
+      const previewNodes = root.querySelectorAll('[data-testid="file-upload-preview"], [data-testid="attachment"]');
+      const chips = removeButtons.length || previewNodes.length;
+      const uploading = !!root.querySelector('progress, [role="progressbar"], [class*="uploading" i], [aria-label*="uploading" i]');
+      return { matched: matchedStems.length, matchedStems, chips, uploading };
+    })()`);
+    return {
+      detected: (Number(snap?.chips) || 0) > 0 || (Number(snap?.matched) || 0) > 0,
+      matched: Number(snap?.matched) || 0,
+      matchedStems: Array.isArray(snap?.matchedStems) ? snap.matchedStems : [],
+      chips: Number(snap?.chips) || 0,
+      uploading: !!snap?.uploading,
+      waitedMs: 0
+    };
+  }
+
+  // Poll the actual composer until its attachment state reaches the requested gate.
+  async #waitForAttachments({
+    baseNames = [],
+    targetStem = '',
+    baselineChips = 0,
+    timeoutMs = 120_000,
+    stableMs = 800,
+    pollMs = 400,
+    maxQuietMs = 8000
+  } = {}) {
+    const start = Date.now();
+    const expected = baseNames.length;
+    let quietSince = null;
+    let lastProgressKey = null;
+    let last = { detected: false, matched: 0, matchedStems: [], chips: 0, uploading: false, waitedMs: 0 };
+
+    while (Date.now() - start < timeoutMs) {
+      const snap = await this.#readAttachmentSnapshot(baseNames);
+      const detected = snap.chips >= expected || snap.matched >= expected || snap.chips > 0;
+      last = {
+        detected,
+        matched: snap.matched,
+        matchedStems: snap.matchedStems,
+        chips: snap.chips,
+        uploading: !!snap.uploading,
+        waitedMs: Date.now() - start
+      };
+
+      const enough = targetStem
+        ? attachmentAttemptComplete(snap, { stem: targetStem, baselineChips })
+        : attachmentsComplete(snap, expected);
       if (enough && !snap.uploading) {
         await sleep(stableMs);
         last.waitedMs = Date.now() - start;
         return last;
       }
-      // Give up early on genuine STALLS: no new chip/match count for maxQuietMs, whether
-      // that count is zero (nothing attached yet) or stuck partway (e.g. 1 of 2 files —
-      // the earlier `detected` check alone would wrongly treat this as "keep waiting
-      // forever", hiding a partial attachment for the full timeoutMs).
+
       const progressKey = attachmentProgressKey(snap);
       if (progressKey !== lastProgressKey) {
         lastProgressKey = progressKey;
         quietSince = null;
       } else if (!snap.uploading) {
         if (quietSince == null) quietSince = Date.now();
-        else if (Date.now() - quietSince > maxQuietMs) return last; // no progress — give up early
+        else if (Date.now() - quietSince > maxQuietMs) return last;
       }
       await sleep(pollMs);
     }
     return last;
   }
 
-  async #waitForAssistantStable({ timeoutMs = 5 * 60_000, stableMs = 2000, pollMs = 500, requiredStopAbsentMs = 5000 } = {}) {
+  async #waitForAssistantStable({ timeoutMs = 2 * 60 * 60_000, stableMs = 2000, pollMs = 500, requiredStopAbsentMs = 5000 } = {}) {
     await this.#emitProgress({ phase: 'waiting_for_response', blocked: false, blockedKind: null, blockedTitle: null });
     const assistantSel = JSON.stringify(this.selectors.assistantMessage);
     const stopSel = JSON.stringify(this.selectors.stopButton);
@@ -982,7 +1071,7 @@ export class ChatGPTController {
     throw err;
   }
 
-  async query({ prompt, attachments = [], timeoutMs = 10 * 60_000, onProgress = null, newChat = false } = {}) {
+  async query({ prompt, attachments = [], timeoutMs = 2 * 60 * 60_000, onProgress = null, newChat = false } = {}) {
     if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('missing_prompt');
     if (prompt.length > 200_000) throw new Error('prompt_too_large');
     const run = { kind: 'query', requested: false, requestedAt: null, reason: null, onProgress };
@@ -993,7 +1082,7 @@ export class ChatGPTController {
       await this.#attachFiles(attachments);
       await this.#typePrompt(prompt);
       await this.#clickSend();
-      return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000) });
+      return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 2 * 60 * 60_000) });
     } finally {
       if (this.currentRun === run) this.currentRun = null;
     }
@@ -1001,7 +1090,7 @@ export class ChatGPTController {
 
   // Send a follow-up message in the CURRENT chat (no new chat, no attachments) and
   // wait for the assistant's reply. Used for "continue" nudges.
-  async followUp({ text, timeoutMs = 10 * 60_000, onProgress = null } = {}) {
+  async followUp({ text, timeoutMs = 2 * 60 * 60_000, onProgress = null } = {}) {
     const prompt = String(text || '');
     if (!prompt.trim()) throw new Error('missing_prompt');
     const run = { kind: 'query', requested: false, requestedAt: null, reason: null, onProgress };
@@ -1010,7 +1099,7 @@ export class ChatGPTController {
       await this.ensureReady({ timeoutMs });
       await this.#typePrompt(prompt);
       await this.#clickSend();
-      return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000) });
+      return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 2 * 60 * 60_000) });
     } finally {
       if (this.currentRun === run) this.currentRun = null;
     }

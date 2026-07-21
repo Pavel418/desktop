@@ -1,144 +1,160 @@
-# Agentic Workflow for Adapting the Scanned-Document Generator
+# Agentic workflow for scanned-document generator adaptation
 
-## Purpose
+## Goal
 
-This directory defines an external, role-separated workflow for adapting the stable
-single-file generator (`generator.py`) to a new scanned template PDF. It reduces missed
-details, confirmation bias, incomplete labels, unnatural placement, weak edge coverage,
-and false success reports.
+Adapt a stable single-file generator to one selected page of an image-only scanned PDF. Generated documents should strongly resemble the source through accurate table geometry, static structure, text anchors, alignment, baselines, font metrics, color, and line spacing.
 
-The runtime stays one `generator.py`. The agentic workflow is external: the JS
-orchestrator (`../workflow-orchestrator.mjs`) sequences the roles as turns inside one
-ChatGPT chat per PDF, enforces the gates, routes issues, and computes reruns. Nothing in
-this workflow becomes a persisted runner inside `generator.py`.
+The workflow never uses OCR or PDF text extraction and never adds artificial scan degradation.
 
-## Files
+## Package contents
 
 | File | Purpose |
 |---|---|
-| `generator.py` | The base generator = the machine backbone the roles drive (not edited here; per-template edits happen at runtime in the model's sandbox) |
-| `roles/00_SHARED_CONTRACT.txt` | Rules inherited by every role (incl. handoff + issue + envelope schemas) |
-| `roles/01_CONTROLLER.txt` | Control policy (implemented mechanically by the JS orchestrator) |
-| `roles/02_CONTRACT_AUDITOR.txt` | Preflight + release contract checks |
-| `roles/03_TEMPLATE_ANALYST.txt` | Scan inspection and region classification |
-| `roles/04_TEMPLATE_ARCHITECT.txt` | Geometry, fields, semantics → EDIT-ZONE plan |
-| `roles/05_GENERATOR_ENGINEER.txt` | Background, implementation, repair, packaging (only writer of `generator.py`) |
-| `roles/06_QA_AUDITOR.txt` | Template/background/baseline/edge/regression validation + builds the visual-review envelope |
-| `roles/07_REPAIR_ENGINEER.txt` | Root-cause fixes and dependency-based reruns |
-| `roles/08_FINAL_AUDITOR.txt` | Independent final release decision |
+| `00_SHARED_CONTRACT.txt` | Rules inherited by every role |
+| `01_CONTROLLER.txt` | Stage order, gates, issue routing, and reruns |
+| `02_CONTRACT_AUDITOR.txt` | Runtime preflight and release validation |
+| `03_TEMPLATE_ANALYST.txt` | Visual scan inventory and template lock |
+| `04_TEMPLATE_ARCHITECT.txt` | Tables, cells, static text, fields, semantics, and reconstruction plan |
+| `05_GENERATOR_ENGINEER.txt` | Background, implementation, repair application, and package writing |
+| `06_QA_AUDITOR.txt` | Template, background, baseline, fidelity, edge, and regression review |
+| `07_REPAIR_ENGINEER.txt` | Root-cause repair planning and rerun dependencies |
+| `08_FINAL_AUDITOR.txt` | Independent release decision |
 
-## Design principles
+## Prompt order
 
-1. **Rendered pixels are the only visual truth.** OCR and PDF text extraction are forbidden.
-2. **Creation and approval are separated.** A role that writes an artifact cannot approve it.
-3. **Validation is machine and visual.** Bounding-box containment alone is insufficient.
-4. **Failures are evidence-driven.** Missing evidence is not a pass.
-5. **Repair is targeted.** Only affected checks rerun during iteration, then one clean full regression.
-6. **The final package stays minimal.** Only `generator.py`, `manifest.json`, `generator_report.json` persist.
+1. **Shared Contract** is supplied to every role.
+2. **Controller** opens the run and enforces ownership and gates.
+3. **Contract Auditor, preflight** inventories the base runtime and identifies permitted edits.
+4. **Template Analyst** creates the scan inventory and locks the target page by rendered-pixel hash.
+5. **Template Architect** creates the complete template specification and master overlay.
+6. **QA Auditor, template** reviews all geometry, fields, cells, keys, static text, images, and reconstruction masks.
+7. **Generator Engineer, background** creates the clean hybrid background.
+8. **QA Auditor, background** checks source-value removal, static structure, seams, and preserved pixels.
+9. **Generator Engineer, implementation** adapts generator.py and creates normal and stress samples with all labels.
+10. **QA Auditor, baseline** performs complete machine, visual, and visible-text coverage audits.
+11. **QA Auditor, fidelity** compares source structure and generated placement conventions.
+12. **Repair loop** repeats Generator Engineer or Template Architect changes, QA verification, and dependency-based reruns until baseline and fidelity pass.
+13. **QA Auditor, edge** runs and reviews all 17 cases one by one.
+14. **Repair loop** repeats only affected tests, followed by the complete edge suite.
+15. **QA Auditor, regression** runs all clean machine stages from isolated directories.
+16. **Generator Engineer, package** writes manifest.json and generator_report.json and cleans temporary outputs.
+17. **Contract Auditor, release** checks runtime and package correctness.
+18. **Final Auditor** independently approves or rejects release.
+19. **Controller** emits the final result.
 
-## The generator is the machine backbone
+## Why stages are isolated
 
-`generator.py` already implements the runtime contract; the roles drive its CLI
-(`describe | schema | list-fields | self-test | assess | propose-missing |
-make-weird-data | render | edge-cases | audit | validate-output`). Each command exits
-with its numeric `status_code`.
+Image rendering, high-DPI tests, exhaustive per-field fitting probes, overlays, and PDF checks can consume substantial memory. Run heavy machine phases in separate clean invocations and merge their stage reports afterward. This prevents stale state, memory pressure, and one long monolithic call from hiding which stage failed.
 
-Adapting a template = editing only the **GPT TEMPLATE EDIT ZONE** (metadata, coordinates,
-`FIELD_CATALOG`, `ERASE_SPECS`, `STATIC_TEXT_CATALOG`, sample data), then validating with
-the CLI. The stable runtime below the edit zone is reused, never rewritten.
-
-### Two-phase audit + visual-review envelope
-
-A Python program can't judge its own renders, so `audit` is two-phase:
-
-- **Phase 1** — `audit --pdf P --output-dir O --seed 0`: runs all machine checks, writes
-  reviewable artifacts under `O/_audit_artifacts/`, and returns **status 60** on purpose.
-- **Visual review** — QA/Final roles open those artifacts at full resolution and, only
-  if everything truly passes, emit a **visual-review envelope** (schema in
-  `roles/00_SHARED_CONTRACT.txt`): 7 required checks + all 17 edge cases true,
-  `reviewed_artifacts` as `{path, sha256}` covering every required artifact, `issues: []`.
-- **Phase 2** — `audit ... --visual-review envelope.json`: reuses the byte-verified
-  artifacts, validates the envelope, writes `manifest.json` + `generator_report.json`,
-  cleans `_audit_artifacts/`, and returns **0** only if the envelope is complete,
-  current, and passing. A stale or partial envelope yields 60. Status 0 is therefore
-  impossible without a genuine external visual review.
-
-## Execution sequence
+Recommended machine stage sequence:
 
 ```text
-1.  Orchestrator opens one chat per PDF (target PDF + generator.py attached).
-2.  Contract Auditor (preflight): CLI/API/manifest/self-test.
-3.  Template Analyst: scan inventory.
-4.  Template Architect: EDIT-ZONE plan (template_spec.json).
-5.  Generator Engineer (implementation): writes the edit zone (geometry, fields,
-    ERASE_SPECS, static text); runs self-test; runs audit phase 1 — one pass produces
-    master_overlay, reconstructed_background, normal/stress samples, all 17 edges.
-6.  QA Auditor (template): master_overlay vs scan.
-7.  QA Auditor (background): reconstructed_background before generated text is trusted.
-8.  QA Auditor (baseline): normal + fully populated stress samples.
-9.  Repair loop until template/background/baseline pass (targeted reruns).
-10. QA Auditor (edge): all 17 cases individually.
-11. Repair loop until all cases pass.
-12. QA Auditor (regression): clean full run; then builds the visual-review envelope.
-13. Generator Engineer (package): audit phase 2 with the envelope → expects status 0.
-14. Contract Auditor (release): manifest/report/CLI/PDF/cleanup/persistent files.
-15. Final Auditor: independent decision that status 0 is envelope-backed.
-16. Orchestrator downloads the 3 persistent files and emits the numeric status.
+self-test
+-> template/background stage
+-> normal and stress stage
+-> edge-case stage
+-> edge overlay stage
+-> determinism/canonical/PDF regression stage
+-> artifact manifest
+-> independent visual review
+-> package
 ```
 
-The Generator Engineer's "background mode" (reconstruction-focused edits) and
-"implementation mode" (field placement) are two emphases of one edit-zone pass: because
-`audit` renders the background, samples, and edges together, a single phase-1 run
-produces every artifact the QA gates below review.
+The Controller may retry one isolated stage without rerunning unrelated passed stages. After all targeted repairs, it must run one clean complete regression.
 
-## Stage gates
+## Gates and loops
 
-- **Preflight** — base runtime, edit zone, public API, and CLI understood; `self-test` passes.
-- **Template** — master overlay correctly represents tables, cells, fields, keys, containers, layout, semantic images, reconstruction regions.
-- **Background** — cleaned background has no source value, damaged label, broken grid line, seam, or inappropriate blank patch.
-- **Baseline** — normal + stress samples pass machine validation, label validation, complete visible-text coverage, and full-resolution review.
-- **Edge** — all 17 edge cases generated and inspected individually; expected failures fail for the correct reason and code.
-- **Regression** — the full suite runs from a clean temporary directory with no repairs during the run.
-- **Release** — manifest, reports, CLI status, PDF output, cleanup, and persistent files satisfy the contract; phase-2 audit returns 0.
-- **Final** — the independent Final Auditor confirms every mandatory check is supported by current evidence.
+### Template loop
 
-## Required edge cases
+```text
+Template Analyst
+-> Template Architect
+-> QA template review
+-> geometry/static/semantic repair
+-> repeat until passed or blocked
+```
 
-`normal_random_placement`, `top_left_placement`, `bottom_right_placement`,
-`wide_glyph_pressure`, `narrow_glyph_pressure`, `long_unbroken_strings`, `punctuation`,
-`multilingual_text`, `dense_multiline_text`, `minimum_font_size`,
-`maximum_permitted_character_length`, `low_dpi`, `high_dpi`, `text_near_field_edges`,
-`shared_collision_groups`, `expected_max_chars_failure`, `expected_impossible_fit_failure`.
+### Background loop
 
-Each case has its own result. A contact sheet is navigation only and cannot replace
-full-resolution review.
+```text
+Generator Engineer background
+-> QA background review
+-> reconstruction repair
+-> repeat until passed or blocked
+```
+
+### Baseline and fidelity loop
+
+```text
+Generator implementation
+-> normal/stress machine validation
+-> baseline visual and label coverage review
+-> fidelity review
+-> root-cause repair
+-> rerun affected checks
+-> repeat
+```
+
+### Edge loop
+
+Each edge case is an independent sub-run. Do not batch-approve.
+
+```text
+render one case
+-> output-contract validation
+-> full-resolution document review
+-> field/glyph overlay review
+-> label review
+-> case decision
+-> repair and rerun when needed
+```
+
+Expected-failure cases pass only when they fail for the specified reason and leave no successful or stale document.
+
+### Final loop
+
+```text
+clean regression
+-> package
+-> release contract audit
+-> independent final audit
+```
+
+A final-audit finding reopens the owning earlier stage.
+
+## Review artifacts
+
+The minimum review set includes:
+
+- scan inventory overlay
+- master table/cell/field overlay
+- reconstruction mask and background
+- normal and stress documents
+- baseline field/glyph, layout, and table-cell overlays
+- complete baseline labels and reports
+- every edge document and report
+- a field/glyph overlay for every visually sensitive edge case
+- all edge labels
+- per-field max-length and minimum-font probe reports
+- regression reports
+- artifact manifest with hashes
+
+Do not repeatedly regenerate invariant table and layout overlays for every edge case. Review them once through the approved master/baseline overlays, then validate edge label files programmatically and use case-specific field/glyph overlays.
 
 ## Communication
 
-Roles exchange structured handoffs (see `roles/00_SHARED_CONTRACT.txt`), artifact paths
-with hashes, concise issue records, and rerun requirements — not long narratives or
-hidden reasoning. Issue states: `open`, `fixed`, `verified`, `blocked`. A Repair Engineer
-may mark an issue `fixed`; only an independent auditor may mark it `verified`.
+Agents exchange structured handoffs and append-only issue records. Passing stages return compact evidence. Failures return exact issue codes, artifacts, fields/tables/cells, and required reruns. Do not transmit narrative reasoning when structured evidence is sufficient.
 
-## Repair and rerun strategy
+## Status policy
 
-Escalate only as needed: parameter → field → cell → region → section → full form.
-Do not weaken checks, shorten test values, disable edge cases, suppress errors, or change
-labels to agree with an incorrect render. After targeted repairs pass, always run one
-clean full regression. Any edit invalidates the previous envelope (hashes change), so a
-fresh QA review + envelope is always required before release. The full rerun dependency
-map is in `roles/07_REPAIR_ENGINEER.txt` and is enforced by the orchestrator's `RERUN_MAP`.
+Only the Controller and Final Auditor assign the global status. The first causal failure determines the code; all secondary errors remain in the report. Status 0 requires every mandatory machine gate, all 17 individual edge decisions, current artifact hashes, independent visual approval, and exact final cleanup.
 
-## Final output contract
+## Final persistent outputs
 
-After success, persist only:
+After successful validation, retain only:
 
 ```text
 generator.py
 manifest.json
 generator_report.json
 ```
-
-The final response links only those files and ends with the exact line
-`STATUS_CODE: <n>` (nothing after it), matching the numeric status the orchestrator
-records.

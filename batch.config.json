@@ -14,7 +14,8 @@
     "maxRetry": 1
   },
   "chrome": {
-    "profileMode": "isolated"
+    "profileMode": "isolated",
+    "pruneCookiesOnOpen": true
   },
   "entries": [
     {

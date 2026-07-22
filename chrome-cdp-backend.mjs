@@ -115,6 +115,19 @@ export function defaultChromeUserDataDir() {
   return path.join(os.homedir(), '.config', 'google-chrome');
 }
 
+// Names of cookies that are safe to delete to shrink the Cookie header: pure telemetry/analytics
+// that the site regenerates. The KEEP guard makes doubly sure we never remove authentication
+// (session-token chunks), CSRF, or Cloudflare clearance cookies, so the session stays logged in.
+const PRUNABLE_COOKIE_RE = /^(_dd_s|_dd_r|_dd|__cf_bm|_ga|_gid|_gat|_gcl|ajs_|amp_|amplitude|intercom-|statsig|mp_|__stripe_mid|__stripe_sid)/i;
+const KEEP_COOKIE_RE = /(session-token|clearance|csrf|__host-|__secure-next-auth|oai-did|auth)/i;
+
+export function isPrunableCookieName(name) {
+  const value = String(name || '');
+  if (!value) return false;
+  if (KEEP_COOKIE_RE.test(value)) return false;
+  return PRUNABLE_COOKIE_RE.test(value);
+}
+
 export function buildChromeLaunchArgs({ debugPort, userDataDir, profileName = null, startUrl = 'about:blank' } = {}) {
   const args = [
     `--remote-debugging-port=${debugPort}`,
@@ -319,6 +332,8 @@ export class ChromeCdpPageAdapter {
     await this.client.send('Page.enable', {}, this.sessionId);
     await this.client.send('Runtime.enable', {}, this.sessionId);
     await this.client.send('DOM.enable', {}, this.sessionId);
+    // Needed for the top-document response status (431 detection) and cookie pruning.
+    await this.client.send('Network.enable', {}, this.sessionId).catch(() => {});
     await this.client.send(
       'Page.addScriptToEvaluateOnNewDocument',
       {
@@ -336,7 +351,68 @@ export class ChromeCdpPageAdapter {
   }
 
   async navigate(url) {
-    await this.client.send('Page.navigate', { url }, this.sessionId);
+    const status = await this._navigateAndGetTopStatus(url);
+    // ChatGPT's edge returns 431 (Request Header Fields Too Large) when the accumulated cookie
+    // jar overflows the header limit. The error response itself rotates/expires cookies (Cloudflare
+    // __cf_bm, stale session-token chunks), so a single reload sends a trimmed jar that succeeds —
+    // this automates the manual refresh that fixes it.
+    if (status === 431) {
+      await this.client.send('Page.reload', { ignoreCache: false }, this.sessionId).catch(() => {});
+    }
+    return status;
+  }
+
+  // Navigate and resolve with the top-level document's HTTP status (null if none arrives in time).
+  async _navigateAndGetTopStatus(url, timeoutMs = 15000) {
+    let settle;
+    const done = new Promise((resolve) => { settle = resolve; });
+    const off = this.client.on('Network.responseReceived', (params, sessionId) => {
+      if (this.sessionId && sessionId && sessionId !== this.sessionId) return;
+      if (params?.type !== 'Document') return; // first main-frame document response
+      off();
+      settle(Number(params?.response?.status) || null);
+    });
+    const timer = setTimeout(() => { off(); settle(null); }, timeoutMs);
+    try {
+      await this.client.send('Page.navigate', { url }, this.sessionId);
+    } catch (error) {
+      off();
+      clearTimeout(timer);
+      throw error;
+    }
+    const status = await done;
+    clearTimeout(timer);
+    return status;
+  }
+
+  // Drop known telemetry cookies for the ChatGPT/OpenAI origins to keep the Cookie header small,
+  // reducing how often the 431 above trips. Conservative: never touches auth or Cloudflare
+  // clearance cookies (see isPrunableCookieName). Returns the number removed.
+  async pruneTelemetryCookies() {
+    let cookies = [];
+    try {
+      const res = await this.client.send(
+        'Network.getCookies',
+        { urls: ['https://chatgpt.com/', 'https://openai.com/', 'https://auth.openai.com/'] },
+        this.sessionId
+      );
+      cookies = Array.isArray(res?.cookies) ? res.cookies : [];
+    } catch {
+      return 0;
+    }
+    let removed = 0;
+    for (const cookie of cookies) {
+      if (!isPrunableCookieName(cookie?.name)) continue;
+      try {
+        await this.client.send(
+          'Network.deleteCookies',
+          { name: cookie.name, domain: cookie.domain, path: cookie.path },
+          this.sessionId
+        );
+        removed += 1;
+      } catch {}
+    }
+    return removed;
   }
 
   async evaluate(js) {
@@ -672,7 +748,7 @@ class ChromeCdpPresenter {
 }
 
 export class ChromeCdpBrowserBackend {
-  constructor({ stateDir, userAgent, onChanged, executablePath = null, debugPort = 9222, profileMode = 'isolated', profileName = 'Default' } = {}) {
+  constructor({ stateDir, userAgent, onChanged, executablePath = null, debugPort = 9222, profileMode = 'isolated', profileName = 'Default', pruneCookiesOnOpen = true } = {}) {
     this.stateDir = stateDir;
     this.userAgent = typeof userAgent === 'string' && userAgent.trim() ? userAgent.trim() : null;
     this.onChanged = typeof onChanged === 'function' ? onChanged : null;
@@ -680,6 +756,8 @@ export class ChromeCdpBrowserBackend {
     this.debugPort = Math.floor(Number(debugPort)) || 9222;
     this.profileMode = String(profileMode || '').trim().toLowerCase() === 'existing' ? 'existing' : 'isolated';
     this.profileName = String(profileName || '').trim() || 'Default';
+    // Drop telemetry cookies before each navigation to keep the Cookie header small (431 mitigation).
+    this.pruneCookiesOnOpen = pruneCookiesOnOpen !== false;
     this.chromeProcess = null;
     this.client = null;
     this.started = false;
@@ -805,11 +883,14 @@ export class ChromeCdpBrowserBackend {
   async createSession({ url, show = false, onClosed } = {}) {
     await this.start();
 
+    // Open the tab blank first so we can attach, prune telemetry cookies, and navigate through the
+    // 431-aware path — Target.createTarget with the real URL would fire the (possibly 431-ing)
+    // request before we could observe or trim it.
     let target;
     try {
-      target = await this.client.send('Target.createTarget', { url, newWindow: true });
+      target = await this.client.send('Target.createTarget', { url: 'about:blank', newWindow: true });
     } catch {
-      target = await this.client.send('Target.createTarget', { url, newWindow: true });
+      target = await this.client.send('Target.createTarget', { url: 'about:blank', newWindow: true });
     }
     const targetId = String(target?.targetId || '').trim();
     if (!targetId) throw new Error('chrome_cdp_target_create_failed');
@@ -826,6 +907,8 @@ export class ChromeCdpBrowserBackend {
 
       const page = new ChromeCdpPageAdapter({ client: this.client, targetId, sessionId, windowId });
       await page.initialize({ userAgent: this.userAgent });
+      if (this.pruneCookiesOnOpen) await page.pruneTelemetryCookies().catch(() => {});
+      if (url && url !== 'about:blank') await page.navigate(url).catch(() => {});
       if (show) await page.bringToFront().catch(() => {});
       else await page.minimize().catch(() => {});
 

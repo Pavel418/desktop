@@ -8,8 +8,77 @@ import {
   ChromeCdpBrowserBackend,
   ChromeCdpConnection,
   ChromeCdpPageAdapter,
-  chromeSpawnOptions
+  chromeSpawnOptions,
+  isPrunableCookieName
 } from '../chrome-cdp-backend.mjs';
+
+// A minimal CDP client fake: records sends, supports on()/emit, and (optionally) emits a
+// top-document Network.responseReceived with `docStatus` in response to Page.navigate.
+function fakeNavClient({ docStatus = 200, sessionId = 'session', cookies = null } = {}) {
+  const handlers = new Map();
+  const calls = [];
+  const client = {
+    on(method, handler) {
+      const list = handlers.get(method) || [];
+      list.push(handler);
+      handlers.set(method, list);
+      return () => handlers.set(method, (handlers.get(method) || []).filter((h) => h !== handler));
+    },
+    async send(method, params, sid) {
+      calls.push({ method, params, sessionId: sid });
+      if (method === 'Page.navigate') {
+        for (const h of [...(handlers.get('Network.responseReceived') || [])]) {
+          h({ type: 'Document', response: { status: docStatus } }, sessionId);
+        }
+      }
+      if (method === 'Network.getCookies') return { cookies: cookies || [] };
+      return {};
+    }
+  };
+  return { client, calls };
+}
+
+test('navigate: a 431 top-document response triggers exactly one reload', async () => {
+  const { client, calls } = fakeNavClient({ docStatus: 431 });
+  const page = new ChromeCdpPageAdapter({ client, targetId: 't', sessionId: 'session' });
+  const status = await page.navigate('https://chatgpt.com/?temporary-chat=true');
+  assert.equal(status, 431);
+  assert.equal(calls.filter((c) => c.method === 'Page.reload').length, 1);
+});
+
+test('navigate: a 200 response does not reload', async () => {
+  const { client, calls } = fakeNavClient({ docStatus: 200 });
+  const page = new ChromeCdpPageAdapter({ client, targetId: 't', sessionId: 'session' });
+  const status = await page.navigate('https://chatgpt.com/');
+  assert.equal(status, 200);
+  assert.equal(calls.filter((c) => c.method === 'Page.reload').length, 0);
+});
+
+test('pruneTelemetryCookies deletes telemetry but keeps auth/clearance cookies', async () => {
+  const cookies = [
+    { name: '_dd_s', domain: '.chatgpt.com', path: '/' },
+    { name: '__cf_bm', domain: '.chatgpt.com', path: '/' },
+    { name: 'statsig.session_id', domain: '.chatgpt.com', path: '/' },
+    { name: '__Secure-next-auth.session-token.0', domain: '.chatgpt.com', path: '/' },
+    { name: 'cf_clearance', domain: '.chatgpt.com', path: '/' },
+    { name: '__Host-next-auth.csrf-token', domain: 'chatgpt.com', path: '/' }
+  ];
+  const { client, calls } = fakeNavClient({ cookies });
+  const page = new ChromeCdpPageAdapter({ client, targetId: 't', sessionId: 'session' });
+  const removed = await page.pruneTelemetryCookies();
+  assert.equal(removed, 3);
+  const deleted = calls.filter((c) => c.method === 'Network.deleteCookies').map((c) => c.params.name);
+  assert.deepEqual(deleted.sort(), ['__cf_bm', '_dd_s', 'statsig.session_id'].sort());
+});
+
+test('isPrunableCookieName: telemetry yes, auth/clearance never', () => {
+  for (const n of ['_dd_s', '__cf_bm', 'statsig.stable_id', 'amp_abc', 'intercom-session-x', '_ga']) {
+    assert.equal(isPrunableCookieName(n), true, `${n} should be prunable`);
+  }
+  for (const n of ['__Secure-next-auth.session-token.0', 'cf_clearance', '__Host-next-auth.csrf-token', 'oai-did', 'sessionKey']) {
+    assert.equal(isPrunableCookieName(n), false, `${n} must be kept`);
+  }
+});
 
 class MockWebSocket {
   constructor() {

@@ -401,7 +401,8 @@ async function main() {
     executablePath: resolveChromeExecutablePath({ settings: chromeSettings }),
     debugPort: resolveChromeDebugPort({ settings: chromeSettings }),
     profileMode: resolveChromeProfileMode({ settings: chromeSettings }),
-    profileName: resolveChromeProfileName({ settings: chromeSettings })
+    profileName: resolveChromeProfileName({ settings: chromeSettings }),
+    pruneCookiesOnOpen: chromeSettings.pruneCookiesOnOpen !== false
   });
 
   log(`Config: ${configPath}`);

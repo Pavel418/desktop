@@ -37,6 +37,49 @@ export function attachmentAttemptComplete(snapshot, { stem = '', baselineChips =
   return (normalizedStem && matchedStems.includes(normalizedStem)) || (Number(snapshot?.chips) || 0) > baselineChips;
 }
 
+export const RESPONSE_COMPLETION_DEFAULTS = Object.freeze({
+  idleMs: 5000,
+  terminalMs: 5000,
+  incompleteTerminalMs: 15000,
+  unknownFallbackMs: 60000,
+  incompleteFallbackMs: 10 * 60_000
+});
+
+// Pure decision boundary for the response waiter. UI idleness alone is deliberately
+// insufficient for a response that a caller knows is structurally incomplete: tool
+// execution can temporarily remove the stop button while the final answer is only a
+// few characters long. A completed semantic envelope can return after ordinary idle
+// stabilization; incomplete/unknown content needs a terminal turn control or a much
+// longer fail-safe interval.
+export function responseCompletionDecision(state, config = RESPONSE_COMPLETION_DEFAULTS) {
+  const text = String(state?.text || '');
+  if (!state?.started || !text || state?.busy || !state?.stable) return { done: false, reason: null };
+
+  const idleForMs = Number(state?.idleForMs) || 0;
+  const terminalForMs = Number(state?.terminalForMs) || 0;
+  const semanticState = ['complete', 'incomplete', 'unknown'].includes(state?.semanticState)
+    ? state.semanticState
+    : 'unknown';
+
+  if (state?.hasError && idleForMs >= config.idleMs) return { done: true, reason: 'terminal_error' };
+  if (semanticState === 'complete' && idleForMs >= config.idleMs) {
+    return { done: true, reason: 'semantic_complete' };
+  }
+
+  if (state?.terminalVisible) {
+    const required = semanticState === 'incomplete' ? config.incompleteTerminalMs : config.terminalMs;
+    if (idleForMs >= required && terminalForMs >= required) {
+      return { done: true, reason: semanticState === 'incomplete' ? 'terminal_incomplete' : 'terminal_ui' };
+    }
+  }
+
+  const fallbackMs = semanticState === 'incomplete'
+    ? config.incompleteFallbackMs
+    : config.unknownFallbackMs;
+  if (idleForMs >= fallbackMs) return { done: true, reason: `${semanticState}_idle_fallback` };
+  return { done: false, reason: null };
+}
+
 function jitter(minMs, maxMs) {
   const min = Math.max(0, Number(minMs) || 0);
   const max = Math.max(min, Number(maxMs) || 0);
@@ -992,67 +1035,138 @@ export class ChatGPTController {
     return last;
   }
 
-  async #waitForAssistantStable({ timeoutMs = 2 * 60 * 60_000, stableMs = 2000, pollMs = 500, requiredStopAbsentMs = 5000 } = {}) {
+  async #waitForAssistantStable({
+    timeoutMs = 2 * 60 * 60_000,
+    stableMs = 2000,
+    pollMs = 500,
+    responseState = null
+  } = {}) {
     await this.#emitProgress({ phase: 'waiting_for_response', blocked: false, blockedKind: null, blockedTitle: null });
     const assistantSel = JSON.stringify(this.selectors.assistantMessage);
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const start = Date.now();
     let last = '';
+    let lastActivityKey = '';
     let lastChange = Date.now();
-    let sawStop = false; // have we observed generation actually running?
-    let stopAbsentSince = null; // when the stop button was last continuously absent
+    let sawActivity = false;
+    let idleSince = null;
+    let terminalSince = null;
     let continueClicks = 0;
+    let lastSemanticState = 'unknown';
+    let lastSnap = null;
 
     while (Date.now() - start < timeoutMs) {
       this.#throwIfStopRequested();
-      // The stop button (data-testid=stop-button) is present the whole time the
-      // model is busy — through the "thinking" phase AND while streaming the answer.
-      // It disappears only when fully done. Read ONLY the last assistant node's text
-      // (never the whole page, or we'd capture the prompt/thinking as a false answer).
+      // ChatGPT can remove its stop button between thinking, tool execution, and final
+      // streaming. Capture independent busy and terminal signals, then combine them
+      // with caller-provided semantic completeness below.
       const snap = await this.#eval(`(() => {
-        const stop = !!document.querySelector(${stopSel});
+        const visible = (n) => {
+          if (!n) return false;
+          const r = n.getBoundingClientRect();
+          const style = window.getComputedStyle(n);
+          return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        };
         const nodes = Array.from(document.querySelectorAll(${assistantSel}));
         const lastNode = nodes[nodes.length - 1];
+        const turnRoot = lastNode?.closest(
+          'article, [data-testid^="conversation-turn"], [data-testid*="conversation-turn"]'
+        ) || lastNode;
         const txt = (lastNode?.innerText || '').trim();
         const codeCount = lastNode ? lastNode.querySelectorAll('pre code').length : 0;
-        const hasContinue = Array.from(document.querySelectorAll('button, a')).some(b => /continue generating/i.test((b.textContent||'').trim()));
+        const allControls = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+        const labelOf = (n) => [
+          n.getAttribute('aria-label') || '',
+          n.getAttribute('title') || '',
+          n.getAttribute('data-testid') || '',
+          n.textContent || ''
+        ].join(' ').replace(/\\s+/g, ' ').trim().toLowerCase();
+        const configuredStops = Array.from(document.querySelectorAll(${stopSel}));
+        const fallbackStops = allControls.filter((n) => /stop (?:generating|responding|streaming)|stop-button/.test(labelOf(n)));
+        const stopVisible = [...configuredStops, ...fallbackStops].some(visible);
+        const hasContinue = allControls.some((n) => visible(n) && /continue generating/.test(labelOf(n)));
+        const busySelector =
+          '[aria-busy="true"], [data-is-streaming="true"], [data-streaming="true"], ' +
+          '[data-testid*="streaming" i], [class~="result-streaming"]';
+        const localBusy = turnRoot
+          ? (turnRoot.matches(busySelector) && visible(turnRoot))
+            || Array.from(turnRoot.querySelectorAll(busySelector)).some(visible)
+          : false;
+        const terminalVisible = turnRoot
+          ? Array.from(turnRoot.querySelectorAll('button, [role="button"]')).some((n) => {
+              if (!visible(n)) return false;
+              return /copy-turn-action|good-response-turn-action|bad-response-turn-action|read aloud|copy response/.test(labelOf(n));
+            })
+          : false;
         const hasError = /something went wrong|try again|error generating/i.test(txt) && txt.length < 500;
-        return { stop, txt, count: nodes.length, codeCount, hasContinue, hasError };
+        const htmlLength = turnRoot ? turnRoot.innerHTML.length : 0;
+        return {
+          stopVisible, busyVisible: stopVisible || localBusy, terminalVisible,
+          txt, count: nodes.length, codeCount, htmlLength, hasContinue, hasError
+        };
       })()`);
 
       const txt = String(snap?.txt || '');
-      if (txt !== last) {
+      const activityKey = [
+        txt, Number(snap?.count) || 0, Number(snap?.codeCount) || 0,
+        Number(snap?.htmlLength) || 0, snap?.busyVisible ? 1 : 0,
+        snap?.terminalVisible ? 1 : 0, snap?.hasContinue ? 1 : 0
+      ].join('\u0000');
+      if (activityKey !== lastActivityKey) {
+        lastActivityKey = activityKey;
         last = txt;
         lastChange = Date.now();
       }
-      if (snap?.stop) { sawStop = true; stopAbsentSince = null; }
-      else if (stopAbsentSince == null) { stopAbsentSince = Date.now(); }
+      if (snap?.busyVisible || snap?.hasContinue) {
+        sawActivity = true;
+        idleSince = null;
+        terminalSince = null;
+      } else {
+        if (idleSince == null) idleSince = Date.now();
+        if (snap?.terminalVisible) {
+          if (terminalSince == null) terminalSince = Date.now();
+        } else {
+          terminalSince = null;
+        }
+      }
 
       // Click "continue generating" if it appears while not actively streaming.
-      if (!snap?.stop && snap?.hasContinue && continueClicks < 3) {
+      if (!snap?.stopVisible && snap?.hasContinue && continueClicks < 3) {
         continueClicks += 1;
         await this.#eval(`(() => {
           const btn = Array.from(document.querySelectorAll('button, a')).find(b => /continue generating/i.test((b.textContent||'').trim()));
           if (btn) btn.click();
         })()`);
         await sleep(300);
-        stopAbsentSince = null;
+        idleSince = null;
+        terminalSince = null;
         continue;
       }
 
       const dynamicStableMs = Math.max(stableMs, txt.length > 8000 ? 3500 : txt.length > 2000 ? 2500 : stableMs);
       const stable = Date.now() - lastChange >= dynamicStableMs;
-      // Allow completion only once generation has actually begun (we saw the stop
-      // button, or enough time passed for an instant reply) — never during the
-      // pre-send / thinking-with-empty-node window.
-      const started = sawStop || Date.now() - start > 5000;
-      // The code-interpreter flow toggles the stop button between phases (thinking,
-      // running python, writing). Require it to be CONTINUOUSLY absent for a few
-      // seconds so we don't mistake a between-phase gap for completion.
-      const stopGoneLongEnough = stopAbsentSince != null && Date.now() - stopAbsentSince >= requiredStopAbsentMs;
-
-      const done = started && stopGoneLongEnough && txt.length > 0 && stable;
-      if (done) {
+      const started = sawActivity || (txt.length > 0 && Date.now() - start > 5000);
+      let semanticState = 'unknown';
+      if (typeof responseState === 'function' && txt) {
+        try {
+          const classified = responseState(txt);
+          if (['complete', 'incomplete', 'unknown'].includes(classified)) semanticState = classified;
+        } catch {}
+      }
+      lastSemanticState = semanticState;
+      lastSnap = snap;
+      const decision = responseCompletionDecision({
+        text: txt,
+        started,
+        busy: !!snap?.busyVisible || !!snap?.hasContinue,
+        stable,
+        idleForMs: idleSince == null ? 0 : Date.now() - idleSince,
+        terminalVisible: !!snap?.terminalVisible,
+        terminalForMs: terminalSince == null ? 0 : Date.now() - terminalSince,
+        hasError: !!snap?.hasError,
+        semanticState
+      });
+      if (decision.done) {
         const extra = await this.#eval(`(() => {
           const nodes = Array.from(document.querySelectorAll(${assistantSel}));
           const lastNode = nodes[nodes.length - 1];
@@ -1066,18 +1180,38 @@ export class ChatGPTController {
           }).filter(c => c.text);
           return { codeBlocks: codes };
         })()`);
-        return { text: txt, codeBlocks: extra?.codeBlocks || [], meta: { count: snap?.count || 0, hasError: !!snap?.hasError } };
+        this.#debug(
+          `response-gate: ${decision.reason} after ${Date.now() - start}ms ` +
+          `(chars=${txt.length}, semantic=${semanticState}, terminal=${!!snap?.terminalVisible})`
+        );
+        return {
+          text: txt,
+          codeBlocks: extra?.codeBlocks || [],
+          meta: {
+            count: snap?.count || 0,
+            hasError: !!snap?.hasError,
+            completionReason: decision.reason,
+            semanticState
+          }
+        };
       }
 
       await sleep(pollMs);
     }
 
     const err = new Error('timeout_waiting_for_response');
-    err.data = { last };
+    err.data = { last, semanticState: lastSemanticState, snapshot: lastSnap };
     throw err;
   }
 
-  async query({ prompt, attachments = [], timeoutMs = 2 * 60 * 60_000, onProgress = null, newChat = false } = {}) {
+  async query({
+    prompt,
+    attachments = [],
+    timeoutMs = 2 * 60 * 60_000,
+    onProgress = null,
+    newChat = false,
+    responseState = null
+  } = {}) {
     if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('missing_prompt');
     if (prompt.length > 200_000) throw new Error('prompt_too_large');
     const run = { kind: 'query', requested: false, requestedAt: null, reason: null, onProgress };
@@ -1088,7 +1222,10 @@ export class ChatGPTController {
       await this.#attachFiles(attachments);
       await this.#typePrompt(prompt);
       await this.#clickSend();
-      return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 2 * 60 * 60_000) });
+      return await this.#waitForAssistantStable({
+        timeoutMs: Math.min(timeoutMs, 2 * 60 * 60_000),
+        responseState
+      });
     } finally {
       if (this.currentRun === run) this.currentRun = null;
     }
@@ -1096,7 +1233,7 @@ export class ChatGPTController {
 
   // Send a follow-up message in the CURRENT chat (no new chat, no attachments) and
   // wait for the assistant's reply. Used for "continue" nudges.
-  async followUp({ text, timeoutMs = 2 * 60 * 60_000, onProgress = null } = {}) {
+  async followUp({ text, timeoutMs = 2 * 60 * 60_000, onProgress = null, responseState = null } = {}) {
     const prompt = String(text || '');
     if (!prompt.trim()) throw new Error('missing_prompt');
     const run = { kind: 'query', requested: false, requestedAt: null, reason: null, onProgress };
@@ -1105,7 +1242,10 @@ export class ChatGPTController {
       await this.ensureReady({ timeoutMs });
       await this.#typePrompt(prompt);
       await this.#clickSend();
-      return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 2 * 60 * 60_000) });
+      return await this.#waitForAssistantStable({
+        timeoutMs: Math.min(timeoutMs, 2 * 60 * 60_000),
+        responseState
+      });
     } finally {
       if (this.currentRun === run) this.currentRun = null;
     }

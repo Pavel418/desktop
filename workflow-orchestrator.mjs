@@ -546,6 +546,28 @@ export function parseHandoff(text, expected = null) {
   return best?.handoff || null;
 }
 
+// Tri-state response classifier consumed by ChatGPTController's wait loop. A balanced
+// handoff is complete even when later schema validation will reject it (so the normal
+// re-ask path can run). A visible handoff prefix without a closed envelope is still
+// streaming/truncated and must not be accepted merely because the UI looks idle.
+export function handoffResponseState(text, expected = null) {
+  const src = String(text || '').trim();
+  if (!src) return 'unknown';
+  // The parser intentionally repairs a missing final brace for already-finished
+  // replies. The live response gate must be stricter: only a genuinely balanced
+  // object (or a complete YAML-shaped handoff) proves streaming has reached the end.
+  const balancedHandoff = extractJsonObjects(src)
+    .some((candidate) => parseHandoff(candidate, expected) != null);
+  const parsed = parseHandoff(src, expected);
+  const yamlHandoff = parsed != null
+    && /(?:^|\n)\s*(?:stage_status|stageStatus)\s*:/m.test(src)
+    && !/[{\[]/.test(src);
+  if (balancedHandoff || yamlHandoff) return 'complete';
+  const hasHandoffKey = /(?:^|[,{]\s*)["']?(?:run[_ -]?id|agent[_ -]?role|stage[_ -]?status|recommended[_ -]?status[_ -]?code)["']?\s*[:=]/im.test(src);
+  const hasStructuredPrefix = /(?:^|\n)\s*(?:```\s*(?:json|yaml|yml)?\s*|(?:json|yaml|yml)\s*\r?\n)\s*[\[{]/i.test(src);
+  return hasHandoffKey || hasStructuredPrefix ? 'incomplete' : 'unknown';
+}
+
 // Union of explicitly requested reruns and reruns derived from open-issue domains.
 export function mergeReruns(requiredReruns = [], issues = []) {
   const out = new Set();
@@ -773,20 +795,21 @@ export class WorkflowOrchestrator {
     return PERSISTENT_FILES.map((name) => captured.get(name)).filter(Boolean);
   }
 
-  async _send(controller, message, { first, attachments, timeoutMs, newChat }) {
+  async _send(controller, message, { first, attachments, timeoutMs, newChat, responseState = null }) {
     if (first) {
-      return controller.query({ prompt: message, attachments, timeoutMs, newChat });
+      return controller.query({ prompt: message, attachments, timeoutMs, newChat, responseState });
     }
-    return controller.followUp({ text: message, timeoutMs });
+    return controller.followUp({ text: message, timeoutMs, responseState });
   }
 
   // Run one role turn: send, capture text, parse the handoff (re-asking once if needed).
   async _turn(controller, step, ctx, sendOpts, transcript) {
     const message = this._composeMessage(step, ctx, { includeShared: sendOpts.first });
-    let result = await this._send(controller, message, sendOpts);
+    const expected = { runId: ctx.runId, role: step.role, mode: step.mode ?? null, kind: step.kind };
+    const responseState = (candidate) => handoffResponseState(candidate, expected);
+    let result = await this._send(controller, message, { ...sendOpts, responseState });
     let text = String(result?.text || '');
     transcript.push({ role: step.role, mode: step.mode, text });
-    const expected = { runId: ctx.runId, role: step.role, mode: step.mode ?? null, kind: step.kind };
     let handoff = parseHandoff(text, expected);
     let validationError = handoff ? handoffValidationError(handoff, step, ctx.runId) : 'handoff JSON not found';
     if (validationError) handoff = null;
@@ -800,7 +823,8 @@ export class WorkflowOrchestrator {
           `Reply again with ONLY the required fenced \`\`\`json handoff object. Required identity: ` +
           `run_id=${ctx.runId}, role=${step.role}, mode=${step.mode ?? 'null'}. ` +
           'Include an artifacts array and a valid SHA-256 for every listed artifact.',
-        timeoutMs: sendOpts.timeoutMs
+        timeoutMs: sendOpts.timeoutMs,
+        responseState
       });
       text = String(reask?.text || '');
       transcript.push({ role: step.role, mode: step.mode, text, reask: true });

@@ -5,7 +5,8 @@ import {
   ChatGPTController,
   attachmentAttemptComplete,
   attachmentsComplete,
-  attachmentProgressKey
+  attachmentProgressKey,
+  responseCompletionDecision
 } from '../chatgpt-controller.mjs';
 
 function readyState() {
@@ -131,4 +132,63 @@ test('attachmentAttemptComplete: accepts only the current file name or a new chi
 
 test('attachmentAttemptComplete: does not mistake an existing chip for a new file', () => {
   assert.equal(attachmentAttemptComplete({ chips: 2, matchedStems: [] }, { stem: 'third', baselineChips: 2 }), false);
+});
+
+test('response completion: tool-phase idle does not complete a truncated handoff', () => {
+  const partial = {
+    text: 'JSON\n{',
+    started: true,
+    busy: false,
+    stable: true,
+    idleForMs: 60_000,
+    terminalVisible: false,
+    terminalForMs: 0,
+    hasError: false,
+    semanticState: 'incomplete'
+  };
+  assert.equal(responseCompletionDecision(partial).done, false);
+});
+
+test('response completion: a complete handoff returns after normal UI stabilization', () => {
+  const result = responseCompletionDecision({
+    text: '{"stage_status":"passed"}',
+    started: true,
+    busy: false,
+    stable: true,
+    idleForMs: 5_000,
+    terminalVisible: false,
+    terminalForMs: 0,
+    hasError: false,
+    semanticState: 'complete'
+  });
+  assert.deepEqual(result, { done: true, reason: 'semantic_complete' });
+});
+
+test('response completion: sustained terminal controls release a genuinely truncated final reply', () => {
+  const result = responseCompletionDecision({
+    text: 'JSON\n{',
+    started: true,
+    busy: false,
+    stable: true,
+    idleForMs: 15_000,
+    terminalVisible: true,
+    terminalForMs: 15_000,
+    hasError: false,
+    semanticState: 'incomplete'
+  });
+  assert.deepEqual(result, { done: true, reason: 'terminal_incomplete' });
+});
+
+test('response completion: busy UI always wins over semantic completeness', () => {
+  const result = responseCompletionDecision({
+    text: '{"stage_status":"passed"}',
+    started: true,
+    busy: true,
+    stable: true,
+    idleForMs: 20_000,
+    terminalVisible: true,
+    terminalForMs: 20_000,
+    semanticState: 'complete'
+  });
+  assert.equal(result.done, false);
 });

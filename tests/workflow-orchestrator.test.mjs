@@ -6,7 +6,7 @@ import path from 'node:path';
 
 import {
   WorkflowOrchestrator, IssueLog, PLAN, GATES, PERSISTENT_FILES,
-  parseHandoff, mergeReruns, selectFailureCode, issueRecordsFromHandoff, loadRoles
+  parseHandoff, handoffResponseState, mergeReruns, selectFailureCode, issueRecordsFromHandoff, loadRoles
 } from '../workflow-orchestrator.mjs';
 
 // ---------------------------------------------------------------------------
@@ -112,6 +112,27 @@ test('parseHandoff: skips an unrelated decoy JSON blob (e.g. a pasted report.jso
   assert.ok(h, 'handoff should parse past the decoy blob');
   assert.equal(h.stage_status, 'passed');
   assert.equal(h.role, 'contract_auditor');
+});
+
+test('handoffResponseState keeps waiting on the exact truncated live-run fragments', () => {
+  assert.equal(handoffResponseState('JSON\n{'), 'incomplete');
+  assert.equal(handoffResponseState('JSON\n{\n  "run_id": "RUN-0001_'), 'incomplete');
+  assert.equal(handoffResponseState([
+    'JSON',
+    '{',
+    '  "run_id": "RUN-0001",',
+    '  "role": "controller",',
+    '  "mode": "start",',
+    '  "stage_status": "passed",',
+    '  "artifacts": []'
+  ].join('\n')), 'incomplete', 'parser repair must not be mistaken for stream completion');
+});
+
+test('handoffResponseState separates completed envelopes from ordinary prose', () => {
+  assert.equal(handoffResponseState(JSON.stringify({
+    run_id: 'RUN-0001', role: 'controller', mode: 'start', stage_status: 'passed', artifacts: []
+  })), 'complete');
+  assert.equal(handoffResponseState('I could not complete the requested operation.'), 'unknown');
 });
 
 test('parseHandoff: normalizes a decorative gate mode on a mode-less role', () => {
@@ -350,9 +371,17 @@ function scriptedController(recorder, { fail = {}, severity = 'minor', domain = 
       };
       return { text: `notes\n\`\`\`json\n${JSON.stringify(handoff)}\n\`\`\`` };
     };
+    const respond = (message, responseState) => {
+      const result = reply(message);
+      if (typeof responseState === 'function') {
+        recorder.responseStates = recorder.responseStates || [];
+        recorder.responseStates.push(responseState(result.text));
+      }
+      return result;
+    };
     return {
-      async query({ prompt }) { return reply(prompt); },
-      async followUp({ text }) { return reply(text); },
+      async query({ prompt, responseState }) { return respond(prompt, responseState); },
+      async followUp({ text, responseState }) { return respond(text, responseState); },
       async downloadLastAssistantEntities({ outDir }) {
         recorder.downloads = (recorder.downloads || 0) + 1;
         if (!writeFiles) return [];
@@ -389,6 +418,8 @@ test('run(): happy path passes every gate and returns status 0 with the 3 persis
   // The Controller opens the run before preflight; the plan is walked in order.
   assert.equal(recorder.turns[0], 'controller/start');
   assert.equal(recorder.turns.at(-1), 'controller/finalize');
+  assert.ok(recorder.responseStates.length > 0);
+  assert.ok(recorder.responseStates.every((state) => state === 'complete'));
 });
 
 test('run(): a recoverable QA gate that fails once is repaired and then passes', async () => {

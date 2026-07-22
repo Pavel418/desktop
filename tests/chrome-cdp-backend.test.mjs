@@ -4,7 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { ChromeCdpBrowserBackend, ChromeCdpConnection, chromeSpawnOptions } from '../chrome-cdp-backend.mjs';
+import {
+  ChromeCdpBrowserBackend,
+  ChromeCdpConnection,
+  ChromeCdpPageAdapter,
+  chromeSpawnOptions
+} from '../chrome-cdp-backend.mjs';
 
 class MockWebSocket {
   constructor() {
@@ -88,6 +93,29 @@ test('chrome-cdp-backend: Chrome spawn does not use shell on any platform', () =
   const opts = chromeSpawnOptions();
   assert.equal(opts.stdio, 'ignore');
   assert.equal(Object.hasOwn(opts, 'shell'), false);
+});
+
+test('chrome-cdp-backend: file upload targets the active composer input before stale global matches', async () => {
+  const calls = [];
+  const client = {
+    async send(method, params, sessionId) {
+      calls.push({ method, params, sessionId });
+      if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
+      if (method === 'Runtime.evaluate') return { result: { objectId: 'active-input-object' } };
+      if (method === 'DOM.requestNode') return { nodeId: 42 };
+      if (method === 'Runtime.releaseObject') return {};
+      if (method === 'DOM.querySelectorAll') return { nodeIds: [11, 42, 13] };
+      if (method === 'DOM.setFileInputFiles') return {};
+      throw new Error(`unexpected:${method}`);
+    }
+  };
+  const page = new ChromeCdpPageAdapter({ client, targetId: 'target', sessionId: 'session' });
+  const result = await page.setFileInputFiles(['C:\\input\\target.pdf']);
+  const setCall = calls.find((call) => call.method === 'DOM.setFileInputFiles');
+  assert.equal(setCall.params.nodeId, 42);
+  assert.deepEqual(setCall.params.files, ['C:\\input\\target.pdf']);
+  assert.equal(result.strategy, 'active-composer');
+  assert.equal(result.nodeId, 42);
 });
 
 test('chrome-cdp-backend: connect rejects if websocket closes before open', async () => {

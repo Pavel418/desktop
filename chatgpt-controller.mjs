@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-export const ATTACHMENT_RUNTIME_REVISION = 'per-file-composer-v2';
+export const ATTACHMENT_RUNTIME_REVISION = 'active-composer-v3';
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -835,7 +835,8 @@ export class ChatGPTController {
         }
 
         this.#debug(
-          `attach: ${fileName} set attempt ${attempt} (inputs found=${info?.found ?? '?'}, set=${info?.set ?? '?'})`
+          `attach: ${fileName} set attempt ${attempt} (inputs found=${info?.found ?? '?'}, set=${info?.set ?? '?'}, ` +
+            `strategy=${info?.strategy ?? '?'}, node=${info?.nodeId ?? '?'})`
         );
         settle = await this.#waitForAttachments({
           baseNames,
@@ -850,6 +851,11 @@ export class ChatGPTController {
             `chips=${settle.chips} uploading=${settle.uploading} waitedMs=${settle.waitedMs}`
         );
         if (!registered) {
+          const revealed = await this.#revealFileInput().catch(() => null);
+          this.#debug(
+            `attach: ${fileName} attempt ${attempt} silently dropped; attachment UI ` +
+              `${revealed ? `refreshed (${revealed})` : 'refresh control NOT found'}`
+          );
           await this.#eval(`(() => { const e = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]'); if (e) e.focus(); return true; })()`).catch(() => {});
           await sleep(900);
         }

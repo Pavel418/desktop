@@ -297,7 +297,7 @@ export class ChromeCdpConnection {
   }
 }
 
-class ChromeCdpPageAdapter {
+export class ChromeCdpPageAdapter {
   constructor({ client, targetId, sessionId, windowId = null }) {
     this.client = client;
     this.targetId = targetId;
@@ -406,10 +406,50 @@ class ChromeCdpPageAdapter {
     let lastFound = 0;
     for (let attempt = 0; attempt < 10; attempt++) {
       const { root } = await this.client.send('DOM.getDocument', { depth: 12, pierce: true }, this.sessionId);
-      // Prefer the composer's real upload input; fall back to any file input.
-      // Set exactly ONE input — setting several submits the same files repeatedly,
-      // which pops a duplicate-file dialog and steals focus from the composer.
-      const ordered = [];
+      // Resolve the input owned by the VISIBLE prompt composer. ChatGPT keeps stale
+      // upload inputs mounted (often three with the same #upload-files id), so taking
+      // the first global match can succeed at the CDP layer without notifying React.
+      let activeNodeId = null;
+      let activeObjectId = null;
+      try {
+        const active = await this.client.send(
+          'Runtime.evaluate',
+          {
+            expression: `(() => {
+              const visible = (n) => {
+                if (!n) return false;
+                const r = n.getBoundingClientRect();
+                const s = getComputedStyle(n);
+                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const prompts = Array.from(document.querySelectorAll('#prompt-textarea, [contenteditable="true"][role="textbox"]'));
+              const prompt = prompts.filter(visible).at(-1) || null;
+              const composer = prompt?.closest('form') || prompt?.closest('[data-testid*="composer" i]') || null;
+              const local = composer ? Array.from(composer.querySelectorAll('input[type="file"]')).filter((n) => !n.disabled) : [];
+              if (local.length) return local.find((n) => n.id === 'upload-files') || local.at(-1);
+              const all = Array.from(document.querySelectorAll('input[type="file"]')).filter((n) => !n.disabled);
+              return all.at(-1) || null;
+            })()`,
+            awaitPromise: false,
+            returnByValue: false
+          },
+          this.sessionId
+        );
+        activeObjectId = active?.result?.objectId || null;
+        if (activeObjectId) {
+          const requested = await this.client.send('DOM.requestNode', { objectId: activeObjectId }, this.sessionId);
+          if (Number.isFinite(requested?.nodeId) && requested.nodeId > 0) activeNodeId = requested.nodeId;
+        }
+      } catch {
+        activeNodeId = null;
+      } finally {
+        if (activeObjectId) {
+          await this.client.send('Runtime.releaseObject', { objectId: activeObjectId }, this.sessionId).catch(() => {});
+        }
+      }
+
+      // Set exactly ONE input. Global matches are fallback candidates only.
+      const ordered = activeNodeId ? [activeNodeId] : [];
       for (const sel of ['input[type="file"]#upload-files', 'form input[type="file"]', 'input[type="file"]']) {
         const q = await this.client.send('DOM.querySelectorAll', { nodeId: root.nodeId, selector: sel }, this.sessionId);
         for (const id of (Array.isArray(q?.nodeIds) ? q.nodeIds : [])) if (!ordered.includes(id)) ordered.push(id);
@@ -422,7 +462,12 @@ class ChromeCdpPageAdapter {
       for (const nodeId of ordered) {
         try {
           await this.client.send('DOM.setFileInputFiles', { nodeId, files }, this.sessionId);
-          return { found: ordered.length, set: 1 };
+          return {
+            found: ordered.length,
+            set: 1,
+            nodeId,
+            strategy: activeNodeId && nodeId === activeNodeId ? 'active-composer' : 'global-fallback'
+          };
         } catch {}
       }
       await sleep(180);

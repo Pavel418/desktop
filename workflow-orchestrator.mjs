@@ -236,6 +236,30 @@ export function selectFailureCode(issues = [], failedStage = null, fallback = 99
   return fallback;
 }
 
+// The compact v3 handoff lists new issue IDs, while some roles also include the
+// complete issue records in an `issues` array. Preserve those details whenever
+// available so repair routing retains severity, domain, owner, and evidence.
+export function issueRecordsFromHandoff(handoff) {
+  const refs = Array.isArray(handoff?.new_issues) ? handoff.new_issues : [];
+  const details = Array.isArray(handoff?.issues) ? handoff.issues.filter((i) => i && typeof i === 'object') : [];
+  const byId = new Map(details.map((i) => [String(i.issue_id || ''), i]));
+  const out = [];
+  const seen = new Set();
+  for (const ref of refs) {
+    const id = String(ref?.issue_id || ref || '');
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(typeof ref === 'object' ? { ...(byId.get(id) || {}), ...ref } : (byId.get(id) || ref));
+  }
+  for (const detail of details) {
+    const id = String(detail.issue_id || '');
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(detail);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Append-only issue log
 // ---------------------------------------------------------------------------
@@ -247,7 +271,9 @@ export class IssueLog {
   }
 
   _ingest(record, { defaultStatus } = {}) {
-    if (typeof record === 'string' && record) record = { issue_id: record };
+    // A referenced ID with no inline record must remain blocking until an auditor
+    // verifies it; otherwise compact handoffs silently discard critical findings.
+    if (typeof record === 'string' && record) record = { issue_id: record, severity: 'major' };
     if (!record || typeof record !== 'object') return;
     const id = String(record.issue_id || `ISSUE-${this.issues.length + 1}`);
     const existing = this._byId.get(id);
@@ -355,15 +381,54 @@ export class WorkflowOrchestrator {
   // message. Called right after the package turn (when they are freshly produced) and
   // again at the end as a fallback.
   async _downloadPersistent(controller, outDir) {
-    if (!controller.downloadLastAssistantEntities) return [];
+    if (!controller.downloadLastAssistantEntities && !controller.downloadLastAssistantFiles) return [];
     await fs.mkdir(outDir, { recursive: true }).catch(() => {});
-    const entities = await controller.downloadLastAssistantEntities({ outDir }).catch(() => []);
-    const links = controller.downloadLastAssistantFiles
-      ? await controller.downloadLastAssistantFiles({ maxFiles: 20, outDir }).catch(() => [])
-      : [];
-    return [...entities, ...links]
-      .filter((f) => f && PERSISTENT_FILES.includes(f.name))
-      .map((f) => ({ path: f.path, name: f.name }));
+    const stagingDir = await fs.mkdtemp(path.join(outDir, '.persistent-download-'));
+    try {
+      const entities = controller.downloadLastAssistantEntities
+        ? await controller.downloadLastAssistantEntities({ outDir: stagingDir }).catch(() => [])
+        : [];
+      const links = controller.downloadLastAssistantFiles
+        ? await controller.downloadLastAssistantFiles({ maxFiles: 20, outDir: stagingDir }).catch(() => [])
+        : [];
+      const found = new Map();
+      for (const file of [...entities, ...links]) {
+        if (file && PERSISTENT_FILES.includes(file.name) && !found.has(file.name)) found.set(file.name, file);
+      }
+      const published = [];
+      for (const name of PERSISTENT_FILES) {
+        const file = found.get(name);
+        if (!file) continue;
+        const destination = path.join(outDir, name);
+        await fs.copyFile(file.path, destination);
+        published.push({ path: destination, name });
+      }
+      return published;
+    } finally {
+      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  async _ensurePersistentDownloads(controller, outDir, transcript) {
+    const captured = new Map();
+    const collect = async () => {
+      for (const file of await this._downloadPersistent(controller, outDir)) captured.set(file.name, file);
+    };
+    await collect();
+    for (let attempt = 1; attempt <= 2 && captured.size < PERSISTENT_FILES.length; attempt++) {
+      const missing = PERSISTENT_FILES.filter((name) => !captured.has(name));
+      this.log(`  · package download recovery ${attempt}/2: requesting ${missing.join(', ')}`);
+      const reply = await controller.followUp({
+        text:
+          `The package artifacts were not all exposed as downloadable attachments. ` +
+          `Do not regenerate or modify them. Attach the existing files ${missing.join(', ')} to this reply ` +
+          `with those exact filenames. Reply briefly and do not emit another handoff JSON.`,
+        timeoutMs: this.config.perTurnTimeoutMs
+      });
+      transcript.push({ role: 'generator_engineer', mode: 'package_download', text: String(reply?.text || '') });
+      await collect();
+    }
+    return PERSISTENT_FILES.map((name) => captured.get(name)).filter(Boolean);
   }
 
   async _send(controller, message, { first, attachments, timeoutMs, newChat }) {
@@ -420,7 +485,7 @@ export class WorkflowOrchestrator {
       if (!['passed', 'ready_for_review'].includes(repairTurn.handoff.stage_status)) {
         return { recovered: false, code: selectFailureCode(state.issues.snapshot(), gate), stage: gate };
       }
-      state.issues.addNew(repairTurn.handoff.new_issues);
+      state.issues.addNew(issueRecordsFromHandoff(repairTurn.handoff));
 
       // 2) The owning writer applies the plan. Template geometry/semantics belongs to
       // Template Architect; all generator/runtime/reconstruction concerns belong to
@@ -445,7 +510,7 @@ export class WorkflowOrchestrator {
         if (!writerTurn.handoff || !['passed', 'ready_for_review'].includes(writerTurn.handoff.stage_status)) {
           return { recovered: false, code: selectFailureCode(state.issues.snapshot(), gate), stage: gate };
         }
-        state.issues.addNew(writerTurn.handoff.new_issues);
+        state.issues.addNew(issueRecordsFromHandoff(writerTurn.handoff));
         state.issues.markFixed(writerTurn.handoff.verified_issues);
         writerReruns.push(...writerTurn.handoff.required_reruns);
       }
@@ -470,7 +535,7 @@ export class WorkflowOrchestrator {
           transcript
         );
         if (!qaTurn.handoff) return { recovered: false, code: 99, stage: mode };
-        state.issues.addNew(qaTurn.handoff.new_issues);
+        state.issues.addNew(issueRecordsFromHandoff(qaTurn.handoff));
         state.issues.markVerified(qaTurn.handoff.verified_issues);
         if (mode === gate) gatePassed = qaTurn.handoff.stage_status === 'passed';
       }
@@ -484,7 +549,7 @@ export class WorkflowOrchestrator {
           transcript
         );
         if (!qaTurn.handoff) return { recovered: false, code: 99, stage: gate };
-        state.issues.addNew(qaTurn.handoff.new_issues);
+        state.issues.addNew(issueRecordsFromHandoff(qaTurn.handoff));
         state.issues.markVerified(qaTurn.handoff.verified_issues);
         gatePassed = qaTurn.handoff.stage_status === 'passed';
       }
@@ -496,6 +561,74 @@ export class WorkflowOrchestrator {
     }
     const code = selectFailureCode(state.issues.snapshot(), gate);
     return { recovered: false, code, stage: gate };
+  }
+
+  // Preflight findings concern the reusable base runtime and must be repaired by
+  // Generator Engineer before template analysis starts. Re-audit them with Contract
+  // Auditor; routing them through QA modes would run template checks before a
+  // template specification exists.
+  async _repairPreflight(controller, state, transcript) {
+    for (let round = 1; round <= this.config.maxRepairRounds; round++) {
+      const assigned = state.issues.open();
+      this.log(`  ↻ preflight repair round ${round}/${this.config.maxRepairRounds} (${assigned.length} open issue(s))`);
+
+      const planner = await this._turn(
+        controller,
+        { role: 'repair_engineer', mode: null, gate: 'preflight' },
+        {
+          ...state.ctx,
+          gate: 'preflight',
+          assignedIssues: assigned,
+          extra: 'Plan only the reusable-runtime preflight corrections. Do not perform template adaptation, edit files, or verify issues.'
+        },
+        { first: false, timeoutMs: this.config.perTurnTimeoutMs },
+        transcript
+      );
+      if (!planner.handoff || !['passed', 'ready_for_review'].includes(planner.handoff.stage_status)) {
+        return { recovered: false, code: selectFailureCode(state.issues.snapshot(), 'preflight'), stage: 'preflight' };
+      }
+      state.issues.addNew(issueRecordsFromHandoff(planner.handoff));
+
+      const writer = await this._turn(
+        controller,
+        { role: 'generator_engineer', mode: 'repair', kind: 'write' },
+        {
+          ...state.ctx,
+          gate: 'preflight',
+          assignedIssues: state.issues.open(),
+          extra: 'Apply only the approved base-runtime preflight corrections. Mark addressed issue IDs fixed, never verified. Do not adapt the target template yet.'
+        },
+        { first: false, timeoutMs: this.config.perTurnTimeoutMs },
+        transcript
+      );
+      if (!writer.handoff || !['passed', 'ready_for_review'].includes(writer.handoff.stage_status)) {
+        return { recovered: false, code: selectFailureCode(state.issues.snapshot(), 'preflight'), stage: 'preflight' };
+      }
+      state.issues.addNew(issueRecordsFromHandoff(writer.handoff));
+      state.issues.markFixed(writer.handoff.verified_issues);
+
+      const audit = await this._turn(
+        controller,
+        { role: 'contract_auditor', mode: 'preflight', gate: 'preflight', kind: 'audit' },
+        {
+          ...state.ctx,
+          gate: 'preflight',
+          assignedIssues: state.issues.snapshot().filter((issue) => issue.status !== 'verified'),
+          extra: 'Re-run preflight after repair. Verify each corrected issue ID explicitly, reopen failures with complete issue records, and do not perform template adaptation.'
+        },
+        { first: false, timeoutMs: this.config.perTurnTimeoutMs },
+        transcript
+      );
+      if (!audit.handoff) return { recovered: false, code: 99, stage: 'preflight' };
+      state.issues.addNew(issueRecordsFromHandoff(audit.handoff));
+      state.issues.markVerified(audit.handoff.verified_issues);
+
+      if (audit.handoff.stage_status === 'passed' && state.issues.blockingForRelease().length === 0) {
+        this.log(`  ✓ "preflight" gate recovered after repair round ${round}`);
+        return { recovered: true };
+      }
+    }
+    return { recovered: false, code: selectFailureCode(state.issues.snapshot(), 'preflight'), stage: 'preflight' };
   }
 
   // Drive the whole workflow for one PDF.
@@ -511,6 +644,7 @@ export class WorkflowOrchestrator {
     let statusCode = null;
     let failedStage = null;
     let packagedFiles = [];
+    let packageProduced = false;
 
     for (let i = 0; i < PLAN.length; i++) {
       const step = PLAN[i];
@@ -532,7 +666,7 @@ export class WorkflowOrchestrator {
       }
 
       // Apply issue-log transitions.
-      state.issues.addNew(turn.handoff.new_issues);
+      state.issues.addNew(issueRecordsFromHandoff(turn.handoff));
       if (step.kind === 'audit') state.issues.markVerified(turn.handoff.verified_issues);
       else if (step.kind === 'write') state.issues.markFixed(turn.handoff.verified_issues);
 
@@ -556,7 +690,15 @@ export class WorkflowOrchestrator {
 
       // Capture the persistent files while they are freshly produced by the package turn.
       if (step.role === 'generator_engineer' && step.mode === 'package') {
-        packagedFiles = await this._downloadPersistent(controller, outDir);
+        packageProduced = true;
+        packagedFiles = await this._ensurePersistentDownloads(controller, outDir, transcript);
+        const missing = PERSISTENT_FILES.filter((name) => !packagedFiles.some((file) => file.name === name));
+        if (missing.length) {
+          failedStage = 'package';
+          statusCode = 70;
+          this.log(`  ✗ package did not expose downloadable persistent files: ${missing.join(', ')} → status 70`);
+          break;
+        }
       }
 
       if (step.kind === 'audit' && step.gate) {
@@ -570,7 +712,21 @@ export class WorkflowOrchestrator {
           continue;
         }
 
-        // Non-recoverable stages (preflight/release/final): abort with a causal code.
+        // Preflight defects are base-runtime defects. Repair them before any target
+        // template work, then have Contract Auditor independently re-run preflight.
+        if (step.gate === 'preflight') {
+          const outcome = await this._repairPreflight(controller, state, transcript);
+          if (outcome.recovered) {
+            gatesPassed.push(step.gate);
+            continue;
+          }
+          failedStage = outcome.stage;
+          statusCode = outcome.code;
+          this.log(`  ✗ "preflight" gate could not be repaired → status ${statusCode}`);
+          break;
+        }
+
+        // Release and final remain non-recoverable in this run.
         if (!QA_MODES.includes(step.gate)) {
           failedStage = step.gate;
           const rec = Number(turn.handoff.recommended_status_code);
@@ -594,12 +750,22 @@ export class WorkflowOrchestrator {
       }
     }
 
-    const success = statusCode === this.config.successCode && gatesPassed.includes('final');
-    if (!Number.isFinite(statusCode)) statusCode = success ? this.config.successCode : selectFailureCode(state.issues.snapshot(), failedStage);
+    const workflowReachedSuccess = statusCode === this.config.successCode && gatesPassed.includes('final');
+    if (!Number.isFinite(statusCode)) {
+      statusCode = workflowReachedSuccess ? this.config.successCode : selectFailureCode(state.issues.snapshot(), failedStage);
+    }
 
-    // Prefer files captured at the package turn; otherwise try the last reply.
-    let files = packagedFiles;
-    if (!files.length) files = await this._downloadPersistent(controller, outDir);
+    // Files are captured and recovery-retried at the package turn. Never invoke the
+    // downloader on an early failure response: no persistent files exist yet.
+    const files = packagedFiles;
+
+    const missingPersistent = PERSISTENT_FILES.filter((name) => !files.some((file) => file.name === name));
+    if (packageProduced && missingPersistent.length) {
+      statusCode = 70;
+      failedStage = 'package';
+    }
+
+    const success = statusCode === this.config.successCode && gatesPassed.includes('final') && missingPersistent.length === 0;
 
     return {
       runId,

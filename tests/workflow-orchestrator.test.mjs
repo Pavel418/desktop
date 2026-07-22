@@ -6,7 +6,7 @@ import path from 'node:path';
 
 import {
   WorkflowOrchestrator, IssueLog, PLAN, GATES, PERSISTENT_FILES,
-  parseHandoff, mergeReruns, selectFailureCode, loadRoles
+  parseHandoff, mergeReruns, selectFailureCode, issueRecordsFromHandoff, loadRoles
 } from '../workflow-orchestrator.mjs';
 
 // ---------------------------------------------------------------------------
@@ -150,6 +150,16 @@ test('IssueLog: repair marks fixed, only auditor verifies, blocking counts unver
   assert.equal(log.blockingForRelease().length, 0);
 });
 
+test('issueRecordsFromHandoff merges compact issue IDs with complete issue records', () => {
+  const records = issueRecordsFromHandoff({
+    new_issues: ['ISSUE-1'],
+    issues: [{ issue_id: 'ISSUE-1', severity: 'critical', domain: 'runtime', evidence: 'exact defect' }]
+  });
+  assert.deepEqual(records, [
+    { issue_id: 'ISSUE-1', severity: 'critical', domain: 'runtime', evidence: 'exact defect' }
+  ]);
+});
+
 test('IssueLog accepts v3 handoffs that reference new issues by ID', () => {
   const log = new IssueLog();
   log.addNew(['ISSUE-STRING-1']);
@@ -175,6 +185,17 @@ function roleFromMessage(message) {
   return { role: m ? m[1].toLowerCase() : 'unknown', mode: m && m[2] ? m[2] : null };
 }
 
+function assignedIssueIds(message) {
+  const match = String(message).match(/Assigned open issues to address:\s*```json\s*([\s\S]*?)```/);
+  if (!match) return [];
+  try {
+    const records = JSON.parse(match[1]);
+    return Array.isArray(records) ? records.map((record) => String(record?.issue_id || '')).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
 // A controller whose replies are derived from the role/mode named in the outgoing
 // message. `fail` maps "role/mode" -> number of times to return stage_status "failed"
 // before passing. `severity`/`domain` shape the emitted issue.
@@ -183,6 +204,7 @@ function scriptedController(recorder, { fail = {}, severity = 'minor', domain = 
   return () => {
     const reply = (message) => {
       const { role, mode } = roleFromMessage(message);
+      const assigned = assignedIssueIds(message);
       const runId = String(message).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
       const key = mode ? `${role}/${mode}` : role;
       recorder.turns.push(key);
@@ -193,11 +215,16 @@ function scriptedController(recorder, { fail = {}, severity = 'minor', domain = 
         stage_status = 'failed';
         new_issues = [{ issue_id: `ISSUE-${key}`, severity, domain, code: 'X', stage: mode || role, status: 'open' }];
       }
+      const mayResolveAssigned =
+        (role === 'generator_engineer' && mode === 'repair') ||
+        role === 'template_architect' || role === 'qa_auditor' || role === 'contract_auditor';
       const handoff = {
         run_id: runId, role, mode, stage_status,
         recommended_status_code: role === 'final_auditor' || (role === 'controller' && mode === 'finalize') ? 0 : null,
         artifacts: [{ path: `temporary/${key}.json`, sha256: 'a'.repeat(64) }],
-        new_issues, verified_issues: [], required_reruns: [], next_role: null
+        new_issues,
+        verified_issues: stage_status === 'passed' && mayResolveAssigned ? assigned : [],
+        required_reruns: [], next_role: null
       };
       return { text: `notes\n\`\`\`json\n${JSON.stringify(handoff)}\n\`\`\`` };
     };
@@ -205,6 +232,7 @@ function scriptedController(recorder, { fail = {}, severity = 'minor', domain = 
       async query({ prompt }) { return reply(prompt); },
       async followUp({ text }) { return reply(text); },
       async downloadLastAssistantEntities({ outDir }) {
+        recorder.downloads = (recorder.downloads || 0) + 1;
         if (!writeFiles) return [];
         const out = [];
         for (const name of PERSISTENT_FILES) {
@@ -257,6 +285,86 @@ test('run(): a recoverable QA gate that fails once is repaired and then passes',
   assert.ok(recorder.turns.includes('generator_engineer/repair'), 'generator writer should apply the repair plan');
 });
 
+test('run(): package download recovery requests missing attachments and then succeeds', async () => {
+  const t = await tmpOut();
+  const recorder = { turns: [], downloads: 0 };
+  const controller = scriptedController(recorder, { writeFiles: false })();
+  const regularFollowUp = controller.followUp.bind(controller);
+  let attachmentsExposed = false;
+  controller.followUp = async ({ text, ...rest }) => {
+    if (String(text).includes('package artifacts were not all exposed')) {
+      attachmentsExposed = true;
+      return { text: 'Attached generator.py, manifest.json, and generator_report.json.' };
+    }
+    return regularFollowUp({ text, ...rest });
+  };
+  controller.downloadLastAssistantEntities = async ({ outDir }) => {
+    recorder.downloads += 1;
+    if (!attachmentsExposed) return [];
+    const files = [];
+    for (const name of PERSISTENT_FILES) {
+      const file = path.join(outDir, name);
+      await fs.writeFile(file, `fresh:${name}`);
+      files.push({ path: file, name });
+    }
+    return files;
+  };
+  const orch = new WorkflowOrchestrator({ roles: makeRoles(), config: { perTurnTimeoutMs: 1000 } });
+  const res = await orch.run({ pdf: t.pdf, baseGenerator: t.gen, outDir: t.out, controller });
+  assert.equal(res.success, true);
+  assert.equal(res.statusCode, 0);
+  assert.equal(recorder.downloads, 2, 'initial capture plus one recovery capture');
+  assert.ok(res.transcript.some((turn) => turn.mode === 'package_download'));
+});
+
+test('run(): missing package downloads fail closed with status 70', async () => {
+  const t = await tmpOut();
+  const recorder = { turns: [], downloads: 0 };
+  const orch = new WorkflowOrchestrator({ roles: makeRoles(), config: { perTurnTimeoutMs: 1000 } });
+  const res = await orch.run({
+    pdf: t.pdf, baseGenerator: t.gen, outDir: t.out,
+    controller: scriptedController(recorder, { writeFiles: false })()
+  });
+  assert.equal(res.success, false);
+  assert.equal(res.statusCode, 70);
+  assert.equal(res.failedStage, 'package');
+  assert.equal(recorder.downloads, 3, 'initial capture plus two recovery captures');
+  assert.ok(!recorder.turns.includes('contract_auditor/release'));
+});
+
+test('run(): staged package publishing replaces stale persistent outputs with exact names', async () => {
+  const t = await tmpOut();
+  await fs.mkdir(t.out, { recursive: true });
+  for (const name of PERSISTENT_FILES) await fs.writeFile(path.join(t.out, name), 'stale');
+  const recorder = { turns: [], downloads: 0 };
+  const orch = new WorkflowOrchestrator({ roles: makeRoles(), config: { perTurnTimeoutMs: 1000 } });
+  const res = await orch.run({
+    pdf: t.pdf, baseGenerator: t.gen, outDir: t.out,
+    controller: scriptedController(recorder)()
+  });
+  assert.equal(res.success, true);
+  for (const name of PERSISTENT_FILES) {
+    assert.equal(await fs.readFile(path.join(t.out, name), 'utf8'), name);
+  }
+});
+
+test('run(): a failed preflight is repaired by Generator Engineer and re-audited by Contract Auditor', async () => {
+  const t = await tmpOut();
+  const recorder = { turns: [], downloads: 0 };
+  const orch = new WorkflowOrchestrator({ roles: makeRoles(), config: { perTurnTimeoutMs: 1000, maxRepairRounds: 2 } });
+  const res = await orch.run({
+    pdf: t.pdf, baseGenerator: t.gen, outDir: t.out,
+    controller: scriptedController(recorder, {
+      fail: { 'contract_auditor/preflight': 1 }, severity: 'critical', domain: 'runtime'
+    })()
+  });
+  assert.equal(res.success, true);
+  assert.equal(recorder.turns.filter((turn) => turn === 'contract_auditor/preflight').length, 2);
+  assert.ok(recorder.turns.includes('repair_engineer'));
+  assert.ok(recorder.turns.includes('generator_engineer/repair'));
+  assert.ok(res.gatesPassed.includes('preflight'));
+});
+
 test('run(): template geometry repair is applied by Template Architect', async () => {
   const t = await tmpOut();
   const recorder = { turns: [] };
@@ -296,6 +404,7 @@ test('run(): a failed creation stage stops before its auditor', async () => {
   assert.equal(res.statusCode, 60);
   assert.equal(res.failedStage, 'background');
   assert.ok(!recorder.turns.includes('qa_auditor/background'));
+  assert.equal(recorder.downloads || 0, 0, 'an early failure must not invoke the downloader');
 });
 
 test('run(): an unparseable handoff aborts with status 99', async () => {

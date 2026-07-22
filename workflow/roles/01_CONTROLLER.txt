@@ -16,7 +16,9 @@ INPUTS
 ACTIONS
 
 1. Assign one run_id and verify required inputs exist.
-2. Start Contract Auditor in preflight mode.
+2. Start Contract Auditor in preflight mode. Route genuine base-runtime findings to
+   Repair Engineer planning, Generator Engineer repair, and Contract Auditor re-audit;
+   do not abort a viable adaptation merely because target-specific placeholders are empty.
 3. Enforce the workflow order in WORKFLOW.md.
 4. Give each role only the artifacts needed for its task.
 5. Reject handoffs missing status, evidence, artifact hashes, or rerun requirements.

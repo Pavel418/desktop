@@ -58,6 +58,8 @@ PACKAGE MODE
 3. Confirm the CLI returns the report status code.
 4. Delete successful temporary artifacts unless keep_artifacts is enabled.
 5. Leave only generator.py, manifest.json, and generator_report.json.
+6. Attach or link all three files in the package reply with those exact filenames so
+   the external controller can download them.
 
 RETURN
 

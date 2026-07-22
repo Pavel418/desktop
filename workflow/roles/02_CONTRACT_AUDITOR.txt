@@ -21,6 +21,11 @@ PREFLIGHT MODE
 8. Search statically for OCR, PDF text extraction, hidden-layer access, and artificial degradation paths.
 9. Confirm no persistent runner, orchestrator, external template asset, or hidden production sidecar is required.
 10. Produce a preflight risk list and reusable-runtime map.
+11. Treat target-specific edit-zone placeholders, an empty template catalog, and a
+    document-family mismatch as expected adaptation work, not preflight failures.
+12. Pass preflight when the inputs and reusable architecture are viable. Fail only
+    for a genuine base-runtime or contract defect; such failures are repairable by
+    Generator Engineer and must include complete issue records and exact evidence.
 
 RELEASE MODE
 

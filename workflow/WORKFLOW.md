@@ -64,6 +64,22 @@ The Controller may retry one isolated stage without rerunning unrelated passed s
 
 ## Gates and loops
 
+### Preflight repair loop
+
+Target-specific placeholders and a mismatched starter document family are expected
+adaptation work and do not fail preflight. Genuine reusable-runtime defects are repaired
+before scan analysis:
+
+```text
+Contract Auditor preflight
+-> Repair Engineer plan
+-> Generator Engineer runtime repair
+-> Contract Auditor preflight re-audit
+```
+
+The workflow stops only when the reusable runtime cannot be repaired within the configured
+round limit.
+
 ### Template loop
 
 ```text

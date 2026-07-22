@@ -145,15 +145,343 @@ function stripTrailingCommas(jsonText) {
   return jsonText.replace(/,(\s*[}\]])/g, '$1');
 }
 
-// A parsed object counts as a handoff only once normalised: it must carry a string
-// stage_status, and its list fields default to [] so downstream code never has to
-// null-check them.
-function _normaliseHandoff(obj) {
-  if (!obj || typeof obj !== 'object' || typeof obj.stage_status !== 'string') return null;
-  for (const key of ['evidence', 'new_issues', 'verified_issues', 'required_reruns']) {
-    if (!Array.isArray(obj[key])) obj[key] = [];
+function extractFencedBlocks(text) {
+  const src = String(text || '');
+  const blocks = [];
+  const closed = /```[^\r\n]*\r?\n([\s\S]*?)```/g;
+  for (const match of src.matchAll(closed)) blocks.push(match[1]);
+  // Streaming or malformed replies sometimes omit the final fence. Keep the tail as
+  // a candidate; conservative bracket completion below decides whether it is usable.
+  const lastFence = src.lastIndexOf('```');
+  if (lastFence >= 0 && src.indexOf('```', lastFence + 3) === -1) {
+    const tail = src.slice(lastFence + 3).replace(/^[^\r\n]*\r?\n?/, '');
+    if (tail.trim()) blocks.push(tail);
+  }
+  return blocks;
+}
+
+function stripJsonComments(src) {
+  let out = '';
+  let quote = null;
+  let escaped = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    const next = src[i + 1];
+    if (quote) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      out += ch;
+    } else if (ch === '/' && next === '/') {
+      while (i < src.length && src[i] !== '\n') i++;
+      out += '\n';
+    } else if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < src.length - 1 && !(src[i] === '*' && src[i + 1] === '/')) i++;
+      i++;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+function convertSingleQuotedStrings(src) {
+  let out = '';
+  let inDouble = false;
+  let inSingle = false;
+  let escaped = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (inDouble) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inDouble = false;
+      continue;
+    }
+    if (inSingle) {
+      if (escaped) {
+        if (ch === "'") out += "'";
+        else if (ch === '"') out += '\\"';
+        else out += `\\${ch}`;
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === "'") {
+        out += '"';
+        inSingle = false;
+      } else if (ch === '"') {
+        out += '\\"';
+      } else if (ch === '\n') {
+        out += '\\n';
+      } else {
+        out += ch;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      out += ch;
+    } else if (ch === "'") {
+      inSingle = true;
+      out += '"';
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+function transformOutsideStrings(src, transform) {
+  let out = '';
+  let segment = '';
+  let inString = false;
+  let escaped = false;
+  for (const ch of src) {
+    if (inString) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      out += transform(segment) + ch;
+      segment = '';
+      inString = true;
+    } else {
+      segment += ch;
+    }
+  }
+  return out + transform(segment);
+}
+
+function completeJsonContainers(src) {
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+  for (const ch of src) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') {
+      const expected = ch === '}' ? '{' : '[';
+      if (stack.at(-1) !== expected) return src;
+      stack.pop();
+    }
+  }
+  if (inString || stack.length > 12) return src;
+  return src + stack.reverse().map((ch) => (ch === '{' ? '}' : ']')).join('');
+}
+
+function relaxedJsonVariants(raw) {
+  const base = String(raw || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/^\s*(?:json|javascript|js)\s*\r?\n/i, '')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/&quot;/gi, '"')
+    .trim()
+    .replace(/;\s*$/, '');
+  const variants = [base, stripTrailingCommas(base)];
+  if (/\\"/.test(base)) {
+    const unescaped = base.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+    variants.push(unescaped, stripTrailingCommas(unescaped));
+  }
+  let relaxed = convertSingleQuotedStrings(stripJsonComments(base));
+  relaxed = transformOutsideStrings(relaxed, (segment) =>
+    segment
+      .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)/g, '$1"$2"$3')
+      .replace(/\bNone\b/g, 'null')
+      .replace(/\bTrue\b/g, 'true')
+      .replace(/\bFalse\b/g, 'false')
+      .replace(/\b(?:undefined|NaN)\b/g, 'null')
+  );
+  variants.push(relaxed, stripTrailingCommas(relaxed));
+  if (/stage[_ -]?status/i.test(relaxed)) {
+    variants.push(completeJsonContainers(relaxed), completeJsonContainers(stripTrailingCommas(relaxed)));
+  }
+  return Array.from(new Set(variants.filter(Boolean)));
+}
+
+function parseYamlScalar(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return '';
+  if (/^(?:null|none|~)$/i.test(value)) return null;
+  if (/^(?:true|false)$/i.test(value)) return /^true$/i.test(value);
+  if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value);
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    return value.slice(1, -1);
+  }
+  if (/^[\[{]/.test(value)) {
+    const parsed = parseRelaxedJson(value);
+    if (parsed != null) return parsed;
+  }
+  return value;
+}
+
+// Constrained YAML-like fallback for the flat handoff shape GPT occasionally emits.
+// It supports top-level scalars, scalar lists, and artifact/issue object lists; it is
+// data-only and deliberately does not implement YAML tags, anchors, or execution.
+function parseSimpleYamlHandoff(raw) {
+  const src = String(raw || '').replace(/^\s*(?:yaml|yml)\s*\r?\n/i, '');
+  if (!/(?:^|\n)\s*(?:stage_status|stageStatus)\s*:/m.test(src)) return null;
+  const out = {};
+  let section = null;
+  let listObject = null;
+  for (const originalLine of src.split(/\r?\n/)) {
+    if (!originalLine.trim() || /^\s*#/.test(originalLine)) continue;
+    const indent = originalLine.match(/^\s*/)?.[0].length || 0;
+    const line = originalLine.trim();
+    if (indent === 0) {
+      const top = line.match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/);
+      if (!top) continue;
+      const [, key, rest] = top;
+      if (rest === '') {
+        out[key] = [];
+        section = key;
+        listObject = null;
+      } else {
+        out[key] = parseYamlScalar(rest.replace(/\s+#.*$/, ''));
+        section = null;
+        listObject = null;
+      }
+      continue;
+    }
+    if (!section || !Array.isArray(out[section])) continue;
+    const item = line.match(/^-\s*(.*)$/);
+    if (item) {
+      const objectStart = item[1].match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/);
+      if (objectStart) {
+        listObject = { [objectStart[1]]: parseYamlScalar(objectStart[2]) };
+        out[section].push(listObject);
+      } else {
+        listObject = null;
+        out[section].push(parseYamlScalar(item[1]));
+      }
+      continue;
+    }
+    const property = line.match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/);
+    if (property && listObject) listObject[property[1]] = parseYamlScalar(property[2]);
+  }
+  return out;
+}
+
+function parseRelaxedJson(raw) {
+  for (const variant of relaxedJsonVariants(raw)) {
+    try {
+      return JSON.parse(variant);
+    } catch {}
+  }
+  return parseSimpleYamlHandoff(raw);
+}
+
+function canonicalToken(value) {
+  return String(value ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+}
+
+function asList(value) {
+  if (Array.isArray(value)) return value;
+  if (value == null || value === '') return [];
+  return [value];
+}
+
+const STATUS_ALIASES = new Map([
+  ['pass', 'passed'], ['passed', 'passed'], ['success', 'passed'], ['succeeded', 'passed'],
+  ['complete', 'passed'], ['completed', 'passed'], ['ok', 'passed'],
+  ['fail', 'failed'], ['failed', 'failed'], ['error', 'failed'],
+  ['blocked', 'blocked'], ['partial', 'blocked'],
+  ['ready', 'ready_for_review'], ['ready_for_review', 'ready_for_review'], ['ready_to_review', 'ready_for_review']
+]);
+
+function objectField(obj, ...names) {
+  for (const name of names) if (Object.hasOwn(obj, name)) return obj[name];
+  return undefined;
+}
+
+// Normalize syntax and harmless naming variations, but never invent run IDs, roles,
+// artifact paths, or hashes. Expected identity only resolves casing/separators and
+// mode omissions after the supplied run and role already match.
+function _normaliseHandoff(input, expected = null) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const obj = { ...input };
+  obj.run_id = objectField(obj, 'run_id', 'runId', 'runID');
+  obj.role = objectField(obj, 'role', 'agent_role', 'agentRole');
+  obj.mode = objectField(obj, 'mode', 'stage_mode', 'stageMode');
+  obj.stage_status = objectField(obj, 'stage_status', 'stageStatus', 'status');
+  obj.recommended_status_code = objectField(
+    obj, 'recommended_status_code', 'recommendedStatusCode', 'status_code', 'statusCode'
+  );
+  obj.artifacts = objectField(obj, 'artifacts', 'artifact', 'artifact_evidence', 'artifactEvidence', 'files');
+  obj.evidence = objectField(obj, 'evidence', 'checks');
+  obj.new_issues = objectField(obj, 'new_issues', 'newIssues');
+  obj.verified_issues = objectField(obj, 'verified_issues', 'verifiedIssues');
+  obj.fixed_issues = objectField(obj, 'fixed_issues', 'fixedIssues');
+  obj.required_reruns = objectField(obj, 'required_reruns', 'requiredReruns', 'reruns');
+  obj.next_role = objectField(obj, 'next_role', 'nextRole');
+
+  if (typeof obj.stage_status !== 'string') return null;
+  obj.stage_status = STATUS_ALIASES.get(canonicalToken(obj.stage_status)) || canonicalToken(obj.stage_status);
+  obj.run_id = typeof obj.run_id === 'string' ? obj.run_id.trim() : obj.run_id;
+  obj.role = canonicalToken(obj.role);
+  const rawMode = obj.mode;
+  obj.mode = rawMode == null || ['null', 'none', 'default', 'n/a', 'na', ''].includes(canonicalToken(rawMode))
+    ? null
+    : canonicalToken(rawMode);
+
+  const expectedRole = canonicalToken(expected?.role);
+  const runMatches = expected?.runId && typeof obj.run_id === 'string' && obj.run_id.toLowerCase() === String(expected.runId).toLowerCase();
+  const roleMatches = expectedRole && obj.role === expectedRole;
+  if (runMatches) obj.run_id = expected.runId;
+  if (roleMatches) obj.role = expected.role;
+  if (runMatches && roleMatches) {
+    if (expected?.mode == null) obj.mode = null;
+    else if (obj.mode == null || obj.mode === canonicalToken(expected.mode)) obj.mode = expected.mode;
+  }
+
+  for (const key of ['evidence', 'new_issues', 'verified_issues', 'fixed_issues', 'required_reruns']) {
+    obj[key] = asList(obj[key]);
+  }
+  if (expected?.kind === 'write' && obj.verified_issues.length === 0 && obj.fixed_issues.length) {
+    obj.verified_issues = [...obj.fixed_issues];
+  }
+  obj.artifacts = asList(obj.artifacts).map((artifact) => {
+    if (!artifact || typeof artifact !== 'object') return artifact;
+    return {
+      ...artifact,
+      path: objectField(artifact, 'path', 'file', 'file_path', 'filePath', 'artifact'),
+      sha256: objectField(artifact, 'sha256', 'sha_256', 'hash', 'digest')
+    };
+  });
+  if (typeof obj.recommended_status_code === 'string' && canonicalToken(obj.recommended_status_code) === 'null') {
+    obj.recommended_status_code = null;
   }
   return obj;
+}
+
+function collectHandoffObjects(value, out, depth = 0) {
+  if (depth > 8 || value == null) return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectHandoffObjects(item, out, depth + 1);
+    return;
+  }
+  if (typeof value !== 'object') return;
+  const keys = Object.keys(value);
+  if (keys.some((key) => ['stage_status', 'stageStatus'].includes(key)) || (keys.includes('status') && keys.some((key) => ['role', 'agent_role', 'agentRole'].includes(key)))) {
+    out.push(value);
+  }
+  for (const key of ['handoff', 'shared_handoff', 'sharedHandoff', 'result', 'output', 'data']) {
+    if (Object.hasOwn(value, key)) collectHandoffObjects(value[key], out, depth + 1);
+  }
 }
 
 const HANDOFF_STATUSES = new Set(['passed', 'failed', 'blocked', 'ready_for_review']);
@@ -182,26 +510,40 @@ function handoffValidationError(handoff, step, runId) {
 // Extract the handoff object from a reply. A reply may contain several JSON objects
 // (e.g. a pasted report.json, the visual-review envelope, AND the handoff itself), in
 // or out of markdown fences, with or without a "json" language tag. Scan the WHOLE
-// text for balanced top-level objects and take the LAST one (scanning backward) that
-// parses and carries a stage_status — matching the shared contract's "keep the
-// handoff block last" rule regardless of how the model formatted it.
-export function parseHandoff(text) {
-  const objects = extractJsonObjects(text);
-  for (let i = objects.length - 1; i >= 0; i--) {
-    let obj;
-    try {
-      obj = JSON.parse(objects[i]);
-    } catch {
-      try {
-        obj = JSON.parse(stripTrailingCommas(objects[i]));
-      } catch {
-        continue;
-      }
+// Parse strict or common GPT-adjacent data formats from the whole reply, fenced
+// blocks, and balanced objects. When the caller supplies the expected stage identity,
+// prefer that candidate over later decoy/report objects; final schema validation
+// still happens separately at the orchestration boundary.
+export function parseHandoff(text, expected = null) {
+  const src = String(text || '');
+  const rawCandidates = [src, ...extractFencedBlocks(src), ...extractJsonObjects(src)];
+  const handoffs = [];
+  for (const raw of Array.from(new Set(rawCandidates))) {
+    const parsed = parseRelaxedJson(raw);
+    if (parsed == null) continue;
+    const objects = [];
+    collectHandoffObjects(parsed, objects);
+    for (const object of objects) {
+      const normalized = _normaliseHandoff(object, expected);
+      if (normalized) handoffs.push(normalized);
     }
-    const norm = _normaliseHandoff(obj);
-    if (norm) return norm;
   }
-  return null;
+  if (!handoffs.length) return null;
+  if (!expected) return handoffs.at(-1);
+
+  const expectedRole = canonicalToken(expected.role);
+  const expectedMode = expected.mode == null ? null : canonicalToken(expected.mode);
+  let best = null;
+  for (let index = 0; index < handoffs.length; index++) {
+    const handoff = handoffs[index];
+    let score = 0;
+    if (String(handoff.run_id || '').toLowerCase() === String(expected.runId || '').toLowerCase()) score += 8;
+    if (canonicalToken(handoff.role) === expectedRole) score += 8;
+    if ((handoff.mode == null ? null : canonicalToken(handoff.mode)) === expectedMode) score += 4;
+    if (HANDOFF_STATUSES.has(handoff.stage_status)) score += 2;
+    if (!best || score > best.score || (score === best.score && index > best.index)) best = { handoff, score, index };
+  }
+  return best?.handoff || null;
 }
 
 // Union of explicitly requested reruns and reruns derived from open-issue domains.
@@ -444,11 +786,15 @@ export class WorkflowOrchestrator {
     let result = await this._send(controller, message, sendOpts);
     let text = String(result?.text || '');
     transcript.push({ role: step.role, mode: step.mode, text });
-    let handoff = parseHandoff(text);
+    const expected = { runId: ctx.runId, role: step.role, mode: step.mode ?? null, kind: step.kind };
+    let handoff = parseHandoff(text, expected);
     let validationError = handoff ? handoffValidationError(handoff, step, ctx.runId) : 'handoff JSON not found';
     if (validationError) handoff = null;
     if (!handoff && this.config.reAskOnBadHandoff) {
-      this.log(`  · ${step.role}${step.mode ? '/' + step.mode : ''}: invalid handoff (${validationError}) — re-asking once`);
+      this.log(
+        `  · ${step.role}${step.mode ? '/' + step.mode : ''}: invalid handoff ` +
+          `(${validationError}; replyChars=${text.length}) — re-asking once`
+      );
       const reask = await controller.followUp({
         text: 'Your previous reply did not end with a valid shared-handoff JSON block. ' +
           `Reply again with ONLY the required fenced \`\`\`json handoff object. Required identity: ` +
@@ -458,7 +804,7 @@ export class WorkflowOrchestrator {
       });
       text = String(reask?.text || '');
       transcript.push({ role: step.role, mode: step.mode, text, reask: true });
-      handoff = parseHandoff(text);
+      handoff = parseHandoff(text, expected);
       validationError = handoff ? handoffValidationError(handoff, step, ctx.runId) : 'handoff JSON not found';
       if (validationError) handoff = null;
     }

@@ -114,6 +114,128 @@ test('parseHandoff: skips an unrelated decoy JSON blob (e.g. a pasted report.jso
   assert.equal(h.role, 'contract_auditor');
 });
 
+test('parseHandoff: normalizes a decorative gate mode on a mode-less role', () => {
+  const h = parseHandoff(JSON.stringify({
+    run_id: 'run-0001', role: 'Repair Engineer', mode: 'preflight', stage_status: 'READY FOR REVIEW',
+    artifacts: [{ path: '/mnt/data/plan.json', sha256: 'a'.repeat(64) }]
+  }), { runId: 'RUN-0001', role: 'repair_engineer', mode: null, kind: 'audit' });
+  assert.equal(h.run_id, 'RUN-0001');
+  assert.equal(h.role, 'repair_engineer');
+  assert.equal(h.mode, null);
+  assert.equal(h.stage_status, 'ready_for_review');
+});
+
+test('parseHandoff: maps writer fixed_issues to the fixed-transition field only for writers', () => {
+  const raw = JSON.stringify({
+    run_id: 'RUN-0001', role: 'generator_engineer', mode: 'repair', stage_status: 'complete',
+    artifacts: [{ path: '/mnt/data/generator.py', sha256: 'b'.repeat(64) }],
+    fixed_issues: ['ISSUE-1']
+  });
+  const writer = parseHandoff(raw, { runId: 'RUN-0001', role: 'generator_engineer', mode: 'repair', kind: 'write' });
+  const auditor = parseHandoff(raw, { runId: 'RUN-0001', role: 'generator_engineer', mode: 'repair', kind: 'audit' });
+  assert.deepEqual(writer.verified_issues, ['ISSUE-1']);
+  assert.deepEqual(auditor.verified_issues, []);
+  assert.equal(writer.stage_status, 'passed');
+});
+
+test('parseHandoff: accepts JSON5/Python-like syntax without evaluating code', () => {
+  const text = `\`\`\`json
+  {
+    run_id: 'RUN-0001', // emitted by GPT
+    role: 'qa-auditor',
+    mode: 'baseline',
+    stage_status: 'success',
+    recommended_status_code: None,
+    artifacts: [{path: '/mnt/data/report.json', sha_256: '${'c'.repeat(64)}',}],
+    new_issues: [],
+  }
+  \`\`\``;
+  const h = parseHandoff(text, { runId: 'RUN-0001', role: 'qa_auditor', mode: 'baseline', kind: 'audit' });
+  assert.ok(h);
+  assert.equal(h.stage_status, 'passed');
+  assert.equal(h.recommended_status_code, null);
+  assert.equal(h.artifacts[0].sha256, 'c'.repeat(64));
+});
+
+test('parseHandoff: unwraps handoff objects and arrays', () => {
+  const handoff = {
+    runId: 'RUN-0001', agentRole: 'contract auditor', stageMode: 'release', stageStatus: 'completed',
+    artifactEvidence: { filePath: '/mnt/data/report.json', digest: 'd'.repeat(64) },
+    requiredReruns: 'regression'
+  };
+  const wrapped = parseHandoff(JSON.stringify({ output: { sharedHandoff: handoff } }), {
+    runId: 'RUN-0001', role: 'contract_auditor', mode: 'release', kind: 'audit'
+  });
+  const arrayWrapped = parseHandoff(JSON.stringify([{ note: 'ignore' }, handoff]), {
+    runId: 'RUN-0001', role: 'contract_auditor', mode: 'release', kind: 'audit'
+  });
+  for (const h of [wrapped, arrayWrapped]) {
+    assert.ok(h);
+    assert.equal(h.role, 'contract_auditor');
+    assert.deepEqual(h.required_reruns, ['regression']);
+    assert.equal(h.artifacts[0].path, '/mnt/data/report.json');
+  }
+});
+
+test('parseHandoff: repairs escaped JSON and an incomplete final fence/container', () => {
+  const escaped = String.raw`{\"run_id\":\"RUN-0001\",\"role\":\"controller\",\"mode\":\"start\",\"stage_status\":\"passed\",\"artifacts\":[]}`;
+  assert.equal(parseHandoff(escaped)?.role, 'controller');
+
+  const incomplete = [
+    '```json',
+    '{"run_id":"RUN-0001","role":"controller","mode":"start","stage_status":"passed","artifacts":[]'
+  ].join('\n');
+  const repaired = parseHandoff(incomplete, { runId: 'RUN-0001', role: 'controller', mode: 'start', kind: 'control' });
+  assert.ok(repaired);
+  assert.equal(repaired.stage_status, 'passed');
+});
+
+test('parseHandoff: chooses the expected identity when a later JSON object is a decoy', () => {
+  const correct = {
+    run_id: 'RUN-0001', role: 'qa_auditor', mode: 'edge', stage_status: 'passed', artifacts: []
+  };
+  const decoy = {
+    run_id: 'RUN-OTHER', role: 'generator_engineer', mode: 'repair', stage_status: 'failed', artifacts: []
+  };
+  const h = parseHandoff(`${JSON.stringify(correct)}\n${JSON.stringify(decoy)}`, {
+    runId: 'RUN-0001', role: 'qa_auditor', mode: 'edge', kind: 'audit'
+  });
+  assert.equal(h.run_id, 'RUN-0001');
+  assert.equal(h.role, 'qa_auditor');
+});
+
+test('parseHandoff: does not rewrite a genuinely wrong run or role', () => {
+  const h = parseHandoff(JSON.stringify({
+    run_id: 'RUN-WRONG', role: 'generator_engineer', mode: 'baseline', stage_status: 'passed', artifacts: []
+  }), { runId: 'RUN-0001', role: 'qa_auditor', mode: 'baseline', kind: 'audit' });
+  assert.equal(h.run_id, 'RUN-WRONG');
+  assert.equal(h.role, 'generator_engineer');
+});
+
+test('parseHandoff: accepts a constrained YAML-style handoff', () => {
+  const text = [
+    '```yaml',
+    'run_id: RUN-0001',
+    'role: qa auditor',
+    'mode: regression',
+    'stage_status: passed',
+    'recommended_status_code: null',
+    'artifacts:',
+    '  - path: /mnt/data/regression.json',
+    `    sha256: ${'e'.repeat(64)}`,
+    'new_issues: []',
+    'verified_issues:',
+    '  - ISSUE-1',
+    'required_reruns: []',
+    '```'
+  ].join('\n');
+  const h = parseHandoff(text, { runId: 'RUN-0001', role: 'qa_auditor', mode: 'regression', kind: 'audit' });
+  assert.ok(h);
+  assert.equal(h.role, 'qa_auditor');
+  assert.equal(h.artifacts[0].sha256, 'e'.repeat(64));
+  assert.deepEqual(h.verified_issues, ['ISSUE-1']);
+});
+
 test('mergeReruns unions explicit reruns with issue-domain derived reruns, in QA order', () => {
   const modes = mergeReruns(['edge'], [{ domain: 'reconstruction', status: 'open' }]);
   // reconstruction -> background, baseline, fidelity, edge ; plus explicit edge

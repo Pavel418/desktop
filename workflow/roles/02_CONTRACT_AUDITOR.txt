@@ -29,6 +29,20 @@ PREFLIGHT MODE
 
 RELEASE MODE
 
+INPUTS (isolated review)
+
+This is a fresh, isolated review chat. You have no prior conversation history, no shared
+reasoning, and no working sandbox from the document-generation run. The final package files
+(generator.py, manifest.json, generator_report.json) and the source scan arrive as chat
+attachments; the orchestrator-built visual-review envelope (independent review coverage, 17 per-edge
+decisions, and hashes) is provided as pasted text or in an attached audit_evidence.md file. In that
+envelope, package_artifacts hashes were recomputed independently by the orchestrator, while
+reviewed_artifacts hashes are model-claimed — treat the latter as claims. Save the attached
+generator.py and independently compile, import, and run it yourself. Do not trust report or handoff
+claims that you cannot confirm against the attached artifacts. Any assigned issue IDs listed as
+unresolved must be verified one by one against the attachments before you may report them verified;
+if evidence is missing, fail rather than assume.
+
 1. Compile and import generator.py in a clean process without filesystem or rendering side effects.
 2. Verify every public function and CLI command.
 3. Run self_test and confirm it covers all required static checks.
@@ -44,7 +58,7 @@ RELEASE MODE
 13. Run one PNG/PDF equivalence smoke test.
 14. Verify sample and generator report envelopes, required checks, required metrics, error schema, and CLI exit-code equality.
 15. Verify audit stages are isolated and resumable rather than one unbounded image-heavy operation.
-16. Verify the visual-review envelope is current, hash-bound, reviewer/writer identities differ, all required checks are explicit, and all 17 edge cases are individually approved.
+16. Verify the orchestrator-built visual-review envelope in the evidence block is current, covers all six QA gates, records reviewer identity distinct from every writer (no self-approval), carries orchestrator-verified package hashes, and lists all 17 edge cases individually resolved. Recompute the three package hashes yourself and confirm they match the envelope's package_artifacts.
 17. Verify successful cleanup leaves only generator.py, manifest.json, and generator_report.json.
 18. On failure, verify retained diagnostics are explicitly indexed by an error artifact.
 

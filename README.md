@@ -33,18 +33,22 @@ own target PDFs, one base generator (`baseGenerator`), and the agentic workflow 
   QA Auditor (template) → Generator Engineer (background) →
   QA Auditor (background) → Generator Engineer (implementation) →
   QA Auditor (baseline → fidelity → edge → regression) →
-  Repair loop (targeted reruns) → build visual-review envelope →
-  Generator Engineer (package: audit phase 2 with the envelope → status 0) →
+  Repair loop (targeted reruns) → Generator Engineer (package → status 0) →
+  Orchestrator builds + validates the visual-review envelope →
   Contract Auditor (release) → Final Auditor → Controller (finalize)
   ```
 
   Creation and approval are separated (a role that writes an artifact never approves it),
   and each role ends its turn with a hash-bound structured JSON handoff the orchestrator routes on.
 - Memory-heavy generator checks run as **isolated machine stages** with stage reports and
-  checkpoints. QA/Final roles review the resulting artifacts at full resolution and emit
-  a **visual-review envelope**; packaging consumes that envelope and returns 0 only if
-  the complete machine run and independent review are current and passing. Status 0 is
-  therefore impossible without a genuine external visual review. See
+  checkpoints. There are two visual-review envelopes. The **model's in-sandbox envelope** is what
+  `generator.py`'s `audit_generator` validates (11 checks + 17 edge cases + writer≠reviewer) to
+  return machine status 0. Separately, the **orchestrator builds its own envelope** from the
+  independent QA reviews — six gates, the 17 individual edge decisions, reviewer identity distinct
+  from every writer — computes real SHA-256 of the three persistent files, and cross-checks the
+  downloaded `generator_report.json`. That orchestrator envelope is fed to the release and final
+  auditors, so the release decision can never rest on the writer's own say-so. Status 0 is therefore
+  impossible without a genuine, independent, hash-bound review. See
   [workflow/WORKFLOW.md](workflow/WORKFLOW.md).
 - On success only **`generator.py`**, **`manifest.json`**, and **`generator_report.json`**
   are downloaded (captured via file buttons / links over CDP). The full multi-turn
@@ -107,9 +111,10 @@ Each role turn ends with a structured handoff (`stage_status` +
   visual quality, `70` persistent output, `80` partial, `99` internal).
 - The whole workflow is retried in a **fresh chat** up to `maxRetry` times on failure.
 
-Status **0** requires the Final Auditor to pass, the Controller to finalize, and packaging
-with the visual-review envelope to have returned 0. Exhausted attempts are logged as failures; the
-batch continues to the next PDF.
+Status **0** requires the full set in the shared contract's authoritative "STATUS 0 DEFINITION": the
+six QA gates passed, all 17 edge decisions resolved, reviewer≠writer, current orchestrator-verified
+package hashes, the orchestrator's envelope built, and independent release + final approval, with the
+Controller finalizing. Exhausted attempts are logged as failures; the batch continues to the next PDF.
 
 ## Run
 

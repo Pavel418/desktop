@@ -38,9 +38,10 @@ The workflow never uses OCR or PDF text extraction and never adds artificial sca
 14. **Repair loop** repeats only affected tests, followed by the complete edge suite.
 15. **QA Auditor, regression** runs all clean machine stages from isolated directories.
 16. **Generator Engineer, package** writes manifest.json and generator_report.json and cleans temporary outputs.
-17. **Contract Auditor, release** checks runtime and package correctness.
-18. **Final Auditor** independently approves or rejects release.
-19. **Controller** emits the final result.
+17. **Controller** assembles and validates the visual-review envelope from the retained QA reviews (six gates, 17 individual edge decisions, reviewer identity distinct from every writer, model-claimed artifact hashes), computes real SHA-256 of the three persistent files, and cross-checks generator_report.json (`checks.visual_quality`) — failing closed if incomplete. This envelope is what the release and final auditors receive.
+18. **Contract Auditor, release** checks runtime and package correctness against that envelope.
+19. **Final Auditor** independently approves or rejects release.
+20. **Controller** emits the final result.
 
 ## Why stages are isolated
 
@@ -163,7 +164,7 @@ Agents exchange structured handoffs and append-only issue records. Passing stage
 
 ## Status policy
 
-Only the Controller and Final Auditor assign the global status. The first causal failure determines the code; all secondary errors remain in the report. Status 0 requires every mandatory machine gate, all 17 individual edge decisions, current artifact hashes, independent visual approval, and exact final cleanup.
+Only the Controller and Final Auditor assign the global status. The first causal failure determines the code; all secondary errors remain in the report. Status 0 requires the authoritative set defined under "STATUS 0 DEFINITION" in the shared contract: the six QA gates passed, all 17 individual edge decisions resolved, reviewer identity distinct from every writer, current orchestrator-verified package hashes, independent release and final approval, and exact final cleanup.
 
 ## Final persistent outputs
 

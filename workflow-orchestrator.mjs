@@ -18,6 +18,7 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 // ---------------------------------------------------------------------------
 // Static workflow definition
@@ -93,6 +94,47 @@ const STAGE_CODE = {
 const SEVERITY_RANK = { critical: 3, major: 2, minor: 1, info: 0 };
 
 export const PERSISTENT_FILES = ['generator.py', 'manifest.json', 'generator_report.json'];
+
+// The six QA gates the visual-review envelope must cover (preflight/release/final excluded).
+const ENVELOPE_QA_GATES = ['template', 'background', 'baseline', 'fidelity', 'edge', 'regression'];
+
+// Roles that create artifacts. A visual review authored by any of these is a self-approval and is
+// rejected by the envelope builder (mirrors generator.py's VISUAL_REVIEW_SELF_APPROVAL check).
+export const WRITER_ROLES = new Set(['generator_engineer', 'template_architect']);
+
+// Envelope vocabulary mirrored from generator.py so the orchestrator, the model's in-sandbox
+// audit_generator envelope, and the auditors all speak one language. Keep these EXACTLY in sync
+// with VISUAL_REVIEW_SCHEMA_VERSION and EDGE_CASE_NAMES in workflow/generator.py (a drift test
+// asserts the match).
+export const VISUAL_REVIEW_SCHEMA_VERSION = 'synthetic-document-visual-review/1.2';
+export const EDGE_CASES = [
+  'normal_random_placement',
+  'top_left_placement',
+  'bottom_right_placement',
+  'wide_glyph_pressure',
+  'narrow_glyph_pressure',
+  'long_unbroken_strings',
+  'punctuation',
+  'multilingual_text',
+  'dense_multiline_text',
+  'minimum_font_size',
+  'maximum_permitted_character_length',
+  'low_dpi',
+  'high_dpi',
+  'text_near_field_edges',
+  'shared_collision_groups',
+  'expected_max_chars_failure',
+  'expected_impossible_fit_failure'
+];
+// 1-indexed name lookup used to backfill a decision's case number from its canonical name.
+const EDGE_CASE_INDEX = new Map(EDGE_CASES.map((name, i) => [name, i + 1]));
+
+// SHA-256 of a file's bytes — the orchestrator's own, independently computed hash (as opposed to
+// the model-claimed hashes carried in handoffs).
+export async function sha256File(filePath) {
+  const bytes = await fs.readFile(filePath);
+  return createHash('sha256').update(bytes).digest('hex');
+}
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -408,6 +450,37 @@ function objectField(obj, ...names) {
   return undefined;
 }
 
+// Per-edge-case decision statuses. `passed` and `expected_failure` are both "resolved"; cases 16 and
+// 17 are the two expected failures (MAX_CHARS_EXCEEDED / TEXT_CANNOT_FIT).
+const EDGE_STATUS_ALIASES = new Map([
+  ['pass', 'passed'], ['passed', 'passed'], ['ok', 'passed'], ['success', 'passed'], ['approved', 'passed'],
+  ['expected_failure', 'expected_failure'], ['expected_fail', 'expected_failure'], ['xfail', 'expected_failure'],
+  ['known_failure', 'expected_failure'], ['expected', 'expected_failure'],
+  ['fail', 'failed'], ['failed', 'failed'], ['error', 'failed']
+]);
+
+// Normalize a qa_auditor/edge handoff's per-case decisions: canonicalize aliases and backfill a
+// missing case number from the canonical name (resolution, not invention — like the mode backfill).
+function normaliseEdgeDecisions(value) {
+  const list = asList(value);
+  if (!list.length) return [];
+  return list.map((entry) => {
+    if (!entry || typeof entry !== 'object') return entry;
+    const name = canonicalToken(objectField(entry, 'name', 'edge_case', 'edgeCase', 'case_name', 'caseName')) || null;
+    let caseNum = Number(objectField(entry, 'case', 'case_number', 'caseNumber', 'index', 'id', 'number'));
+    if (!Number.isInteger(caseNum) && name && EDGE_CASE_INDEX.has(name)) caseNum = EDGE_CASE_INDEX.get(name);
+    const rawStatus = objectField(entry, 'status', 'decision', 'result', 'outcome');
+    return {
+      ...entry,
+      case: Number.isInteger(caseNum) ? caseNum : null,
+      name,
+      status: EDGE_STATUS_ALIASES.get(canonicalToken(rawStatus)) || canonicalToken(rawStatus),
+      code: objectField(entry, 'code', 'status_code', 'statusCode') ?? null,
+      artifact: objectField(entry, 'artifact', 'path', 'file') ?? null
+    };
+  });
+}
+
 // Normalize syntax and harmless naming variations, but never invent run IDs, roles,
 // artifact paths, or hashes. Expected identity only resolves casing/separators and
 // mode omissions after the supplied run and role already match.
@@ -428,6 +501,9 @@ function _normaliseHandoff(input, expected = null) {
   obj.fixed_issues = objectField(obj, 'fixed_issues', 'fixedIssues');
   obj.required_reruns = objectField(obj, 'required_reruns', 'requiredReruns', 'reruns');
   obj.next_role = objectField(obj, 'next_role', 'nextRole');
+  obj.edge_decisions = objectField(
+    obj, 'edge_decisions', 'edgeDecisions', 'edge_cases', 'edgeCases', 'per_edge_decisions', 'perEdgeDecisions'
+  );
 
   if (typeof obj.stage_status !== 'string') return null;
   obj.stage_status = STATUS_ALIASES.get(canonicalToken(obj.stage_status)) || canonicalToken(obj.stage_status);
@@ -465,6 +541,7 @@ function _normaliseHandoff(input, expected = null) {
   if (typeof obj.recommended_status_code === 'string' && canonicalToken(obj.recommended_status_code) === 'null') {
     obj.recommended_status_code = null;
   }
+  obj.edge_decisions = normaliseEdgeDecisions(obj.edge_decisions);
   return obj;
 }
 
@@ -583,6 +660,17 @@ export function mergeReruns(requiredReruns = [], issues = []) {
   return QA_MODES.filter((m) => out.has(m));
 }
 
+// Restrict a rerun list to QA stages at or before `gate` in pipeline order. Downstream stages have
+// not produced artifacts yet during an early gate's repair, so auditing them there is spurious.
+// A no-op for late gates (regression sees everything). Preserves QA_MODES order.
+export function clampRerunsToGate(rerunModes = [], gate = null) {
+  const gateIdx = QA_MODES.indexOf(gate);
+  return rerunModes.filter((m) => {
+    const i = QA_MODES.indexOf(m);
+    return i >= 0 && (gateIdx < 0 || i <= gateIdx);
+  });
+}
+
 // Pick the causal failure code: most-severe open/blocked issue's domain code, else the
 // failing stage's default, else 99.
 export function selectFailureCode(issues = [], failedStage = null, fallback = 99) {
@@ -696,7 +784,15 @@ const DEFAULT_CONFIG = {
   maxRepairRounds: 4,
   perTurnTimeoutMs: 7_200_000,
   successCode: 0,
-  reAskOnBadHandoff: true
+  reAskOnBadHandoff: true,
+  // Release/final evidence (visual-review envelope + per-edge decisions) is pasted inline
+  // when it fits this many characters; otherwise it is written to a single file and
+  // attached, keeping the isolated auditor's prompt short so its attention stays sharp.
+  auditEvidenceInlineMax: 12_000,
+  // Require the qa_auditor/edge review to resolve all 17 individual edge cases before the
+  // visual-review envelope can be built. Default false so bare-config unit tests stay green;
+  // run-batch enables it in production.
+  enforceEdgeDecisions: false
 };
 
 export class WorkflowOrchestrator {
@@ -709,15 +805,25 @@ export class WorkflowOrchestrator {
   }
 
   // Compose the message text for one role turn.
+  //
+  // The full shared contract is sent ONLY on the first turn of a chat (includeShared). ChatGPT
+  // retains it for the rest of that conversation, so later turns carry a one-line reminder instead
+  // of re-appending ~6 KB every turn. The isolated audit session is a separate chat, so its first
+  // turn (the release audit) also gets includeShared → the full contract there too.
   _composeMessage(step, ctx, { includeShared }) {
     const parts = [];
-    parts.push('===== SHARED ADAPTATION CONTRACT =====');
-    parts.push(this.roles.shared.trim());
     if (includeShared) {
+      parts.push('===== SHARED ADAPTATION CONTRACT =====');
+      parts.push(this.roles.shared.trim());
+      // A fresh isolated-audit turn overrides the default writer-oriented note, because it
+      // starts a brand-new chat with different attachments and no prior sandbox.
       parts.push(
-        `\nInputs attached to this chat: the target scanned PDF (${ctx.pdfName}) and the base generator.py. ` +
-        `Save the generator as generator.py in your working directory and drive it with its CLI.`
+        '\n' + (ctx.inputsNote ||
+          `Inputs attached to this chat: the target scanned PDF (${ctx.pdfName}) and the base generator.py. ` +
+          `Save the generator as generator.py in your working directory and drive it with its CLI.`)
       );
+    } else {
+      parts.push('(The shared adaptation contract provided at the start of this chat is still in force; keep following it.)');
     }
     parts.push(`\nActive run id: ${ctx.runId}. Use this exact value in the handoff.`);
     parts.push(`\n===== ROLE: ${step.role.toUpperCase()}${step.mode ? ` (mode: ${step.mode})` : ''} =====`);
@@ -739,6 +845,162 @@ export class WorkflowOrchestrator {
     );
     parts.push('\n' + notes.join('\n'));
     return parts.join('\n');
+  }
+
+  // Record one passing QA review into state.reviews (latest per gate wins), so the envelope
+  // builder can assemble a reviewer-sourced certification. Pure data, no reasoning text.
+  _recordReview(state, step, handoff, round = 0) {
+    const record = {
+      gate: step.gate ?? step.mode ?? null,
+      role: handoff.role || step.role,
+      mode: step.mode ?? null,
+      status: handoff.stage_status,
+      round,
+      artifacts: (handoff.artifacts || []).map((a) => ({ path: a.path, sha256: a.sha256, source: 'model_claimed' })),
+      verified_issues: handoff.verified_issues || [],
+      edge_decisions: handoff.edge_decisions || []
+    };
+    const gate = record.gate;
+    const existing = state.reviews.findIndex((r) => r.gate === gate);
+    if (existing >= 0) state.reviews[existing] = record;
+    else state.reviews.push(record);
+  }
+
+  // Assemble and validate the orchestrator's visual-review envelope (Envelope-O) from the retained
+  // QA reviews plus the downloaded package files. This is the mechanical home the docs promise: it
+  // certifies an independent, hash-bound review before the release decision. Returns
+  // { envelope } on success or { error: { message, code } } on a fail-closed condition.
+  //
+  // Honest scope: the three persistent files are hashed here by the orchestrator itself
+  // (source: 'orchestrator_verified'); sandbox artifacts (overlays, edge documents) never left the
+  // model, so their hashes stay 'model_claimed' and are labeled as such.
+  async _buildAndValidateEnvelope(state, packagedFiles, outDir) {
+    const fail = (code, message) => ({ error: { code, message } });
+
+    // 1) All six QA gates reviewed and passed.
+    const byGate = new Map(state.reviews.map((r) => [r.gate, r]));
+    for (const gate of ENVELOPE_QA_GATES) {
+      const review = byGate.get(gate);
+      if (!review || review.status !== 'passed') {
+        return fail(60, `visual-review envelope: QA gate "${gate}" has no passing review`);
+      }
+    }
+
+    // 2) Reviewer ≠ writer. The orchestrator assigned every role, so this is authoritative.
+    for (const gate of ENVELOPE_QA_GATES) {
+      const review = byGate.get(gate);
+      if (review.role !== 'qa_auditor' || WRITER_ROLES.has(review.role)) {
+        return fail(30, `visual-review envelope: gate "${gate}" was reviewed by a non-independent role "${review.role}"`);
+      }
+    }
+
+    // 3) Exactly 17 resolved per-edge decisions from the edge review.
+    if (this.config.enforceEdgeDecisions !== false) {
+      const edge = byGate.get('edge');
+      const resolved = new Set(
+        (edge.edge_decisions || [])
+          .filter((d) => ['passed', 'expected_failure'].includes(d.status) && Number.isInteger(d.case) && d.case >= 1 && d.case <= 17)
+          .map((d) => d.case)
+      );
+      if (resolved.size !== EDGE_CASES.length) {
+        return fail(60, `visual-review envelope: edge review resolved ${resolved.size}/${EDGE_CASES.length} individual cases`);
+      }
+    }
+
+    // 4) Every referenced artifact carries a valid model-claimed hash.
+    for (const review of state.reviews) {
+      for (const a of review.artifacts) {
+        if (!a.path || typeof a.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(a.sha256)) {
+          return fail(30, `visual-review envelope: gate "${review.gate}" has an artifact without a valid hash`);
+        }
+      }
+    }
+
+    // 5) No unresolved blocking issue.
+    if (state.issues.blockingForRelease().length !== 0) {
+      return fail(60, 'visual-review envelope: unresolved critical/major issues remain');
+    }
+
+    // 6) Orchestrator-verified hashes of the three persistent files.
+    const packageArtifacts = [];
+    for (const name of PERSISTENT_FILES) {
+      const file = packagedFiles.find((f) => f.name === name);
+      if (!file) return fail(70, `visual-review envelope: persistent file ${name} is missing`);
+      packageArtifacts.push({ path: name, sha256: await sha256File(file.path), source: 'orchestrator_verified' });
+    }
+
+    // 7) Cross-check the downloaded generator_report.json (and manifest) against Envelope-P.
+    const reportFile = packagedFiles.find((f) => f.name === 'generator_report.json');
+    let reportStatus = null;
+    let visualQuality = null;
+    try {
+      const report = JSON.parse(await fs.readFile(reportFile.path, 'utf8'));
+      reportStatus = report.status_code ?? report.status ?? null;
+      visualQuality = report?.checks?.visual_quality ?? null;
+    } catch (err) {
+      return fail(70, `visual-review envelope: generator_report.json is unreadable (${err.message})`);
+    }
+    if (visualQuality !== true) {
+      return fail(70, `visual-review envelope: generator_report.json does not record checks.visual_quality === true (got ${JSON.stringify(visualQuality)})`);
+    }
+    if (reportStatus != null && Number(reportStatus) !== this.config.successCode) {
+      return fail(70, `visual-review envelope: generator_report.json status ${reportStatus} is not the success code`);
+    }
+    const manifestFile = packagedFiles.find((f) => f.name === 'manifest.json');
+    let schemaOk = true;
+    try {
+      const manifest = JSON.parse(await fs.readFile(manifestFile.path, 'utf8'));
+      const version = manifest.visual_review_schema_version;
+      if (version != null && version !== VISUAL_REVIEW_SCHEMA_VERSION) schemaOk = false;
+    } catch {
+      // A manifest we cannot parse is a packaging defect.
+      return fail(70, 'visual-review envelope: manifest.json is unreadable');
+    }
+    if (!schemaOk) {
+      return fail(70, `visual-review envelope: manifest visual_review_schema_version != ${VISUAL_REVIEW_SCHEMA_VERSION}`);
+    }
+
+    const envelope = {
+      schema_version: VISUAL_REVIEW_SCHEMA_VERSION,
+      builder: 'workflow-orchestrator',
+      run_id: state.ctx.runId,
+      reviewer_roles: ['qa_auditor'],
+      writer_roles: [...WRITER_ROLES],
+      status: 'passed',
+      gates: Object.fromEntries(ENVELOPE_QA_GATES.map((g) => [g, byGate.get(g).status])),
+      edge_decisions: (byGate.get('edge').edge_decisions || []).slice(),
+      reviewed_artifacts: state.reviews.flatMap((r) => r.artifacts),
+      package_artifacts: packageArtifacts,
+      report_status: reportStatus,
+      issues: []
+    };
+    return { envelope };
+  }
+
+  // Serialize the validated envelope into the human-readable evidence block the isolated
+  // release/final auditors read. Reviewer-sourced (fixes the earlier writer-scrape). Missing
+  // envelope yields an explicit failure note so the auditor rejects rather than assumes.
+  _serializeEnvelope(envelope) {
+    if (!envelope) {
+      return '(NO VALIDATED VISUAL-REVIEW ENVELOPE — the orchestrator did not certify an independent ' +
+        'review. Reject release: do not approve without a current, hash-bound, independent review.)';
+    }
+    const lines = [];
+    lines.push('===== ORCHESTRATOR-VERIFIED PACKAGE HASHES (independently computed) =====');
+    for (const a of envelope.package_artifacts) lines.push(`${a.path}  sha256=${a.sha256}`);
+    lines.push(`generator_report.json status: ${envelope.report_status}`);
+    lines.push('');
+    lines.push('===== INDEPENDENT REVIEW COVERAGE (reviewer: ' + envelope.reviewer_roles.join(', ') + ') =====');
+    for (const [gate, status] of Object.entries(envelope.gates)) lines.push(`${gate}: ${status}`);
+    lines.push('');
+    lines.push(`===== 17 PER-EDGE DECISIONS (from the independent QA edge review) =====`);
+    for (const d of envelope.edge_decisions) {
+      lines.push(`case ${d.case} ${d.name || ''}: ${d.status}${d.code != null ? ` (code ${d.code})` : ''}`);
+    }
+    lines.push('');
+    lines.push('===== MODEL-CLAIMED REVIEWED ARTIFACTS (hashes claimed by the model, not independently verified) =====');
+    for (const a of envelope.reviewed_artifacts) lines.push(`${a.path}  sha256=${a.sha256} [${a.source}]`);
+    return lines.join('\n');
   }
 
   // Best-effort capture of the three persistent files from the current last assistant
@@ -818,11 +1080,15 @@ export class WorkflowOrchestrator {
         `  · ${step.role}${step.mode ? '/' + step.mode : ''}: invalid handoff ` +
           `(${validationError}; replyChars=${text.length}) — re-asking once`
       );
+      const edgeNote = step.mode === 'edge'
+        ? ' Include an `edge_decisions` array with exactly 17 objects {case,name,status}, one per edge ' +
+          'case 1-17 (cases 16 and 17 are expected_failure).'
+        : '';
       const reask = await controller.followUp({
         text: 'Your previous reply did not end with a valid shared-handoff JSON block. ' +
           `Reply again with ONLY the required fenced \`\`\`json handoff object. Required identity: ` +
           `run_id=${ctx.runId}, role=${step.role}, mode=${step.mode ?? 'null'}. ` +
-          'Include an artifacts array and a valid SHA-256 for every listed artifact.',
+          'Include an artifacts array and a valid SHA-256 for every listed artifact.' + edgeNote,
         timeoutMs: sendOpts.timeoutMs,
         responseState
       });
@@ -889,9 +1155,17 @@ export class WorkflowOrchestrator {
         [...repairTurn.handoff.required_reruns, ...writerReruns],
         state.issues.open()
       );
+      // Clamp reruns to QA stages at or before the current gate in pipeline order. Earlier gates
+      // have no downstream artifacts yet (implementation, edge, and regression run only after the
+      // background gate), so re-auditing a later stage during an early gate's repair merely audits
+      // files that do not exist — fabricating fresh failures that prevent the gate from ever
+      // converging. RERUN_MAP's downstream entries are meant for late repairs, where those stages
+      // already exist and this clamp is a no-op.
+      const inScope = clampRerunsToGate(rerunModes, gate);
+      const dropped = rerunModes.filter((m) => !inScope.includes(m));
       // Always re-run at least the failing gate's own mode if it is a QA mode.
-      const modes = rerunModes.length ? rerunModes : (QA_MODES.includes(gate) ? [gate] : []);
-      this.log(`    reruns: ${modes.join(', ') || '(none)'}`);
+      const modes = inScope.length ? inScope : (QA_MODES.includes(gate) ? [gate] : []);
+      this.log(`    reruns: ${modes.join(', ') || '(none)'}${dropped.length ? ` (deferred downstream: ${dropped.join(', ')})` : ''}`);
 
       // 3) Re-run the affected QA modes (independent auditor).
       let gatePassed = false;
@@ -907,6 +1181,7 @@ export class WorkflowOrchestrator {
         if (!qaTurn.handoff) return { recovered: false, code: 99, stage: mode };
         state.issues.addNew(issueRecordsFromHandoff(qaTurn.handoff));
         state.issues.markVerified(qaTurn.handoff.verified_issues);
+        if (qaTurn.handoff.stage_status === 'passed') this._recordReview(state, qaStep, qaTurn.handoff, round);
         if (mode === gate) gatePassed = qaTurn.handoff.stage_status === 'passed';
       }
       // If the gate itself was not among reruns, re-check it explicitly.
@@ -921,6 +1196,9 @@ export class WorkflowOrchestrator {
         if (!qaTurn.handoff) return { recovered: false, code: 99, stage: gate };
         state.issues.addNew(issueRecordsFromHandoff(qaTurn.handoff));
         state.issues.markVerified(qaTurn.handoff.verified_issues);
+        if (qaTurn.handoff.stage_status === 'passed') {
+          this._recordReview(state, { role: 'qa_auditor', mode: gate, gate }, qaTurn.handoff, round);
+        }
         gatePassed = qaTurn.handoff.stage_status === 'passed';
       }
 
@@ -1002,11 +1280,20 @@ export class WorkflowOrchestrator {
   }
 
   // Drive the whole workflow for one PDF.
-  async run({ pdf, baseGenerator, outDir, controller, timeoutMs, newChat = true, runId = 'RUN-0001' }) {
+  //
+  // makeAuditController (optional): an async factory returning { controller, close }. When
+  // provided, the release + final audits run in that FRESH, isolated session — a chat that
+  // never saw the writer's reasoning or sandbox — so the status-0 decision is genuinely
+  // independent. When omitted, every step runs on the single `controller` (legacy behavior).
+  async run({ pdf, baseGenerator, outDir, controller, timeoutMs, newChat = true, runId = 'RUN-0001', makeAuditController = null }) {
     const perTurnTimeoutMs = timeoutMs || this.config.perTurnTimeoutMs;
     const transcript = [];
     const state = {
       issues: new IssueLog(),
+      // Structured record of each passing QA review (one per gate, latest wins), used to build the
+      // visual-review envelope. Populated by _recordReview at every passing audit site.
+      reviews: [],
+      envelope: null,
       ctx: { runId, pdfName: path.basename(pdf) }
     };
     const attachments = [pdf, baseGenerator];
@@ -1015,18 +1302,74 @@ export class WorkflowOrchestrator {
     let failedStage = null;
     let packagedFiles = [];
     let packageProduced = false;
+    // The isolated audit session is opened lazily at the release step and closed in the
+    // finally below, so no extra tab opens for runs that fail before release.
+    let auditSession = null;
+    let auditController = null;
 
+    try {
     for (let i = 0; i < PLAN.length; i++) {
       const step = PLAN[i];
-      const first = i === 0;
-      this.log(`▶ ${step.role}${step.mode ? '/' + step.mode : ''}${step.gate ? ` [gate: ${step.gate}]` : ''}`);
-      const turn = await this._turn(
-        controller,
-        step,
-        { ...state.ctx, gate: step.gate },
-        { first, attachments, timeoutMs: perTurnTimeoutMs, newChat },
-        transcript
-      );
+      const isFreshAudit = !!makeAuditController &&
+        ((step.role === 'contract_auditor' && step.mode === 'release') || step.role === 'final_auditor');
+
+      let turnController = controller;
+      let ctx = { ...state.ctx, gate: step.gate };
+      let sendOpts = { first: i === 0, attachments, timeoutMs: perTurnTimeoutMs, newChat };
+
+      if (isFreshAudit) {
+        if (!auditController) {
+          auditSession = await makeAuditController();
+          auditController = auditSession.controller;
+        }
+        turnController = auditController;
+        const releaseStep = step.role === 'contract_auditor';
+
+        // Deliver the release evidence: paste inline when short (sharper attention), else
+        // write one file and attach it so the prompt body stays small.
+        const auditAttachments = [pdf, ...packagedFiles.map((f) => f.path)];
+        const evidence = this._serializeEnvelope(state.envelope);
+        const budget = Number(this.config.auditEvidenceInlineMax) || 0;
+        let extra;
+        if (evidence.length <= budget) {
+          extra = 'Release-decision evidence (the maker chat is NOT visible to you):\n\n' + evidence;
+          this.log(`  · audit evidence pasted inline (${evidence.length} chars)`);
+        } else {
+          const evidencePath = path.join(outDir, `${runId}.audit_evidence.md`);
+          await fs.mkdir(outDir, { recursive: true }).catch(() => {});
+          await fs.writeFile(evidencePath, evidence);
+          if (releaseStep) auditAttachments.push(evidencePath);
+          extra =
+            'Release-decision evidence is in the attached file audit_evidence.md (the maker chat is ' +
+            'NOT visible to you). Read it in full before deciding.';
+          this.log(`  · audit evidence attached as file (${evidence.length} chars > inline budget ${budget})`);
+        }
+
+        ctx = {
+          ...state.ctx,
+          gate: step.gate,
+          // The isolated auditor never saw the fixed-but-unverified issue IDs in chat, and
+          // blockingForRelease() counts any critical/major issue that is not verified. Pass
+          // them so it can verify each against the attached artifacts.
+          assignedIssues: state.issues.snapshot().filter((issue) => issue.status !== 'verified'),
+          inputsNote:
+            'This is a FRESH, isolated review chat. You have NO prior context, conversation history, ' +
+            `or working sandbox from the document generation. Attached: the target scanned PDF ` +
+            `(${state.ctx.pdfName}) and the final package files generator.py, manifest.json, and ` +
+            'generator_report.json. Save generator.py and independently compile, import, and run it — ' +
+            'do not trust report claims. Release evidence follows below or in an attached file.',
+          extra
+        };
+        sendOpts = {
+          first: releaseStep, // release opens the fresh chat (query + attachments); final follows up
+          attachments: releaseStep ? auditAttachments : [],
+          timeoutMs: perTurnTimeoutMs,
+          newChat: false // the tab is already a fresh temporary chat; a "New chat" click would destroy it
+        };
+      }
+
+      this.log(`▶ ${step.role}${step.mode ? '/' + step.mode : ''}${step.gate ? ` [gate: ${step.gate}]` : ''}${isFreshAudit ? ' [isolated audit session]' : ''}`);
+      const turn = await this._turn(turnController, step, ctx, sendOpts, transcript);
 
       if (!turn.handoff) {
         failedStage = step.gate || step.mode || step.role;
@@ -1069,11 +1412,24 @@ export class WorkflowOrchestrator {
           this.log(`  ✗ package did not expose downloadable persistent files: ${missing.join(', ')} → status 70`);
           break;
         }
+
+        // Build and validate the visual-review envelope now that the QA reviews and the packaged
+        // files both exist, and before the release decision consumes it. Fail closed if incomplete.
+        const built = await this._buildAndValidateEnvelope(state, packagedFiles, outDir);
+        if (built.error) {
+          failedStage = 'release';
+          statusCode = built.error.code;
+          this.log(`  ✗ ${built.error.message} → status ${statusCode}`);
+          break;
+        }
+        state.envelope = built.envelope;
+        this.log(`  ✓ visual-review envelope built (6 gates, ${state.envelope.edge_decisions.length} edge decisions, ${state.envelope.package_artifacts.length} verified package hashes)`);
       }
 
       if (step.kind === 'audit' && step.gate) {
         if (turn.handoff.stage_status === 'passed' && state.issues.blockingForRelease().length === 0) {
           gatesPassed.push(step.gate);
+          if (QA_MODES.includes(step.gate)) this._recordReview(state, step, turn.handoff, 0);
           this.log(`  ✓ "${step.gate}" gate passed`);
           if (step.gate === 'final') {
             const rec = Number(turn.handoff.recommended_status_code);
@@ -1119,6 +1475,10 @@ export class WorkflowOrchestrator {
         break;
       }
     }
+    } finally {
+      // Always close the isolated audit tab, on pass, reject, or throw.
+      if (auditSession) await auditSession.close().catch(() => {});
+    }
 
     const workflowReachedSuccess = statusCode === this.config.successCode && gatesPassed.includes('final');
     if (!Number.isFinite(statusCode)) {
@@ -1144,6 +1504,8 @@ export class WorkflowOrchestrator {
       failedStage,
       gatesPassed,
       issues: state.issues.snapshot(),
+      reviews: state.reviews,
+      envelope: state.envelope,
       files,
       transcript
     };

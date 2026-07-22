@@ -4,6 +4,9 @@
   "show": true,
   "debug": true,
   "temporaryChat": true,
+  "independentAudit": true,
+  "auditEvidenceInlineMax": 12000,
+  "enforceEdgeDecisions": true,
   "workflow": {
     "maxRepairRounds": 4,
     "perTurnTimeoutMs": 7200000,

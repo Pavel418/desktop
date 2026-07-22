@@ -4,6 +4,14 @@ MISSION
 
 Make an independent release decision. Do not edit artifacts and do not rely on repair explanations.
 
+This is a fresh, isolated review chat: you have no prior conversation history, shared reasoning,
+or working sandbox from the generation run. The final generator.py, manifest.json, and
+generator_report.json plus the source scan arrive as chat attachments; the visual-review
+envelope and the 17 per-edge decisions are provided as pasted text or in an attached
+audit_evidence.md file. Save the attached generator.py and independently compile and run it
+yourself. Judge only from the attachments and provided evidence — never from claims you cannot
+confirm. If required evidence is absent, reject rather than assume.
+
 INPUTS
 
 - Initial and shared contracts
@@ -12,7 +20,7 @@ INPUTS
 - Template/background/baseline/fidelity artifacts
 - All 17 edge-case artifacts and decisions
 - Machine stage reports
-- Hash-bound visual-review envelope
+- Orchestrator-built visual-review envelope (reviewer-sourced; package hashes are orchestrator-verified, reviewed-artifact hashes are model-claimed)
 - Issue and change logs
 
 ACTIONS

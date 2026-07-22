@@ -214,7 +214,8 @@ const DEFAULT_WORKFLOW_CONFIG = {
 export async function processEntry({
   entry, backend, selectors, stateDir, show, timeoutMs, debug = false,
   chatUrl = 'https://chatgpt.com/', newChat = true,
-  workflowConfig = DEFAULT_WORKFLOW_CONFIG, makeController = defaultMakeController
+  workflowConfig = DEFAULT_WORKFLOW_CONFIG, makeController = defaultMakeController,
+  independentAudit = true
 }) {
   const summary = { name: entry.name, pdfs: [], aborted: false };
   const pdfs = await selectPdfs(entry);
@@ -244,6 +245,9 @@ export async function processEntry({
       record.attempts = attempt + 1;
       const label = `${labelBase}${attempt > 0 ? ` [retry ${attempt}/${maxRetry}]` : ''}`;
       let session = null;
+      // The isolated audit session (for the independent release/final decision) is opened
+      // lazily by the orchestrator via this factory, and closed in the finally below.
+      let auditSession = null;
       try {
         log(`[${label}] opening chat (attachments: ${[pdf, entry.baseGenerator].map((a) => path.basename(a)).join(', ')})`);
         session = await backend.createSession({ url: chatUrl, show });
@@ -256,6 +260,22 @@ export async function processEntry({
             log(`[${label}] ⚠ ChatGPT needs attention (${st?.kind || 'blocked'}) — complete it in the Chrome window; waiting…`),
           onUnblocked: () => log(`[${label}] resolved — continuing`)
         });
+
+        const makeAuditController = independentAudit ? async () => {
+          log(`[${label}] opening isolated audit chat for the independent release/final decision`);
+          const s = await backend.createSession({ url: chatUrl, show });
+          auditSession = s;
+          const c = makeController({
+            page: s.page,
+            selectors,
+            stateDir,
+            onDebug: debug ? (msg) => log(`[${label}] · (audit) ${msg}`) : null,
+            onBlocked: (st) =>
+              log(`[${label}] ⚠ (audit) ChatGPT needs attention (${st?.kind || 'blocked'}) — complete it in the Chrome window; waiting…`),
+            onUnblocked: () => log(`[${label}] (audit) resolved — continuing`)
+          });
+          return { controller: c, close: () => s.close().catch(() => {}) };
+        } : null;
 
         const orchestrator = new WorkflowOrchestrator({
           roles: entry.roles,
@@ -270,7 +290,8 @@ export async function processEntry({
           controller,
           timeoutMs,
           newChat,
-          runId: `RUN-${String(i + 1).padStart(4, '0')}`
+          runId: `RUN-${String(i + 1).padStart(4, '0')}`,
+          makeAuditController
         });
 
         record.status = res.statusCode;
@@ -301,6 +322,7 @@ export async function processEntry({
         if (attempt >= maxRetry) resolved = true;
         else log(`[${label}] → retrying in a fresh chat after error`);
       } finally {
+        if (auditSession) await auditSession.close().catch(() => {});
         if (session) await session.close().catch(() => {});
       }
     }
@@ -344,12 +366,20 @@ async function main() {
   const chatUrl = temporaryChat ? 'https://chatgpt.com/?temporary-chat=true' : 'https://chatgpt.com/';
   const newChat = !temporaryChat;
 
+  // Run the release + final audits in a fresh, isolated ChatGPT session (independent of the
+  // writer chat) by default. Disable with "independentAudit": false or --shared-audit.
+  const independentAudit = argFlag('--shared-audit') ? false : config.independentAudit !== false;
+
   const wf = config.workflow || {};
   const workflowConfig = {
     maxRepairRounds: Number.isFinite(wf.maxRepairRounds) ? wf.maxRepairRounds : DEFAULT_WORKFLOW_CONFIG.maxRepairRounds,
     perTurnTimeoutMs: Number.isFinite(wf.perTurnTimeoutMs) ? wf.perTurnTimeoutMs : timeoutMs,
     successCode: Number.isFinite(wf.successCode) ? wf.successCode : 0,
-    maxRetry: Number.isFinite(wf.maxRetry) ? wf.maxRetry : DEFAULT_WORKFLOW_CONFIG.maxRetry
+    maxRetry: Number.isFinite(wf.maxRetry) ? wf.maxRetry : DEFAULT_WORKFLOW_CONFIG.maxRetry,
+    auditEvidenceInlineMax: Number.isFinite(config.auditEvidenceInlineMax) ? config.auditEvidenceInlineMax : 12_000,
+    // Require all 17 individual edge decisions before the visual-review envelope can be built.
+    // Default on in production; disable with "enforceEdgeDecisions": false.
+    enforceEdgeDecisions: config.enforceEdgeDecisions !== false
   };
   const entryDefaults = {
     randomOne: argFlag('--random-one') ? true : config.randomOne === true,
@@ -378,14 +408,14 @@ async function main() {
   log(`Runtime source: ${fileURLToPath(import.meta.url)} | attachment=${ATTACHMENT_RUNTIME_REVISION}`);
   log(`Persistent log: ${activeRunLogPath}`);
   log(`Entries: ${entries.length} | parallel: ${concurrency} | timeout: ${timeoutMs}ms | window: ${show ? 'visible' : 'hidden'} | chat: ${temporaryChat ? 'temporary' : 'regular'}${debug ? ' | debug: ON' : ''}`);
-  log(`Workflow: maxRepairRounds=${workflowConfig.maxRepairRounds} | maxRetry=${workflowConfig.maxRetry} | successCode=${workflowConfig.successCode}`);
+  log(`Workflow: maxRepairRounds=${workflowConfig.maxRepairRounds} | maxRetry=${workflowConfig.maxRetry} | successCode=${workflowConfig.successCode} | release/final audit: ${independentAudit ? 'isolated session' : 'shared chat'}`);
   log('Starting Chrome…');
   await backend.start();
 
   let summaries;
   try {
     summaries = await runPool(entries, concurrency, (entry) =>
-      processEntry({ entry, backend, selectors, stateDir, show, timeoutMs, debug, chatUrl, newChat, workflowConfig }).catch((err) => ({
+      processEntry({ entry, backend, selectors, stateDir, show, timeoutMs, debug, chatUrl, newChat, workflowConfig, independentAudit }).catch((err) => ({
         name: entry.name,
         pdfs: [],
         aborted: true,

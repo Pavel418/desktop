@@ -131,4 +131,10 @@ Do not repair during regression. Return failures to the Controller.
 
 RETURN
 
-Return the shared handoff, issue records, reviewed artifact hashes, per-edge decisions, and explicit reruns.
+Return the shared handoff, issue records, reviewed artifact hashes, and explicit reruns.
+
+In edge mode the handoff MUST include an `edge_decisions` array of exactly 17 objects, one per case
+1-17, each {case, name, status, code?, artifact?}. `status` is `passed` or `expected_failure`; cases
+16 and 17 are `expected_failure` with codes 10 and 40. The orchestrator counts these to build the
+visual-review envelope, so all 17 must be present and resolved — do not batch, summarize, or omit any
+case.

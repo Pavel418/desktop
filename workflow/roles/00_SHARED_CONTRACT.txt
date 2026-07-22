@@ -59,6 +59,16 @@ APPROVAL SEPARATION
 - Only Controller and Final Auditor may assign the global result.
 - Status 0 is forbidden without current machine validation and an independent hash-bound visual review.
 
+STATUS 0 DEFINITION (authoritative)
+
+Status 0 requires ALL of:
+- the six QA gates (template, background, baseline, fidelity, edge, regression) passed;
+- all 17 individual edge-case decisions resolved (passed or the two expected failures);
+- the visual review's reviewer identity differs from every writer (no self-approval);
+- current, orchestrator-verified SHA-256 hashes of generator.py, manifest.json, and generator_report.json;
+- independent release (Contract Auditor) and final (Final Auditor) approval;
+- exact final cleanup leaving only the three persistent outputs.
+
 PERSISTENCE
 
 After success, persist only:
@@ -98,6 +108,38 @@ Return only evidence and decisions, not hidden reasoning:
   "required_reruns": [],
   "next_role": "controller"
 }
+
+For the qa_auditor edge mode ONLY, also include exactly 17 per-case decisions:
+
+  "edge_decisions": [
+    {"case": 1, "name": "normal_random_placement", "status": "passed", "code": null, "artifact": "..."},
+    ...
+    {"case": 16, "name": "expected_max_chars_failure", "status": "expected_failure", "code": 10},
+    {"case": 17, "name": "expected_impossible_fit_failure", "status": "expected_failure", "code": 40}
+  ]
+
+VISUAL-REVIEW ENVELOPE
+
+The orchestrator (mechanical Controller) assembles this envelope from the independent QA reviews and
+verifies it before the release decision. Roles do not hand it back; they supply its inputs (passing QA
+handoffs with hash-bound artifacts and the 17 edge_decisions). Shape:
+
+{
+  "schema_version": "synthetic-document-visual-review/1.2",
+  "builder": "workflow-orchestrator",
+  "run_id": "RUN-0001",
+  "reviewer_roles": ["qa_auditor"],
+  "writer_roles": ["generator_engineer", "template_architect"],
+  "status": "passed",
+  "gates": {"template": "passed", "background": "passed", "baseline": "passed", "fidelity": "passed", "edge": "passed", "regression": "passed"},
+  "edge_decisions": [ ...17 ],
+  "reviewed_artifacts": [{"path": "...", "sha256": "...", "source": "model_claimed"}],
+  "package_artifacts": [{"path": "generator.py", "sha256": "...", "source": "orchestrator_verified"}],
+  "issues": []
+}
+
+Only package_artifacts hashes are independently recomputed by the orchestrator; reviewed_artifacts
+hashes are model-claimed and labeled as such.
 
 ISSUE RECORD
 

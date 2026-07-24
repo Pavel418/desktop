@@ -7,6 +7,9 @@
   "independentAudit": true,
   "auditEvidenceInlineMax": 12000,
   "enforceEdgeDecisions": true,
+  "stallInspect": false,
+  "stallInspectHoldMs": 300000,
+  "stallInspectIntervalMs": 20000,
   "workflow": {
     "maxRepairRounds": 4,
     "perTurnTimeoutMs": 7200000,

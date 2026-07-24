@@ -24,9 +24,12 @@ import { createHash } from 'node:crypto';
 // Static workflow definition
 // ---------------------------------------------------------------------------
 
-// Ordered gates (see workflow/WORKFLOW.md "Stage gates").
+// Ordered gates (see workflow/WORKFLOW.md "Stage gates"). The base generator is a fixed,
+// known-good artifact, so its soundness is verified mechanically (a byte-hash identity check in
+// run()) instead of by an LLM "preflight" audit — which re-derived the same static facts every
+// run and, worse, hallucinated repairable defects into a clean file. See _checkGeneratorIdentity.
 export const GATES = [
-  'preflight', 'template', 'background', 'baseline', 'fidelity', 'edge', 'regression', 'release', 'final'
+  'template', 'background', 'baseline', 'fidelity', 'edge', 'regression', 'release', 'final'
 ];
 
 // QA modes that a repair round can re-run.
@@ -50,7 +53,6 @@ export const ROLE_FILES = {
 // an audit step opens.
 export const PLAN = [
   { role: 'controller', mode: 'start', gate: null, kind: 'control' },
-  { role: 'contract_auditor', mode: 'preflight', gate: 'preflight', kind: 'audit' },
   { role: 'template_analyst', mode: null, gate: null, kind: 'write' },
   { role: 'template_architect', mode: null, gate: null, kind: 'write' },
   { role: 'qa_auditor', mode: 'template', gate: 'template', kind: 'audit' },
@@ -86,26 +88,25 @@ const DOMAIN_CODE = {
   reconstruction: 60, typography: 60, placement: 60, fidelity: 60, packaging: 70
 };
 const STAGE_CODE = {
-  preflight: 30, template: 50, background: 60, baseline: 60, fidelity: 60, edge: 60,
+  template: 50, background: 60, baseline: 60, fidelity: 60, edge: 60,
   regression: 99, release: 70, final: 99,
-  start: 20, finalize: 20,
+  start: 20, finalize: 20, generator_identity: 20,
   template_analyst: 50, template_architect: 50, implementation: 20, package: 70
 };
 const SEVERITY_RANK = { critical: 3, major: 2, minor: 1, info: 0 };
 
 export const PERSISTENT_FILES = ['generator.py', 'manifest.json', 'generator_report.json'];
 
-// The six QA gates the visual-review envelope must cover (preflight/release/final excluded).
+// The six QA gates the visual-review envelope must cover (release/final are not QA gates).
 const ENVELOPE_QA_GATES = ['template', 'background', 'baseline', 'fidelity', 'edge', 'regression'];
 
 // Roles that create artifacts. A visual review authored by any of these is a self-approval and is
 // rejected by the envelope builder (mirrors generator.py's VISUAL_REVIEW_SELF_APPROVAL check).
 export const WRITER_ROLES = new Set(['generator_engineer', 'template_architect']);
 
-// Envelope vocabulary mirrored from generator.py so the orchestrator, the model's in-sandbox
-// audit_generator envelope, and the auditors all speak one language. Keep these EXACTLY in sync
-// with VISUAL_REVIEW_SCHEMA_VERSION and EDGE_CASE_NAMES in workflow/generator.py (a drift test
-// asserts the match).
+// Release-envelope vocabulary. The generator separately validates an in-sandbox machine-review
+// envelope because package hashes do not exist until after that audit completes. Keep this version
+// in sync with ORCHESTRATOR_VISUAL_REVIEW_SCHEMA_VERSION in workflow/generator.py.
 export const VISUAL_REVIEW_SCHEMA_VERSION = 'synthetic-document-visual-review/1.2';
 export const EDGE_CASES = [
   'normal_random_placement',
@@ -134,6 +135,19 @@ const EDGE_CASE_INDEX = new Map(EDGE_CASES.map((name, i) => [name, i + 1]));
 export async function sha256File(filePath) {
   const bytes = await fs.readFile(filePath);
   return createHash('sha256').update(bytes).digest('hex');
+}
+
+// Render a millisecond duration as a compact, human-readable string ("8m 12s", "540ms", "1h 03m").
+export function humanizeDuration(ms) {
+  const n = Math.max(0, Math.round(Number(ms) || 0));
+  if (n < 1000) return `${n}ms`;
+  const totalSec = Math.round(n / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`;
+  if (m > 0) return `${m}m ${String(s).padStart(2, '0')}s`;
+  return `${s}s`;
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +511,7 @@ function _normaliseHandoff(input, expected = null) {
   obj.artifacts = objectField(obj, 'artifacts', 'artifact', 'artifact_evidence', 'artifactEvidence', 'files');
   obj.evidence = objectField(obj, 'evidence', 'checks');
   obj.new_issues = objectField(obj, 'new_issues', 'newIssues');
+  obj.issues = objectField(obj, 'issues', 'issue_records', 'issueRecords');
   obj.verified_issues = objectField(obj, 'verified_issues', 'verifiedIssues');
   obj.fixed_issues = objectField(obj, 'fixed_issues', 'fixedIssues');
   obj.required_reruns = objectField(obj, 'required_reruns', 'requiredReruns', 'reruns');
@@ -524,7 +539,7 @@ function _normaliseHandoff(input, expected = null) {
     else if (obj.mode == null || obj.mode === canonicalToken(expected.mode)) obj.mode = expected.mode;
   }
 
-  for (const key of ['evidence', 'new_issues', 'verified_issues', 'fixed_issues', 'required_reruns']) {
+  for (const key of ['evidence', 'new_issues', 'issues', 'verified_issues', 'fixed_issues', 'required_reruns']) {
     obj[key] = asList(obj[key]);
   }
   if (expected?.kind === 'write' && obj.verified_issues.length === 0 && obj.fixed_issues.length) {
@@ -562,10 +577,30 @@ function collectHandoffObjects(value, out, depth = 0) {
 }
 
 const HANDOFF_STATUSES = new Set(['passed', 'failed', 'blocked', 'ready_for_review']);
+const ISSUE_SEVERITIES = new Set(['critical', 'major', 'minor']);
+const ISSUE_DOMAINS = new Set([
+  'runtime', 'geometry', 'semantics', 'reconstruction', 'typography', 'placement',
+  'annotation', 'compatibility', 'packaging'
+]);
+
+function completeIssueRecordError(issue) {
+  if (!issue || typeof issue !== 'object' || Array.isArray(issue)) return 'new issue must be a complete object, not an ID';
+  if (typeof issue.issue_id !== 'string' || !issue.issue_id.trim()) return 'new issue is missing issue_id';
+  if (!ISSUE_SEVERITIES.has(canonicalToken(issue.severity))) return `${issue.issue_id}: invalid or missing severity`;
+  if (!ISSUE_DOMAINS.has(canonicalToken(issue.domain))) return `${issue.issue_id}: invalid or missing domain`;
+  for (const key of ['code', 'stage', 'artifact', 'evidence', 'owner']) {
+    if (typeof issue[key] !== 'string' || !issue[key].trim()) return `${issue.issue_id}: missing ${key}`;
+  }
+  if (!Array.isArray(issue.required_reruns)) return `${issue.issue_id}: required_reruns must be an array`;
+  if (!['open', 'fixed', 'verified', 'blocked'].includes(canonicalToken(issue.status))) {
+    return `${issue.issue_id}: invalid or missing status`;
+  }
+  return null;
+}
 
 // Validate the v3 inter-agent envelope at the orchestration boundary. Artifact entries
 // are hash-bound; only control turns may omit artifact evidence.
-function handoffValidationError(handoff, step, runId) {
+export function handoffValidationError(handoff, step, runId) {
   if (!handoff || handoff.run_id !== runId) return 'run_id mismatch';
   if (handoff.role !== step.role) return 'role mismatch';
   if ((handoff.mode ?? null) !== (step.mode ?? null)) return 'mode mismatch';
@@ -580,6 +615,12 @@ function handoffValidationError(handoff, step, runId) {
     if (typeof artifact.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(artifact.sha256)) {
       return `artifact hash is invalid: ${artifact.path}`;
     }
+  }
+  const detailedIssues = issueRecordsFromHandoff(handoff);
+  if (handoff.new_issues.length !== detailedIssues.length) return 'every new issue must have one complete issue record';
+  for (const issue of detailedIssues) {
+    const issueError = completeIssueRecordError(issue);
+    if (issueError) return issueError;
   }
   return null;
 }
@@ -792,7 +833,11 @@ const DEFAULT_CONFIG = {
   // Require the qa_auditor/edge review to resolve all 17 individual edge cases before the
   // visual-review envelope can be built. Default false so bare-config unit tests stay green;
   // run-batch enables it in production.
-  enforceEdgeDecisions: false
+  enforceEdgeDecisions: false,
+  // Optional pin for the base generator's SHA-256. When set, run() fails fast (status 20) if the
+  // attached base generator's bytes do not match — the mechanical replacement for the LLM
+  // preflight audit. When null, the hash is only logged (no enforcement).
+  expectedGeneratorSha256: null
 };
 
 export class WorkflowOrchestrator {
@@ -1066,6 +1111,8 @@ export class WorkflowOrchestrator {
 
   // Run one role turn: send, capture text, parse the handoff (re-asking once if needed).
   async _turn(controller, step, ctx, sendOpts, transcript) {
+    const started = Date.now();
+    const label = `${step.role}${step.mode ? '/' + step.mode : ''}`;
     const message = this._composeMessage(step, ctx, { includeShared: sendOpts.first });
     const expected = { runId: ctx.runId, role: step.role, mode: step.mode ?? null, kind: step.kind };
     const responseState = (candidate) => handoffResponseState(candidate, expected);
@@ -1086,6 +1133,7 @@ export class WorkflowOrchestrator {
         : '';
       const reask = await controller.followUp({
         text: 'Your previous reply did not end with a valid shared-handoff JSON block. ' +
+          `Validation error: ${validationError}. ` +
           `Reply again with ONLY the required fenced \`\`\`json handoff object. Required identity: ` +
           `run_id=${ctx.runId}, role=${step.role}, mode=${step.mode ?? 'null'}. ` +
           'Include an artifacts array and a valid SHA-256 for every listed artifact.' + edgeNote,
@@ -1097,6 +1145,13 @@ export class WorkflowOrchestrator {
       handoff = parseHandoff(text, expected);
       validationError = handoff ? handoffValidationError(handoff, step, ctx.runId) : 'handoff JSON not found';
       if (validationError) handoff = null;
+    }
+    // Always-on, human-readable turn outcome (independent of the debug-only response-gate lines).
+    const dur = humanizeDuration(Date.now() - started);
+    if (handoff) {
+      this.log(`  ✓ ${label} — ${text.length} chars in ${dur} (${handoff.stage_status})`);
+    } else {
+      this.log(`  ✗ ${label} — no valid handoff in ${dur} (${text.length} chars)`);
     }
     return { handoff, result, text };
   }
@@ -1211,72 +1266,23 @@ export class WorkflowOrchestrator {
     return { recovered: false, code, stage: gate };
   }
 
-  // Preflight findings concern the reusable base runtime and must be repaired by
-  // Generator Engineer before template analysis starts. Re-audit them with Contract
-  // Auditor; routing them through QA modes would run template checks before a
-  // template specification exists.
-  async _repairPreflight(controller, state, transcript) {
-    for (let round = 1; round <= this.config.maxRepairRounds; round++) {
-      const assigned = state.issues.open();
-      this.log(`  ↻ preflight repair round ${round}/${this.config.maxRepairRounds} (${assigned.length} open issue(s))`);
-
-      const planner = await this._turn(
-        controller,
-        { role: 'repair_engineer', mode: null, gate: 'preflight' },
-        {
-          ...state.ctx,
-          gate: 'preflight',
-          assignedIssues: assigned,
-          extra: 'Plan only the reusable-runtime preflight corrections. Do not perform template adaptation, edit files, or verify issues.'
-        },
-        { first: false, timeoutMs: this.config.perTurnTimeoutMs },
-        transcript
-      );
-      if (!planner.handoff || !['passed', 'ready_for_review'].includes(planner.handoff.stage_status)) {
-        return { recovered: false, code: selectFailureCode(state.issues.snapshot(), 'preflight'), stage: 'preflight' };
-      }
-      state.issues.addNew(issueRecordsFromHandoff(planner.handoff));
-
-      const writer = await this._turn(
-        controller,
-        { role: 'generator_engineer', mode: 'repair', kind: 'write' },
-        {
-          ...state.ctx,
-          gate: 'preflight',
-          assignedIssues: state.issues.open(),
-          extra: 'Apply only the approved base-runtime preflight corrections. Mark addressed issue IDs fixed, never verified. Do not adapt the target template yet.'
-        },
-        { first: false, timeoutMs: this.config.perTurnTimeoutMs },
-        transcript
-      );
-      if (!writer.handoff || !['passed', 'ready_for_review'].includes(writer.handoff.stage_status)) {
-        return { recovered: false, code: selectFailureCode(state.issues.snapshot(), 'preflight'), stage: 'preflight' };
-      }
-      state.issues.addNew(issueRecordsFromHandoff(writer.handoff));
-      state.issues.markFixed(writer.handoff.verified_issues);
-
-      const audit = await this._turn(
-        controller,
-        { role: 'contract_auditor', mode: 'preflight', gate: 'preflight', kind: 'audit' },
-        {
-          ...state.ctx,
-          gate: 'preflight',
-          assignedIssues: state.issues.snapshot().filter((issue) => issue.status !== 'verified'),
-          extra: 'Re-run preflight after repair. Verify each corrected issue ID explicitly, reopen failures with complete issue records, and do not perform template adaptation.'
-        },
-        { first: false, timeoutMs: this.config.perTurnTimeoutMs },
-        transcript
-      );
-      if (!audit.handoff) return { recovered: false, code: 99, stage: 'preflight' };
-      state.issues.addNew(issueRecordsFromHandoff(audit.handoff));
-      state.issues.markVerified(audit.handoff.verified_issues);
-
-      if (audit.handoff.stage_status === 'passed' && state.issues.blockingForRelease().length === 0) {
-        this.log(`  ✓ "preflight" gate recovered after repair round ${round}`);
-        return { recovered: true };
-      }
+  // Mechanical base-generator identity gate (replaces the LLM preflight audit). The base
+  // generator is a fixed, known-good, single file the orchestrator attaches itself; verifying its
+  // byte hash is a deterministic, instant substitute for a model re-reading and re-validating it
+  // every run. Always logs the computed hash; enforces equality only when a pin is configured.
+  async _checkGeneratorIdentity(baseGenerator) {
+    let sha;
+    try {
+      sha = await sha256File(baseGenerator);
+    } catch (err) {
+      return { ok: false, reason: `base generator unreadable: ${err?.message || err}` };
     }
-    return { recovered: false, code: selectFailureCode(state.issues.snapshot(), 'preflight'), stage: 'preflight' };
+    this.log(`base generator sha256=${sha}`);
+    const expected = String(this.config.expectedGeneratorSha256 || '').trim().toLowerCase();
+    if (expected && expected !== sha) {
+      return { ok: false, sha, reason: `hash mismatch (expected ${expected.slice(0, 12)}…, got ${sha.slice(0, 12)}…)` };
+    }
+    return { ok: true, sha };
   }
 
   // Drive the whole workflow for one PDF.
@@ -1298,6 +1304,20 @@ export class WorkflowOrchestrator {
     };
     const attachments = [pdf, baseGenerator];
     const gatesPassed = [];
+
+    // Base-generator identity gate — the mechanical replacement for the removed LLM preflight
+    // audit. The base generator is a fixed, known-good artifact the orchestrator itself attaches,
+    // so its soundness is asserted by byte identity rather than re-validated by a model every run.
+    // The hash is always logged (auditable run record); a configured pin fails fast on mismatch.
+    const identity = await this._checkGeneratorIdentity(baseGenerator);
+    if (!identity.ok) {
+      this.log(`  ✗ base generator identity check failed (${identity.reason}) → status 20`);
+      return {
+        runId, statusCode: 20, success: false, failedStage: 'generator_identity',
+        gatesPassed: [], issues: [], reviews: [], envelope: null, files: [], transcript
+      };
+    }
+
     let statusCode = null;
     let failedStage = null;
     let packagedFiles = [];
@@ -1436,20 +1456,6 @@ export class WorkflowOrchestrator {
             statusCode = Number.isFinite(rec) ? rec : this.config.successCode;
           }
           continue;
-        }
-
-        // Preflight defects are base-runtime defects. Repair them before any target
-        // template work, then have Contract Auditor independently re-run preflight.
-        if (step.gate === 'preflight') {
-          const outcome = await this._repairPreflight(controller, state, transcript);
-          if (outcome.recovered) {
-            gatesPassed.push(step.gate);
-            continue;
-          }
-          failedStage = outcome.stage;
-          statusCode = outcome.code;
-          this.log(`  ✗ "preflight" gate could not be repaired → status ${statusCode}`);
-          break;
         }
 
         // Release and final remain non-recoverable in this run.

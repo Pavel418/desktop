@@ -110,19 +110,49 @@ class Mutex {
 }
 
 export class ChatGPTController {
-  constructor({ page, selectors, onBlocked, onUnblocked, stateDir, onDebug = null }) {
+  constructor({ page, selectors, onBlocked, onUnblocked, stateDir, onDebug = null, stallInspect = null }) {
     this.page = page;
     this.selectors = selectors;
     this.onBlocked = onBlocked;
     this.onUnblocked = onUnblocked;
     this.onDebug = typeof onDebug === 'function' ? onDebug : null;
     this.stateDir = stateDir;
+    // Stall-inspection debug mode: when enabled, a suspected "stall" (an idle-fallback with a
+    // near-empty reply) does NOT trigger the normal fallback. Instead the controller dumps the
+    // full DOM truth + screenshots to stateDir and HOLDS, so we can see whether the reply is
+    // genuinely empty on-page or our reader is grabbing the wrong node. { enabled, holdMs, intervalMs }.
+    this.stallInspect = stallInspect && stallInspect.enabled
+      ? {
+          enabled: true,
+          holdMs: Number(stallInspect.holdMs) > 0 ? Number(stallInspect.holdMs) : 30 * 60_000,
+          intervalMs: Number(stallInspect.intervalMs) > 0 ? Number(stallInspect.intervalMs) : 20_000
+        }
+      : null;
     this.mutex = new Mutex();
     this.blocked = false;
     this.blockedKind = null;
     this.serverId = null;
     this.mouse = { x: 30, y: 30 };
     this.currentRun = null;
+    // Network-layer attachment upload watcher, live from #attachFiles through the send-gate.
+    this.uploadWatch = null;
+  }
+
+  // Compact one-line summary of the current network upload snapshot for debug logs.
+  #uploadSummary() {
+    const snap = this.uploadWatch?.snapshot?.();
+    if (!snap) return null;
+    return (
+      `net-uploads: total=${snap.total} inflight=${snap.inflight} finished=${snap.finished} ` +
+      `failed=${snap.failed} oldestInflightMs=${snap.oldestInflightMs}`
+    );
+  }
+
+  #stopUploadWatch() {
+    try {
+      this.uploadWatch?.off?.();
+    } catch {}
+    this.uploadWatch = null;
   }
 
   async runExclusive(fn) {
@@ -557,21 +587,88 @@ export class ChatGPTController {
     const sendSel = JSON.stringify(this.selectors.sendButton);
     const start = Date.now();
     let readySince = null;
+    let lastNetKey = null;
+    let lastDomKey = null;
     while (Date.now() - start < timeoutMs) {
       this.#throwIfStopRequested();
       const snap = await this.#eval(`(() => {
-        const prompt = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]');
-        const root = prompt?.closest('form') || prompt?.closest('[data-testid*="composer" i]') || document.querySelector('main') || document.body;
-        const uploading = !!root.querySelector('progress, [role="progressbar"], [class*="uploading" i], [aria-label*="uploading" i], [class*="progress" i][role]');
-        const visible = (n) => { const r = n.getBoundingClientRect(); const s = getComputedStyle(n); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+        const visible = (n) => { if (!n) return false; const r = n.getBoundingClientRect(); const s = getComputedStyle(n); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
         const disabled = (n) => !!n.disabled || String(n.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
-        const send = Array.from(document.querySelectorAll(${sendSel})).find(visible);
-        return { uploading, sendReady: !!send && !disabled(send), hasSend: !!send };
+        // Resolve the ACTIVE composer from the LAST visible prompt. ChatGPT keeps stale
+        // composers mounted, and their send buttons stay permanently disabled — evaluating
+        // the first global match reports a disabled button that will never enable.
+        const prompts = Array.from(document.querySelectorAll('#prompt-textarea, [contenteditable="true"][role="textbox"]'));
+        const prompt = prompts.filter(visible).at(-1) || prompts.at(-1) || null;
+        const composer = prompt?.closest('form') || prompt?.closest('[data-testid*="composer" i]') || null;
+        const root = composer || document.querySelector('main') || document.body;
+        const uploadEl = root.querySelector('progress, [role="progressbar"], [class*="uploading" i], [aria-label*="uploading" i], [class*="progress" i][role]');
+        const uploading = !!uploadEl;
+        const promptLen = String(prompt?.innerText || prompt?.textContent || prompt?.value || '').trim().length;
+        const allSends = Array.from(document.querySelectorAll(${sendSel}));
+        const visibleSends = allSends.filter(visible);
+        // Prefer the send button INSIDE the active composer; fall back to first visible global.
+        const scopedSend = composer ? Array.from(composer.querySelectorAll(${sendSel})).find(visible) : null;
+        const globalSend = visibleSends[0] || null;
+        const send = scopedSend || globalSend;
+        const disabledReason = !send ? 'no-send' : (send.disabled ? 'prop-disabled'
+          : (String(send.getAttribute('aria-disabled') || '').toLowerCase() === 'true' ? 'aria-disabled' : 'enabled'));
+        // Distinguish "editor never registered the text" from "attachment still pending":
+        // count chips still showing a spinner/processing state within the active composer.
+        const pendingChips = composer
+          ? Array.from(composer.querySelectorAll('[class*="uploading" i], [aria-label*="uploading" i], [aria-label*="processing" i], [data-testid*="attachment" i] svg[class*="spin" i], progress, [role="progressbar"]')).filter(visible).length
+          : 0;
+        const sendHtml = send ? String(send.outerHTML || '').replace(/\\s+/g, ' ').slice(0, 240) : null;
+        return {
+          uploading, sendReady: !!send && !disabled(send), hasSend: !!send,
+          disabledReason, promptLen, scopedInComposer: !!scopedSend,
+          visiblePrompts: prompts.filter(visible).length,
+          sendTotal: allSends.length, sendVisible: visibleSends.length,
+          globalDisabled: globalSend ? disabled(globalSend) : null,
+          scopedDisabled: scopedSend ? disabled(scopedSend) : null,
+          pendingChips, sendHtml,
+          uploadHint: uploadEl ? String(uploadEl.getAttribute('class') || uploadEl.getAttribute('aria-label') || uploadEl.tagName).slice(0, 80) : null
+        };
       })()`);
+
+      // Log the network upload picture whenever it changes, so a send button that stays
+      // disabled can be attributed to a still-in-flight (or stalled) upload rather than a
+      // DOM heuristic miss. This is what tells GPT-side stalls apart from wiring bugs.
+      const netSnap = this.uploadWatch?.snapshot?.();
+      if (netSnap) {
+        const netKey = `${netSnap.inflight}:${netSnap.finished}:${netSnap.failed}`;
+        if (netKey !== lastNetKey) {
+          lastNetKey = netKey;
+          this.#debug(
+            `send-gate: net-uploads inflight=${netSnap.inflight} finished=${netSnap.finished} ` +
+            `failed=${netSnap.failed} oldestInflightMs=${netSnap.oldestInflightMs} ` +
+            `(domUploading=${snap.uploading}, sendReady=${snap.sendReady})`
+          );
+        }
+      }
+
+      // Log the composer/send DOM state whenever it changes. Because uploads finish long
+      // before the timeout, the net picture goes quiet — this is the signal that shows what
+      // is actually holding the gate (disabled send, empty prompt, or a stuck upload hint).
+      const domKey = `${snap.uploading}:${snap.hasSend}:${snap.sendReady}:${snap.disabledReason}:${snap.promptLen}:${snap.scopedInComposer}`;
+      if (domKey !== lastDomKey) {
+        lastDomKey = domKey;
+        this.#debug(
+          `send-gate: dom uploading=${snap.uploading} hasSend=${snap.hasSend} sendReady=${snap.sendReady} ` +
+          `send=${snap.disabledReason} scoped=${snap.scopedInComposer} promptLen=${snap.promptLen} ` +
+          `prompts=${snap.visiblePrompts} sends=${snap.sendVisible}/${snap.sendTotal} ` +
+          `globalDisabled=${snap.globalDisabled} scopedDisabled=${snap.scopedDisabled} pendingChips=${snap.pendingChips}` +
+          (snap.uploadHint ? ` uploadHint="${snap.uploadHint}"` : '') +
+          (snap.sendHtml ? `\n  send: ${snap.sendHtml}` : '')
+        );
+      }
+
       if (!snap.uploading && (snap.sendReady || !snap.hasSend)) {
         if (readySince == null) readySince = Date.now();
         else if (Date.now() - readySince >= stableMs) {
-          this.#debug(`send-gate: ready after ${Date.now() - start}ms (sendReady=${snap.sendReady}, hasSend=${snap.hasSend})`);
+          this.#debug(
+            `send-gate: ready after ${Date.now() - start}ms (sendReady=${snap.sendReady}, hasSend=${snap.hasSend}` +
+            `${netSnap ? `, netInflight=${netSnap.inflight}, netFailed=${netSnap.failed}` : ''})`
+          );
           return;
         }
       } else {
@@ -579,7 +676,65 @@ export class ChatGPTController {
       }
       await sleep(pollMs);
     }
-    this.#debug(`send-gate: timed out after ${timeoutMs}ms waiting for send to become ready`);
+    // Timed out. Dump both the composer/send DOM state and the full network picture so the
+    // cause is unambiguous: a stuck upload (inflight/failed request) vs a send button that
+    // stays disabled after uploads already finished (a UI-state/selector issue on our side).
+    this.#debug(`send-gate: timed out after ${timeoutMs}ms waiting for send to become ready (last dom: ${lastDomKey})`);
+
+    // One-time rich capture of why the send button is disabled: the accessibility tooltip
+    // it points at (ChatGPT states the reason there), whether the disabled attribute is set,
+    // any spinning/animated indicators in the composer, and the attachment chips' markup.
+    const stuck = await this.#eval(`(() => {
+      const clip = (s, n) => String(s || '').replace(/\\s+/g, ' ').trim().slice(0, n);
+      const visible = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+      const prompts = Array.from(document.querySelectorAll('#prompt-textarea, [contenteditable="true"][role="textbox"]'));
+      const prompt = prompts.filter(visible).at(-1) || prompts.at(-1) || null;
+      const composer = prompt?.closest('form') || prompt?.closest('[data-testid*="composer" i]') || document.querySelector('main') || document.body;
+      const send = document.querySelector('#composer-submit-button, button[data-testid="send-button"]')
+        || (composer && composer.querySelector('button[data-testid="send-button"], button[aria-label*="send" i]'));
+      // Resolve the tooltip/popover the button describes itself with — the disabled reason.
+      const ref = send && (send.getAttribute('aria-describedby') || send.getAttribute('interestfor'));
+      const tip = ref ? document.getElementById(ref) : null;
+      // Any spinning/loading indicator anywhere in the composer (broad — Tailwind animate-spin,
+      // role=progressbar, svg with spinner classes, aria-busy).
+      const spinners = composer ? Array.from(composer.querySelectorAll(
+        '[class*="animate-spin" i], [class*="spinner" i], [class*="loading" i], [aria-busy="true"], [role="progressbar"], progress, svg[class*="spin" i]'
+      )).filter(visible).map((n) => clip(n.getAttribute('class') || n.getAttribute('aria-label') || n.tagName, 60)) : [];
+      // Attachment chips: the region just above the prompt that holds file previews.
+      const chipNodes = composer ? Array.from(composer.querySelectorAll(
+        '[data-testid*="attachment" i], [data-testid*="file" i], [class*="attachment" i]'
+      )).filter(visible) : [];
+      const chips = chipNodes.slice(0, 4).map((n) => clip(n.outerHTML, 300));
+      return {
+        sendDisabledAttr: send ? send.hasAttribute('disabled') : null,
+        sendHtml: send ? clip(send.outerHTML, 600) : null,
+        tipText: tip ? clip(tip.innerText || tip.textContent, 200) : (ref ? '(describedby target not found)' : '(no describedby)'),
+        spinners,
+        chipCount: chipNodes.length,
+        chips
+      };
+    })()`).catch((e) => ({ error: String(e?.message || e) }));
+    this.#debug(
+      `send-gate: stuck-state — disabledAttr=${stuck?.sendDisabledAttr} ` +
+      `spinners=${JSON.stringify(stuck?.spinners || [])} chipCount=${stuck?.chipCount}\n` +
+      `  tooltip: ${stuck?.tipText}\n` +
+      `  send: ${stuck?.sendHtml}` +
+      (stuck?.chips?.length ? '\n  chips:\n' + stuck.chips.map((c) => `    · ${c}`).join('\n') : '') +
+      (stuck?.error ? `\n  (capture error: ${stuck.error})` : '')
+    );
+
+    const finalNet = this.uploadWatch?.snapshot?.();
+    if (finalNet) {
+      this.#debug(
+        `send-gate: final ${this.#uploadSummary()}` +
+        (finalNet.requests.length
+          ? '\n' + finalNet.requests
+              .map((r) => `  · ${r.state} ${r.method} ${r.url} status=${r.status ?? '-'} ` +
+                `bytes=${r.bytes} age=${r.ageMs}ms${r.error ? ` error=${r.error}` : ''}`)
+              .join('\n')
+          : ' (no upload requests observed — file may have been selected without a network POST)')
+      );
+    }
   }
 
   async #clickSend() {
@@ -838,6 +993,20 @@ export class ChatGPTController {
     const baseNames = absFiles.map((f) => path.basename(f));
     this.#debug(`attach: uploading ${absFiles.length} file(s): ${baseNames.join(', ')}`);
 
+    // Start watching the network layer so we can distinguish "chip appeared" (file selected)
+    // from "bytes actually uploaded". Kept alive until the send-gate settles (#clickSend).
+    this.#stopUploadWatch();
+    if (typeof this.page.watchUploads === 'function') {
+      this.uploadWatch = this.page.watchUploads({
+        onEvent: (e) => {
+          const tail = e.status != null ? ` status=${e.status}` : '';
+          const bytes = e.bytes ? ` bytes=${e.bytes}` : '';
+          const err = e.error ? ` error=${e.error}` : '';
+          this.#debug(`attach: net ${e.phase} ${e.method} ${e.url}${tail}${bytes}${err} (age=${e.ageMs}ms)`);
+        }
+      });
+    }
+
     // Give React time to wire the hidden input's change handler before setting it.
     await this.#eval(`(() => { const e = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]'); if (e) e.focus(); return true; })()`).catch(() => {});
     await sleep(1200);
@@ -923,6 +1092,12 @@ export class ChatGPTController {
       err.data = { files: baseNames, ...settle, expected: baseNames.length };
       throw err;
     }
+
+    // Chips are present. Report the network picture: if the upload requests have not
+    // finished here, the file is selected but its bytes are still in flight (or stalled)
+    // and the send-gate is what will actually wait them out.
+    const summary = this.#uploadSummary();
+    if (summary) this.#debug(`attach: chips settled; ${summary}`);
   }
 
   // Some ChatGPT variants hide the file input behind a two-stage "+" menu. Open
@@ -1054,6 +1229,8 @@ export class ChatGPTController {
     let continueClicks = 0;
     let lastSemanticState = 'unknown';
     let lastSnap = null;
+    // High-water mark of the reply length; growth means active streaming (see the idle logic).
+    let maxTxtLen = 0;
 
     while (Date.now() - start < timeoutMs) {
       this.#throwIfStopRequested();
@@ -1117,7 +1294,14 @@ export class ChatGPTController {
         last = txt;
         lastChange = Date.now();
       }
-      if (snap?.busyVisible || snap?.hasContinue) {
+      // Reply text grew since the previous poll → still actively streaming, so this is not idle.
+      // (Length only — not HTML churn — so a blinking cursor can't stop us from ever settling, and
+      // text length is monotone-bounded so it can never wedge the wait open indefinitely.) The
+      // actual render bug (unfocused tab → CodeMirror never paints → innerText frozen) is fixed at
+      // the CDP layer via Emulation.setFocusEmulationEnabled in the page adapter.
+      const grew = txt.length > maxTxtLen;
+      if (grew) maxTxtLen = txt.length;
+      if (snap?.busyVisible || snap?.hasContinue || grew) {
         sawActivity = true;
         idleSince = null;
         terminalSince = null;
@@ -1167,6 +1351,20 @@ export class ChatGPTController {
         semanticState
       });
       if (decision.done) {
+        // Stall-inspection: a near-empty idle-fallback is the exact case under suspicion (is the
+        // reply really empty, or are we reading the wrong node?). Instead of accepting it, dump the
+        // DOM truth + screenshots and hold. If the content actually grew while held, the idle
+        // detection was premature — resume with the grown text rather than the near-empty read.
+        if (this.stallInspect && /_idle_fallback$/.test(decision.reason)) {
+          const held = await this.#runStallInspector({ reason: decision.reason, semanticState, currentText: txt });
+          if (held?.grew) {
+            last = held.text;
+            lastChange = Date.now();
+            idleSince = null;
+            terminalSince = null;
+            continue;
+          }
+        }
         const extra = await this.#eval(`(() => {
           const nodes = Array.from(document.querySelectorAll(${assistantSel}));
           const lastNode = nodes[nodes.length - 1];
@@ -1204,6 +1402,92 @@ export class ChatGPTController {
     throw err;
   }
 
+  // Rich DOM truth-dump used by the stall inspector. The point is to compare what our reader
+  // sees (the LAST assistant node's innerText) against the LARGEST assistant node and the code
+  // blocks — so a "near-empty stall" that is really a wrong-node read is immediately obvious.
+  async #captureStallDom() {
+    const assistantSel = JSON.stringify(this.selectors.assistantMessage);
+    return await this.#eval(`(() => {
+      const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim();
+      const vis = (n) => { const r = n.getBoundingClientRect(); const s = getComputedStyle(n); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+      const nodes = Array.from(document.querySelectorAll(${assistantSel}));
+      const info = nodes.map((n, i) => ({
+        i, tag: n.tagName,
+        id: n.getAttribute('data-message-id') || null,
+        role: n.getAttribute('data-message-author-role') || null,
+        streaming: n.getAttribute('data-is-streaming') || null,
+        textLen: (n.innerText || '').length,
+        head: norm(n.innerText).slice(0, 160),
+        visible: vis(n)
+      }));
+      const last = nodes[nodes.length - 1] || null;
+      const byMax = nodes.slice().sort((a, b) => (b.innerText || '').length - (a.innerText || '').length)[0] || null;
+      const codeInLast = last ? Array.from(last.querySelectorAll('pre code')).map((c) => ({ len: (c.innerText || '').length, head: norm(c.innerText).slice(0, 200) })) : [];
+      const codeAll = Array.from(document.querySelectorAll('pre code')).map((c) => (c.innerText || '').length);
+      return {
+        url: location.href,
+        count: nodes.length,
+        lastTextLen: last ? (last.innerText || '').length : 0,
+        lastText: last ? (last.innerText || '') : null,
+        maxLenTextLen: byMax ? (byMax.innerText || '').length : 0,
+        maxLenText: byMax ? (byMax.innerText || '') : null,
+        maxLenIsLast: byMax === last,
+        lastOuterHTML: last ? last.outerHTML.slice(0, 30000) : null,
+        nodes: info,
+        codeBlocksInLast: codeInLast,
+        allCodeBlockLens: codeAll
+      };
+    })()`);
+  }
+
+  // On a suspected stall: dump the DOM truth + screenshots to <stateDir>/stall-inspect, then HOLD
+  // (re-dumping periodically) instead of reacting, so a human can inspect the live window and we
+  // can see whether the reply is genuinely empty or still growing. Returns the best text seen.
+  async #runStallInspector({ reason, semanticState, currentText }) {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const dir = path.join(this.stateDir || '.', 'stall-inspect');
+    await fs.mkdir(dir, { recursive: true }).catch(() => {});
+    const writePng = async (name) => {
+      if (typeof this.page.screenshot !== 'function') return;
+      const png = await this.page.screenshot({ fullPage: false }).catch(() => null);
+      if (png) await fs.writeFile(path.join(dir, name), png).catch(() => {});
+    };
+
+    const dump0 = await this.#captureStallDom().catch((e) => ({ error: String(e?.message || e) }));
+    const jsonPath = path.join(dir, `stall-${ts}.json`);
+    await fs.writeFile(
+      jsonPath,
+      JSON.stringify({ reason, semanticState, readerText: currentText, readerLen: currentText.length, ...dump0 }, null, 2)
+    ).catch(() => {});
+    await writePng(`stall-${ts}-0.png`);
+
+    this.#debug(
+      `⏸ STALL INSPECTOR fired: reason=${reason} readerLen=${currentText.length} ` +
+      `lastNodeLen=${dump0.lastTextLen} maxNodeLen=${dump0.maxLenTextLen} maxIsLast=${dump0.maxLenIsLast} ` +
+      `assistantNodes=${dump0.count} codeLens=${JSON.stringify(dump0.allCodeBlockLens || [])} — ` +
+      `dumped ${jsonPath}; HOLDING up to ${Math.round(this.stallInspect.holdMs / 1000)}s (inspect the Chrome window; DOM+PNG under ${dir})`
+    );
+
+    const holdStart = Date.now();
+    let shot = 1;
+    let bestText = currentText;
+    while (Date.now() - holdStart < this.stallInspect.holdMs) {
+      this.#throwIfStopRequested();
+      await sleep(this.stallInspect.intervalMs);
+      const d = await this.#captureStallDom().catch(() => null);
+      if (!d) continue;
+      await writePng(`stall-${ts}-${shot}.png`);
+      this.#debug(
+        `⏸ STALL held ${Math.round((Date.now() - holdStart) / 1000)}s — ` +
+        `lastNodeLen=${d.lastTextLen} maxNodeLen=${d.maxLenTextLen} maxIsLast=${d.maxLenIsLast} nodes=${d.count} (shot ${shot})`
+      );
+      if ((d.maxLenTextLen || 0) > bestText.length) bestText = d.maxLenText || bestText;
+      shot += 1;
+    }
+    this.#debug(`⏸ STALL INSPECTOR hold elapsed; resuming (bestLen=${bestText.length}, grew=${bestText.length > currentText.length})`);
+    return { text: bestText, grew: bestText.length > currentText.length };
+  }
+
   async query({
     prompt,
     attachments = [],
@@ -1227,6 +1511,7 @@ export class ChatGPTController {
         responseState
       });
     } finally {
+      this.#stopUploadWatch();
       if (this.currentRun === run) this.currentRun = null;
     }
   }
@@ -1247,6 +1532,7 @@ export class ChatGPTController {
         responseState
       });
     } finally {
+      this.#stopUploadWatch();
       if (this.currentRun === run) this.currentRun = null;
     }
   }
@@ -1276,6 +1562,7 @@ export class ChatGPTController {
 
         return { ok: true };
       } finally {
+        this.#stopUploadWatch();
         if (this.currentRun === run) this.currentRun = null;
       }
     });

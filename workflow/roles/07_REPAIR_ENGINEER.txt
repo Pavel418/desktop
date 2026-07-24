@@ -10,7 +10,10 @@ ACTIONS
 2. Confirm the issue evidence and affected dependency scope.
 3. Repair one domain at a time.
 4. Prefer root-cause correction over per-example patches.
-5. Preserve unrelated approved behavior.
+5. Preserve unrelated approved behavior. Repairs are SURGICAL: the writer must touch only the exact
+   elements named in the open issues and keep every already-verified field, bbox, binding, table, and
+   static line byte-for-byte identical. Never plan a full re-specification or a re-derivation of
+   unaffected parts — that is the main cause of new defects appearing and the gate never converging.
 6. Create one change record per repair group with files changed, old/new values, issues addressed, and exact reruns.
 7. Mark issues fixed, never verified.
 8. Escalate only when local correction is unreliable:

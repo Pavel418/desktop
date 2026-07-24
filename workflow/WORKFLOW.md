@@ -12,7 +12,7 @@ The workflow never uses OCR or PDF text extraction and never adds artificial sca
 |---|---|
 | `00_SHARED_CONTRACT.txt` | Rules inherited by every role |
 | `01_CONTROLLER.txt` | Stage order, gates, issue routing, and reruns |
-| `02_CONTRACT_AUDITOR.txt` | Runtime preflight and release validation |
+| `02_CONTRACT_AUDITOR.txt` | Isolated release validation |
 | `03_TEMPLATE_ANALYST.txt` | Visual scan inventory and template lock |
 | `04_TEMPLATE_ARCHITECT.txt` | Tables, cells, static text, fields, semantics, and reconstruction plan |
 | `05_GENERATOR_ENGINEER.txt` | Background, implementation, repair application, and package writing |
@@ -22,10 +22,11 @@ The workflow never uses OCR or PDF text extraction and never adds artificial sca
 
 ## Prompt order
 
-1. **Shared Contract** is supplied to every role.
-2. **Controller** opens the run and enforces ownership and gates.
-3. **Contract Auditor, preflight** inventories the base runtime and identifies permitted edits.
-4. **Template Analyst** creates the scan inventory and locks the target page by rendered-pixel hash.
+1. **Shared Contract** is supplied to every role. It carries a static BASE GENERATOR MAP (edit-zone
+   markers, public API, defaults) so roles do not need to rediscover the fixed base runtime.
+2. **Controller** opens the run and enforces ownership and gates. The base generator's soundness is
+   asserted mechanically by the orchestrator (byte-hash identity gate), not by an LLM audit.
+3. **Template Analyst** creates the scan inventory and locks the target page by rendered-pixel hash.
 5. **Template Architect** creates the complete template specification and master overlay.
 6. **QA Auditor, template** reviews all geometry, fields, cells, keys, static text, images, and reconstruction masks.
 7. **Generator Engineer, background** creates the clean hybrid background.
@@ -65,21 +66,21 @@ The Controller may retry one isolated stage without rerunning unrelated passed s
 
 ## Gates and loops
 
-### Preflight repair loop
+### Base generator identity gate
 
-Target-specific placeholders and a mismatched starter document family are expected
-adaptation work and do not fail preflight. Genuine reusable-runtime defects are repaired
-before scan analysis:
+The base generator is a fixed, known-good, single file the orchestrator attaches itself. Rather than
+pay an LLM to re-inventory and re-validate it every run (which re-derived the same static facts and
+could hallucinate defects into a clean file), the orchestrator verifies its SHA-256 mechanically
+before any model turn:
 
 ```text
-Contract Auditor preflight
--> Repair Engineer plan
--> Generator Engineer runtime repair
--> Contract Auditor preflight re-audit
+orchestrator computes sha256(generator.py)
+-> logs it (auditable run record)
+-> if config.expectedGeneratorSha256 is set and differs -> fail fast, status 20, no model turns
 ```
 
-The workflow stops only when the reusable runtime cannot be repaired within the configured
-round limit.
+The static facts the old preflight produced (edit-zone location, public API, defaults) now live in
+the BASE GENERATOR MAP inside the Shared Contract, so roles start already oriented.
 
 ### Template loop
 

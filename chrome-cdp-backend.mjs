@@ -115,17 +115,18 @@ export function defaultChromeUserDataDir() {
   return path.join(os.homedir(), '.config', 'google-chrome');
 }
 
-// Names of cookies that are safe to delete to shrink the Cookie header: pure telemetry/analytics
-// that the site regenerates. The KEEP guard makes doubly sure we never remove authentication
-// (session-token chunks), CSRF, or Cloudflare clearance cookies, so the session stays logged in.
+// Names of cookies that are safe to delete to shrink the Cookie header. Telemetry is always
+// disposable. Per-conversation temporary-chat state is disposable only when no other managed chat
+// is open; deleting it underneath an active chat could invalidate that conversation.
 const PRUNABLE_COOKIE_RE = /^(_dd_s|_dd_r|_dd|__cf_bm|_ga|_gid|_gat|_gcl|ajs_|amp_|amplitude|intercom-|statsig|mp_|__stripe_mid|__stripe_sid)/i;
+const STALE_CONVERSATION_COOKIE_RE = /^(conv_key|history_off)_[0-9a-f-]{16,}$/i;
 const KEEP_COOKIE_RE = /(session-token|clearance|csrf|__host-|__secure-next-auth|oai-did|auth)/i;
 
-export function isPrunableCookieName(name) {
+export function isPrunableCookieName(name, { includeConversationState = false } = {}) {
   const value = String(name || '');
   if (!value) return false;
   if (KEEP_COOKIE_RE.test(value)) return false;
-  return PRUNABLE_COOKIE_RE.test(value);
+  return PRUNABLE_COOKIE_RE.test(value) || (includeConversationState && STALE_CONVERSATION_COOKIE_RE.test(value));
 }
 
 export function buildChromeLaunchArgs({ debugPort, userDataDir, profileName = null, startUrl = 'about:blank' } = {}) {
@@ -334,6 +335,12 @@ export class ChromeCdpPageAdapter {
     await this.client.send('DOM.enable', {}, this.sessionId);
     // Needed for the top-document response status (431 detection) and cookie pruning.
     await this.client.send('Network.enable', {}, this.sessionId).catch(() => {});
+    // Force the page to always render as if focused. A backgrounded/unfocused tab has its rendering
+    // throttled by Chrome, which leaves ChatGPT's CodeMirror code blocks unpainted — their text
+    // never enters the DOM, so reading innerText returns only the streaming fragment and the reply
+    // looks permanently "stalled" at a few characters. Emulated focus keeps it painting so reads
+    // reflect the real, complete reply. (Confirmed fix: unfocused innerText=19 → focused=593.)
+    await this.client.send('Emulation.setFocusEmulationEnabled', { enabled: true }, this.sessionId).catch(() => {});
     await this.client.send(
       'Page.addScriptToEvaluateOnNewDocument',
       {
@@ -350,16 +357,24 @@ export class ChromeCdpPageAdapter {
     }
   }
 
-  async navigate(url) {
-    const status = await this._navigateAndGetTopStatus(url);
-    // ChatGPT's edge returns 431 (Request Header Fields Too Large) when the accumulated cookie
-    // jar overflows the header limit. The error response itself rotates/expires cookies (Cloudflare
-    // __cf_bm, stale session-token chunks), so a single reload sends a trimmed jar that succeeds —
-    // this automates the manual refresh that fixes it.
-    if (status === 431) {
-      await this.client.send('Page.reload', { ignoreCache: false }, this.sessionId).catch(() => {});
+  async navigate(url, { pruneConversationStateOn431 = false } = {}) {
+    const firstStatus = await this._navigateAndGetTopStatus(url);
+    if (firstStatus !== 431) return firstStatus;
+
+    // A reload with the same cookie jar simply repeats the oversized request. Remove disposable
+    // state, perform a fresh observed navigation, and verify that the server no longer returns 431.
+    await this.pruneTelemetryCookies({ includeConversationState: pruneConversationStateOn431 });
+    const retryStatus = await this._navigateAndGetTopStatus(url);
+    if (retryStatus === 431 || retryStatus == null) {
+      const error = new Error(retryStatus === 431
+        ? 'chatgpt_navigation_http_431'
+        : 'chatgpt_navigation_431_recovery_unverified');
+      error.statusCode = retryStatus;
+      error.initialStatusCode = 431;
+      error.url = url;
+      throw error;
     }
-    return status;
+    return retryStatus;
   }
 
   // Navigate and resolve with the top-level document's HTTP status (null if none arrives in time).
@@ -385,10 +400,10 @@ export class ChromeCdpPageAdapter {
     return status;
   }
 
-  // Drop known telemetry cookies for the ChatGPT/OpenAI origins to keep the Cookie header small,
-  // reducing how often the 431 above trips. Conservative: never touches auth or Cloudflare
-  // clearance cookies (see isPrunableCookieName). Returns the number removed.
-  async pruneTelemetryCookies() {
+  // Drop disposable cookies for the ChatGPT/OpenAI origins to keep the Cookie header small.
+  // Authentication, CSRF, and Cloudflare clearance are always retained. Per-conversation state is
+  // removed only when the caller confirms that no managed chat depends on it.
+  async pruneTelemetryCookies({ includeConversationState = false } = {}) {
     let cookies = [];
     try {
       const res = await this.client.send(
@@ -402,7 +417,7 @@ export class ChromeCdpPageAdapter {
     }
     let removed = 0;
     for (const cookie of cookies) {
-      if (!isPrunableCookieName(cookie?.name)) continue;
+      if (!isPrunableCookieName(cookie?.name, { includeConversationState })) continue;
       try {
         await this.client.send(
           'Network.deleteCookies',
@@ -426,6 +441,21 @@ export class ChromeCdpPageAdapter {
       this.sessionId
     );
     return result?.result?.value;
+  }
+
+  // Capture a PNG screenshot of the page as a Buffer (null on failure). Used by the stall
+  // inspector to record what is actually on screen at a suspected-stall moment.
+  async screenshot({ fullPage = false } = {}) {
+    try {
+      const res = await this.client.send(
+        'Page.captureScreenshot',
+        { format: 'png', captureBeyondViewport: !!fullPage },
+        this.sessionId
+      );
+      return res?.data ? Buffer.from(res.data, 'base64') : null;
+    } catch {
+      return null;
+    }
   }
 
   async getUrl() {
@@ -552,6 +582,114 @@ export class ChromeCdpPageAdapter {
     const err = new Error('missing_file_input');
     err.data = { selector: 'input[type=file]', found: lastFound };
     throw err;
+  }
+
+  // Watch ChatGPT attachment uploads at the NETWORK layer so a caller can tell a genuine
+  // in-flight (or stalled) upload apart from a file that is merely selected/chipped. A chip
+  // appears the instant the input's change event fires; the bytes travel afterward over a
+  // separate request that can stall server-side. Returns a handle with a live snapshot()
+  // ({inflight, finished, failed, oldestInflightMs, requests}) and off() to unsubscribe.
+  // onEvent, when supplied, receives compact lifecycle records ({phase, method, url, status,
+  // ageMs}) for debug logging. URLs are reduced to origin+path so signed-upload tokens in the
+  // query string are never logged.
+  watchUploads({ onEvent = null } = {}) {
+    const trimUrl = (url = '') => {
+      const s = String(url);
+      const q = s.indexOf('?');
+      return q >= 0 ? s.slice(0, q) : s;
+    };
+    // Attachment traffic: OpenAI's file-create/complete endpoints, the user-content host,
+    // and the backing blob PUT. Restrict generic /files matches to write methods so ordinary
+    // GET polling is not counted as an upload.
+    const isUpload = (url = '', method = '') => {
+      const u = String(url);
+      const m = String(method || '').toUpperCase();
+      const isWrite = m === 'POST' || m === 'PUT' || m === 'PATCH';
+      if (/\bfiles\.oaiusercontent\.com\b/i.test(u)) return true;
+      if (/blob\.core\.windows\.net/i.test(u) && (m === 'PUT' || m === 'POST')) return true;
+      if (/\/backend-a(?:pi|lt)\/(?:files|conversation\/[^/]+\/attachments)/i.test(u) && isWrite) return true;
+      if (/\/(?:files|uploads?)(?:\/|\?|$)/i.test(u) && isWrite) return true;
+      return false;
+    };
+    const requests = new Map(); // requestId -> record
+    const mine = (sessionId) => !(this.sessionId && sessionId && sessionId !== this.sessionId);
+    const emit = (rec, phase) => {
+      if (!onEvent) return;
+      try {
+        onEvent({
+          phase,
+          method: rec.method,
+          url: rec.url,
+          status: rec.status,
+          bytes: rec.bytes,
+          error: rec.error || null,
+          ageMs: (rec.endedAt || Date.now()) - rec.startedAt
+        });
+      } catch {}
+    };
+
+    const offWillSend = this.client.on('Network.requestWillBeSent', (p, sid) => {
+      if (!mine(sid)) return;
+      const url = p?.request?.url || '';
+      const method = p?.request?.method || '';
+      if (!isUpload(url, method)) return;
+      if (requests.has(p.requestId)) return; // ignore redirect re-fires on the same id
+      const rec = {
+        id: p.requestId, url: trimUrl(url), method, status: null,
+        state: 'inflight', startedAt: Date.now(), endedAt: null, bytes: 0, error: null
+      };
+      requests.set(p.requestId, rec);
+      emit(rec, 'request');
+    });
+    const offResp = this.client.on('Network.responseReceived', (p, sid) => {
+      if (!mine(sid)) return;
+      const rec = requests.get(p?.requestId);
+      if (!rec) return;
+      rec.status = Number(p?.response?.status) || null;
+      emit(rec, 'response');
+    });
+    const offFin = this.client.on('Network.loadingFinished', (p, sid) => {
+      if (!mine(sid)) return;
+      const rec = requests.get(p?.requestId);
+      if (!rec || rec.state !== 'inflight') return;
+      rec.state = 'finished';
+      rec.endedAt = Date.now();
+      rec.bytes = Number(p?.encodedDataLength) || rec.bytes;
+      emit(rec, 'finished');
+    });
+    const offFail = this.client.on('Network.loadingFailed', (p, sid) => {
+      if (!mine(sid)) return;
+      const rec = requests.get(p?.requestId);
+      if (!rec || rec.state !== 'inflight') return;
+      rec.state = p?.canceled ? 'canceled' : 'failed';
+      rec.endedAt = Date.now();
+      rec.error = p?.errorText || (p?.canceled ? 'canceled' : 'failed');
+      emit(rec, rec.state);
+    });
+
+    const snapshot = () => {
+      const now = Date.now();
+      const all = Array.from(requests.values());
+      const inflight = all.filter((r) => r.state === 'inflight');
+      return {
+        total: all.length,
+        inflight: inflight.length,
+        finished: all.filter((r) => r.state === 'finished').length,
+        failed: all.filter((r) => r.state === 'failed' || r.state === 'canceled').length,
+        oldestInflightMs: inflight.length ? now - Math.min(...inflight.map((r) => r.startedAt)) : 0,
+        requests: all.map((r) => ({
+          method: r.method, url: r.url, status: r.status, state: r.state,
+          bytes: r.bytes, ageMs: (r.endedAt || now) - r.startedAt, error: r.error
+        }))
+      };
+    };
+    let stopped = false;
+    const off = () => {
+      if (stopped) return;
+      stopped = true;
+      offWillSend(); offResp(); offFin(); offFail();
+    };
+    return { off, snapshot };
   }
 
   // ChatGPT renders generated files as clickable "entity" buttons (aria-label =
@@ -874,7 +1012,10 @@ export class ChromeCdpBrowserBackend {
       profileMode: this.profileMode,
       profileName: this.profileName,
       managedProfile: this.profileMode !== 'existing',
-      launchedByAgentify: !!this.chromeProcess
+      launchedByAgentify: !!this.chromeProcess,
+      // PID of the launched Chrome browser process (root of its process tree), so callers can
+      // monitor the browser's RAM/CPU. Null when attached to an existing browser we did not spawn.
+      chromePid: this.chromeProcess?.pid ?? null
     };
   }
 
@@ -907,8 +1048,13 @@ export class ChromeCdpBrowserBackend {
 
       const page = new ChromeCdpPageAdapter({ client: this.client, targetId, sessionId, windowId });
       await page.initialize({ userAgent: this.userAgent });
-      if (this.pruneCookiesOnOpen) await page.pruneTelemetryCookies().catch(() => {});
-      if (url && url !== 'about:blank') await page.navigate(url).catch(() => {});
+      const mayPruneConversationState = this.tabClosers.size === 0;
+      if (this.pruneCookiesOnOpen) {
+        await page.pruneTelemetryCookies({ includeConversationState: mayPruneConversationState }).catch(() => {});
+      }
+      if (url && url !== 'about:blank') {
+        await page.navigate(url, { pruneConversationStateOn431: mayPruneConversationState });
+      }
       if (show) await page.bringToFront().catch(() => {});
       else await page.minimize().catch(() => {});
 

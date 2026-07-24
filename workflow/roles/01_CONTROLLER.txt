@@ -16,9 +16,10 @@ INPUTS
 ACTIONS
 
 1. Assign one run_id and verify required inputs exist.
-2. Start Contract Auditor in preflight mode. Route genuine base-runtime findings to
-   Repair Engineer planning, Generator Engineer repair, and Contract Auditor re-audit;
-   do not abort a viable adaptation merely because target-specific placeholders are empty.
+2. Trust the base generator as-is: its soundness is verified mechanically by the orchestrator
+   (byte-hash identity) before the run, and the shared contract's BASE GENERATOR MAP records the
+   edit zone, public API, and defaults. Do not re-audit or repair the base runtime; begin adaptation
+   at the scan inventory. Do not abort merely because target-specific placeholders are empty.
 3. Enforce the workflow order in WORKFLOW.md.
 4. Give each role only the artifacts needed for its task.
 5. Reject handoffs missing status, evidence, artifact hashes, or rerun requirements.
@@ -42,7 +43,7 @@ DO NOT
 
 GATES
 
-preflight -> scan inventory -> template specification -> template QA -> reconstructed background -> background QA -> implementation -> baseline QA -> fidelity QA -> edge QA -> regression -> package -> release audit -> final audit
+scan inventory -> template specification -> template QA -> reconstructed background -> background QA -> implementation -> baseline QA -> fidelity QA -> edge QA -> regression -> package -> release audit -> final audit
 
 RETURN
 

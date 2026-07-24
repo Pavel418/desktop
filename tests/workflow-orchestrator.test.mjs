@@ -6,9 +6,17 @@ import path from 'node:path';
 
 import {
   WorkflowOrchestrator, IssueLog, PLAN, GATES, PERSISTENT_FILES,
-  parseHandoff, handoffResponseState, mergeReruns, selectFailureCode, issueRecordsFromHandoff, loadRoles,
-  EDGE_CASES, VISUAL_REVIEW_SCHEMA_VERSION, sha256File, clampRerunsToGate
+  parseHandoff, handoffResponseState, handoffValidationError, mergeReruns, selectFailureCode, issueRecordsFromHandoff, loadRoles,
+  EDGE_CASES, VISUAL_REVIEW_SCHEMA_VERSION, sha256File, clampRerunsToGate, humanizeDuration
 } from '../workflow-orchestrator.mjs';
+
+test('humanizeDuration renders ms, seconds, minutes, and hours compactly', () => {
+  assert.equal(humanizeDuration(540), '540ms');
+  assert.equal(humanizeDuration(8000), '8s');
+  assert.equal(humanizeDuration(487157), '8m 07s');
+  assert.equal(humanizeDuration(3600000), '1h 00m');
+  assert.equal(humanizeDuration(-5), '0ms');
+});
 
 // Realistic package-file contents so the orchestrator's envelope build (report cross-check +
 // manifest schema check) sees valid JSON, mirroring what generator.py actually writes.
@@ -309,7 +317,7 @@ test('selectFailureCode prefers the most-severe open issue domain code', () => {
 
 test('selectFailureCode falls back to the failing stage code', () => {
   assert.equal(selectFailureCode([], 'baseline'), 60);
-  assert.equal(selectFailureCode([], 'preflight'), 30);
+  assert.equal(selectFailureCode([], 'release'), 70);
   assert.equal(selectFailureCode([], null, 99), 99);
 });
 
@@ -333,6 +341,35 @@ test('issueRecordsFromHandoff merges compact issue IDs with complete issue recor
   assert.deepEqual(records, [
     { issue_id: 'ISSUE-1', severity: 'critical', domain: 'runtime', evidence: 'exact defect' }
   ]);
+});
+
+test('handoff validation rejects undocumented issue IDs and accepts complete issue records', () => {
+  const base = {
+    run_id: 'RUN-0001',
+    role: 'contract_auditor',
+    mode: 'preflight',
+    stage_status: 'failed',
+    recommended_status_code: 30,
+    artifacts: [{ path: '/mnt/data/preflight.json', sha256: 'a'.repeat(64) }],
+    verified_issues: [],
+    required_reruns: ['preflight'],
+    next_role: 'controller'
+  };
+  const step = { role: 'contract_auditor', mode: 'preflight', kind: 'audit' };
+  const undocumented = parseHandoff(JSON.stringify({ ...base, new_issues: ['ISSUE-1'] }), {
+    runId: 'RUN-0001', ...step
+  });
+  assert.match(handoffValidationError(undocumented, step, 'RUN-0001'), /complete object/);
+
+  const complete = parseHandoff(JSON.stringify({
+    ...base,
+    new_issues: [{
+      issue_id: 'ISSUE-1', severity: 'major', domain: 'annotation', code: 'LABEL_SCHEMA',
+      stage: 'preflight', artifact: '/mnt/data/preflight.json', evidence: 'Exact schema mismatch.',
+      owner: 'generator_engineer', required_reruns: ['preflight'], status: 'open'
+    }]
+  }), { runId: 'RUN-0001', ...step });
+  assert.equal(handoffValidationError(complete, step, 'RUN-0001'), null);
 });
 
 test('IssueLog accepts v3 handoffs that reference new issues by ID', () => {
@@ -388,7 +425,18 @@ function scriptedController(recorder, { fail = {}, severity = 'minor', domain = 
       if (failCounts[key] > 0) {
         failCounts[key] -= 1;
         stage_status = 'failed';
-        new_issues = [{ issue_id: `ISSUE-${key}`, severity, domain, code: 'X', stage: mode || role, status: 'open' }];
+        new_issues = [{
+          issue_id: `ISSUE-${key}`,
+          severity,
+          domain,
+          code: 'X',
+          stage: mode || role,
+          artifact: `/mnt/data/${key}.json`,
+          evidence: `Scripted evidence for ${key}`,
+          owner: domain === 'geometry' || domain === 'semantics' ? 'template_architect' : 'generator_engineer',
+          required_reruns: [mode || role],
+          status: 'open'
+        }];
       }
       const mayResolveAssigned =
         (role === 'generator_engineer' && mode === 'repair') ||
@@ -435,7 +483,13 @@ function scriptedController(recorder, { fail = {}, severity = 'minor', domain = 
 
 async function tmpOut() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'wf-orch-'));
-  return { root, pdf: path.join(root, 'target.pdf'), gen: path.join(root, 'generator.py'), out: path.join(root, 'out') };
+  const pdf = path.join(root, 'target.pdf');
+  const gen = path.join(root, 'generator.py');
+  // The orchestrator's base-generator identity gate reads and hashes the generator file, so it
+  // must exist on disk. Write small stand-ins for both attachments.
+  await fs.writeFile(pdf, '%PDF-1.4 test\n');
+  await fs.writeFile(gen, '# GPT TEMPLATE EDIT ZONE\n# END GPT TEMPLATE EDIT ZONE\n');
+  return { root, pdf, gen, out: path.join(root, 'out') };
 }
 
 test('run(): happy path passes every gate and returns status 0 with the 3 persistent files', async () => {
@@ -450,7 +504,7 @@ test('run(): happy path passes every gate and returns status 0 with the 3 persis
   assert.equal(res.success, true);
   for (const g of GATES) assert.ok(res.gatesPassed.includes(g), `gate ${g} should pass`);
   assert.deepEqual(res.files.map((f) => f.name).sort(), [...PERSISTENT_FILES].sort());
-  // The Controller opens the run before preflight; the plan is walked in order.
+  // The Controller opens the run; the plan is walked in order.
   assert.equal(recorder.turns[0], 'controller/start');
   assert.equal(recorder.turns.at(-1), 'controller/finalize');
   assert.ok(recorder.responseStates.length > 0);
@@ -503,8 +557,8 @@ test('run(): release and final run in a fresh isolated audit session', async () 
   assert.ok(audit.turns.includes('final_auditor'), 'final audit runs in the audit session');
   assert.ok(!maker.turns.includes('contract_auditor/release'), 'release must not run on the maker');
   assert.ok(!maker.turns.includes('final_auditor'), 'final must not run on the maker');
-  // Preflight (a contract_auditor turn) and finalize still run on the maker.
-  assert.ok(maker.turns.includes('contract_auditor/preflight'));
+  // The maker chat still starts and finalizes the run.
+  assert.equal(maker.turns[0], 'controller/start');
   assert.equal(maker.turns.at(-1), 'controller/finalize');
 
   // Exactly one audit session, opened once and closed once.
@@ -644,11 +698,14 @@ test('run(): the isolated release audit receives the structured envelope evidenc
   assert.doesNotMatch(evidence, /NOT FOUND/); // the old writer-scrape placeholders are gone
 });
 
-test('envelope constants mirror generator.py (no drift)', async () => {
+test('orchestrator envelope constants mirror generator.py without conflating the machine-review schema', async () => {
   const gen = await fs.readFile(new URL('../workflow/generator.py', import.meta.url), 'utf8');
-  const versionMatch = gen.match(/VISUAL_REVIEW_SCHEMA_VERSION\s*=\s*"([^"]+)"/);
-  assert.ok(versionMatch, 'generator.py declares VISUAL_REVIEW_SCHEMA_VERSION');
+  const versionMatch = gen.match(/ORCHESTRATOR_VISUAL_REVIEW_SCHEMA_VERSION\s*=\s*"([^"]+)"/);
+  assert.ok(versionMatch, 'generator.py declares ORCHESTRATOR_VISUAL_REVIEW_SCHEMA_VERSION');
   assert.equal(versionMatch[1], VISUAL_REVIEW_SCHEMA_VERSION);
+  const machineMatch = gen.match(/MACHINE_VISUAL_REVIEW_SCHEMA_VERSION\s*=\s*"([^"]+)"/);
+  assert.ok(machineMatch, 'generator.py declares MACHINE_VISUAL_REVIEW_SCHEMA_VERSION');
+  assert.notEqual(machineMatch[1], VISUAL_REVIEW_SCHEMA_VERSION);
   const block = gen.match(/EDGE_CASE_NAMES\s*=\s*\(([\s\S]*?)\)/);
   assert.ok(block, 'generator.py declares EDGE_CASE_NAMES');
   const names = [...block[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
@@ -751,21 +808,37 @@ test('run(): staged package publishing replaces stale persistent outputs with ex
   }
 });
 
-test('run(): a failed preflight is repaired by Generator Engineer and re-audited by Contract Auditor', async () => {
+test('run(): a base generator hash mismatch fails fast with status 20 and no model turns', async () => {
   const t = await tmpOut();
-  const recorder = { turns: [], downloads: 0 };
-  const orch = new WorkflowOrchestrator({ roles: makeRoles(), config: { perTurnTimeoutMs: 1000, maxRepairRounds: 2 } });
+  const recorder = { turns: [] };
+  const orch = new WorkflowOrchestrator({
+    roles: makeRoles(),
+    config: { perTurnTimeoutMs: 1000, expectedGeneratorSha256: 'f'.repeat(64) }
+  });
   const res = await orch.run({
     pdf: t.pdf, baseGenerator: t.gen, outDir: t.out,
-    controller: scriptedController(recorder, {
-      fail: { 'contract_auditor/preflight': 1 }, severity: 'critical', domain: 'runtime'
-    })()
+    controller: scriptedController(recorder)()
+  });
+  assert.equal(res.success, false);
+  assert.equal(res.statusCode, 20);
+  assert.equal(res.failedStage, 'generator_identity');
+  assert.equal(recorder.turns.length, 0, 'no model turns run when the base generator fails the identity gate');
+});
+
+test('run(): a matching base generator hash pin lets the run proceed', async () => {
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  const goodSha = await sha256File(t.gen);
+  const orch = new WorkflowOrchestrator({
+    roles: makeRoles(),
+    config: { perTurnTimeoutMs: 1000, expectedGeneratorSha256: goodSha }
+  });
+  const res = await orch.run({
+    pdf: t.pdf, baseGenerator: t.gen, outDir: t.out,
+    controller: scriptedController(recorder)()
   });
   assert.equal(res.success, true);
-  assert.equal(recorder.turns.filter((turn) => turn === 'contract_auditor/preflight').length, 2);
-  assert.ok(recorder.turns.includes('repair_engineer'));
-  assert.ok(recorder.turns.includes('generator_engineer/repair'));
-  assert.ok(res.gatesPassed.includes('preflight'));
+  assert.equal(recorder.turns[0], 'controller/start');
 });
 
 test('run(): template geometry repair is applied by Template Architect', async () => {
@@ -841,7 +914,6 @@ test('PLAN covers every gate exactly once and separates creation from approval',
     PLAN.map(({ role, mode }) => `${role}/${mode || '-'}`),
     [
       'controller/start',
-      'contract_auditor/preflight',
       'template_analyst/-',
       'template_architect/-',
       'qa_auditor/template',

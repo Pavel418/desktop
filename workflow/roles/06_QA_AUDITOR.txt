@@ -18,14 +18,20 @@ TEMPLATE MODE
 
 Compare master_overlay.png with the source scan. Verify:
 
-- complete table extents and correct table splitting
+- complete table extents and correct table splitting; each table bbox is tight to its gridlines and
+  does not enclose page margin, outer border, or border preprint text
 - every visible row/column boundary and merged cell
 - no cell gaps or overlaps
-- every writable region has exactly one field
+- every writable region has exactly one field, and no field boundary overlaps a static-text bbox
 - field-to-cell/container correctness
 - no field covers printed labels or wrong cells
-- complete static-text inventory and explicit cell assignments
-- top-level rotated text and semantic images
+- complete static-text inventory with glyph-tight bboxes and explicit cell assignments; adjacent
+  same-region lines in different languages have separate tight bboxes
+- each field's canonical binding matches its printed-label meaning (flag guessed roles, e.g.
+  remarks bound to certification, consignor bound to exporter, unlabeled code bound to customs)
+- top-level rotated text and semantic images lie fully outside every table. Margin/border preprint
+  text classified as excluded_background is preserved background — do not require it as a top-level
+  region or static-text line; confirm its pixels are preserved rather than flagging it uncovered
 - field keys, cell keys, reconstruction masks, anchors, and baseline groups
 
 BACKGROUND MODE

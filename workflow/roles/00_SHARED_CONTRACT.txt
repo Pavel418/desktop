@@ -30,6 +30,27 @@ ARCHITECTURE
 - PDF output is supported and disabled by default.
 - Rendering and labels must be deterministic for identical input, seed, DPI, and placement profile.
 
+BASE GENERATOR MAP
+
+The attached generator.py is the fixed, known-good base runtime. Its soundness has already been
+verified mechanically (byte-hash identity) before this run; do NOT re-audit, re-validate, compile-check,
+or "repair" the base runtime, and do not open issues about it. Treat these as established facts:
+
+- The ONLY region you may modify is delimited by the markers `# GPT TEMPLATE EDIT ZONE` and
+  `# END GPT TEMPLATE EDIT ZONE`. Everything outside those markers is stable and off-limits unless a
+  documented, reproduced runtime defect forces the smallest possible change.
+- These public functions exist and MUST be preserved (names, signatures, defaults):
+  get_canonical_schema, get_generator_manifest, get_available_fields, assess_compatibility,
+  propose_missing_values, resolve_record, validate_record, render_document,
+  validate_output_contract, generate_edge_cases, self_test, audit_generator.
+- output_pdf defaults to false. The scanned PDF remains an input to render_document(). PDF output is
+  supported and disabled by default.
+- The base runtime contains no OCR, PDF-text-extraction, hidden-text, or artificial-degradation paths.
+- Target-specific edit-zone placeholders, an empty template catalog, and a document-family mismatch
+  are EXPECTED adaptation work, not defects.
+
+Your job is to adapt the EDIT ZONE to the selected page — not to inspect or certify the base runtime.
+
 FIDELITY
 
 - Use hybrid reconstruction: preserve reliable pixels and reconstruct only approved affected regions.
@@ -50,6 +71,12 @@ TEXT AND LABEL TRUTH
 - Do not use fuzzy label deduplication.
 - A visible text line without its required label is a failure.
 - A label without visible text is a failure.
+- Exception: margin/border preprint text (rotated frame strings, printer/edition/serial codes lying
+  outside the form's tables and fields) is preserved background — its pixels are kept unchanged, but
+  it is not a catalogued static-text line or a top-level text region and is exempt from the label and
+  table-separation requirements. Never place a top-level text region or table bbox so that they
+  overlap: a top-level region must lie fully outside every table (the runtime enforces this with zero
+  tolerance), so draw table bboxes tight to their gridlines and exclude border preprint accordingly.
 
 APPROVAL SEPARATION
 
@@ -103,7 +130,22 @@ Return only evidence and decisions, not hidden reasoning:
   "stage_status": "passed|failed|blocked|ready_for_review",
   "recommended_status_code": null,
   "artifacts": [{"path": "...", "sha256": "..."}],
-  "new_issues": ["ISSUE-0001"],
+  "new_issues": [{
+    "issue_id": "ISSUE-0001",
+    "severity": "major",
+    "domain": "annotation",
+    "code": "MISSING_VISIBLE_TEXT_LABEL",
+    "stage": "baseline_label_audit",
+    "artifact": "temporary/stress/document.png",
+    "field": null,
+    "table": "cmr_form",
+    "cell": "box_16",
+    "bbox": [0, 0, 0, 0],
+    "evidence": "One visible line has no table text-bbox item.",
+    "owner": "repair_engineer",
+    "required_reruns": ["baseline", "table_text_bbox", "visible_text_coverage"],
+    "status": "open"
+  }],
   "verified_issues": [],
   "required_reruns": [],
   "next_role": "controller"
@@ -119,6 +161,16 @@ For the qa_auditor edge mode ONLY, also include exactly 17 per-case decisions:
   ]
 
 VISUAL-REVIEW ENVELOPE
+
+Two deliberately different hash-bound envelopes exist and MUST have different schema identities:
+
+- generator.py validates the pre-package in-sandbox machine-review envelope
+  (`synthetic-document-machine-visual-review/1.0`) against its temporary audit artifacts;
+- after packaging, the mechanical orchestrator builds the authoritative release envelope below
+  (`synthetic-document-visual-review/1.2`) using six QA gates and verified package hashes.
+
+The generator cannot validate the release envelope because generator_report.json must already exist
+before the orchestrator can hash the package. Do not report their different fields as schema drift.
 
 The orchestrator (mechanical Controller) assembles this envelope from the independent QA reviews and
 verifies it before the release decision. Roles do not hand it back; they supply its inputs (passing QA
@@ -144,6 +196,9 @@ hashes are model-claimed and labeled as such.
 ISSUE RECORD
 
 Each defect must identify one root cause and evidence:
+
+Every entry in new_issues must be the complete issue object below. Never return only
+an issue ID; incomplete issue records are rejected at the orchestration boundary.
 
 {
   "issue_id": "ISSUE-0001",

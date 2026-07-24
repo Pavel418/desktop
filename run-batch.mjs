@@ -29,7 +29,8 @@ import { format } from 'node:util';
 import { ChromeCdpBrowserBackend } from './chrome-cdp-backend.mjs';
 import { ATTACHMENT_RUNTIME_REVISION, ChatGPTController } from './chatgpt-controller.mjs';
 import { defaultStateDir } from './state.mjs';
-import { WorkflowOrchestrator, loadRoles } from './workflow-orchestrator.mjs';
+import { WorkflowOrchestrator, loadRoles, humanizeDuration } from './workflow-orchestrator.mjs';
+import { ResourceMonitor } from './resource-monitor.mjs';
 import {
   resolveChromeExecutablePath,
   resolveChromeDebugPort,
@@ -212,10 +213,10 @@ const DEFAULT_WORKFLOW_CONFIG = {
 };
 
 export async function processEntry({
-  entry, backend, selectors, stateDir, show, timeoutMs, debug = false,
+  entry, backend, monitor = null, selectors, stateDir, show, timeoutMs, debug = false,
   chatUrl = 'https://chatgpt.com/', newChat = true,
   workflowConfig = DEFAULT_WORKFLOW_CONFIG, makeController = defaultMakeController,
-  independentAudit = true
+  independentAudit = true, stallInspect = null
 }) {
   const summary = { name: entry.name, pdfs: [], aborted: false };
   const pdfs = await selectPdfs(entry);
@@ -239,11 +240,14 @@ export async function processEntry({
       ? path.join(entry.outDir, group)
       : path.join(entry.outDir, `${String(i + 1).padStart(2, '0')}-${stem}`);
     const record = { pdf: path.basename(pdf), group, files: [], error: null, status: null, attempts: 0, gatesPassed: [] };
+    const fileStarted = Date.now();
+    log(`\n───── ${labelBase} ─────${monitor ? `  (${monitor.format()})` : ''}`);
 
     let resolved = false;
     for (let attempt = 0; attempt <= maxRetry && !resolved; attempt++) {
       record.attempts = attempt + 1;
       const label = `${labelBase}${attempt > 0 ? ` [retry ${attempt}/${maxRetry}]` : ''}`;
+      const attemptStarted = Date.now();
       let session = null;
       // The isolated audit session (for the independent release/final decision) is opened
       // lazily by the orchestrator via this factory, and closed in the finally below.
@@ -255,6 +259,7 @@ export async function processEntry({
           page: session.page,
           selectors,
           stateDir,
+          stallInspect,
           onDebug: debug ? (msg) => log(`[${label}] · ${msg}`) : null,
           onBlocked: (st) =>
             log(`[${label}] ⚠ ChatGPT needs attention (${st?.kind || 'blocked'}) — complete it in the Chrome window; waiting…`),
@@ -269,6 +274,7 @@ export async function processEntry({
             page: s.page,
             selectors,
             stateDir,
+            stallInspect,
             onDebug: debug ? (msg) => log(`[${label}] · (audit) ${msg}`) : null,
             onBlocked: (st) =>
               log(`[${label}] ⚠ (audit) ChatGPT needs attention (${st?.kind || 'blocked'}) — complete it in the Chrome window; waiting…`),
@@ -299,11 +305,18 @@ export async function processEntry({
         record.files = res.files.map((f) => f.path);
 
         // Persist the transcript and issue log (temporary chats aren't saved by ChatGPT).
+        // Suffix retries so a later attempt never overwrites an earlier attempt's transcript —
+        // the earlier (often longer) run is exactly what a post-mortem needs.
         await fs.mkdir(iterOut, { recursive: true });
-        await fs.writeFile(path.join(iterOut, `${stem}.response.txt`), renderTranscript(res.transcript));
-        await fs.writeFile(path.join(iterOut, `${stem}.issues.json`), JSON.stringify(res.issues, null, 2));
+        const attemptSuffix = attempt > 0 ? `.attempt${attempt + 1}` : '';
+        await fs.writeFile(path.join(iterOut, `${stem}${attemptSuffix}.response.txt`), renderTranscript(res.transcript));
+        await fs.writeFile(path.join(iterOut, `${stem}${attemptSuffix}.issues.json`), JSON.stringify(res.issues, null, 2));
 
-        log(`[${label}] status ${res.statusCode} | gates: ${res.gatesPassed.join('→') || 'none'} | ${res.files.length} file(s)`);
+        log(
+          `[${label}] status ${res.statusCode} | gates: ${res.gatesPassed.join('→') || 'none'} | ` +
+          `${res.files.length} file(s) | took ${humanizeDuration(Date.now() - attemptStarted)}` +
+          `${monitor ? ` | ${monitor.format()}` : ''}`
+        );
 
         if (res.success) {
           if (res.files.length === 0) log(`[${label}] ⚠ success status but no persistent files captured`);
@@ -327,6 +340,8 @@ export async function processEntry({
       }
     }
 
+    record.durationMs = Date.now() - fileStarted;
+    log(`[${labelBase}] ⏱ file total ${humanizeDuration(record.durationMs)} over ${record.attempts} attempt(s)`);
     summary.pdfs.push(record);
   }
 
@@ -361,6 +376,12 @@ async function main() {
   }
 
   const debug = argFlag('--debug') || config.debug === true;
+  // Stall-inspection debug mode: on a near-empty idle-fallback, dump the DOM truth + screenshots
+  // and HOLD instead of reacting, so we can see whether the reply is genuinely empty or misread.
+  // Enable with --stall-inspect or "stallInspect": true (holdMs/intervalMs optionally configurable).
+  const stallInspect = (argFlag('--stall-inspect') || config.stallInspect === true)
+    ? { enabled: true, holdMs: Number(config.stallInspectHoldMs) || undefined, intervalMs: Number(config.stallInspectIntervalMs) || undefined }
+    : null;
   // Temporary chats are never in a project, aren't saved to history, and start fresh.
   const temporaryChat = argFlag('--regular-chat') ? false : config.temporaryChat !== false;
   const chatUrl = temporaryChat ? 'https://chatgpt.com/?temporary-chat=true' : 'https://chatgpt.com/';
@@ -410,13 +431,22 @@ async function main() {
   log(`Persistent log: ${activeRunLogPath}`);
   log(`Entries: ${entries.length} | parallel: ${concurrency} | timeout: ${timeoutMs}ms | window: ${show ? 'visible' : 'hidden'} | chat: ${temporaryChat ? 'temporary' : 'regular'}${debug ? ' | debug: ON' : ''}`);
   log(`Workflow: maxRepairRounds=${workflowConfig.maxRepairRounds} | maxRetry=${workflowConfig.maxRetry} | successCode=${workflowConfig.successCode} | release/final audit: ${independentAudit ? 'isolated session' : 'shared chat'}`);
+  if (stallInspect) log(`⏸ STALL INSPECT MODE ON — a near-empty idle-fallback will dump DOM+screenshots and HOLD instead of reacting (kill the run when done inspecting).`);
   log('Starting Chrome…');
-  await backend.start();
+  const chromeState = await backend.start();
+  const chromePid = chromeState?.chromePid ?? null;
 
+  // Sample RAM/CPU of the script and the whole Chrome process tree throughout the run.
+  const resourceIntervalMs = Number(config.resourceSampleMs) || 15_000;
+  const monitor = new ResourceMonitor({ chromePid, log, intervalMs: resourceIntervalMs });
+  log(`Resource monitor: chrome pid=${chromePid ?? 'n/a'} | sampling every ${Math.round(resourceIntervalMs / 1000)}s | ${monitor.cores} CPU core(s)`);
+  monitor.start();
+
+  const runStarted = Date.now();
   let summaries;
   try {
     summaries = await runPool(entries, concurrency, (entry) =>
-      processEntry({ entry, backend, selectors, stateDir, show, timeoutMs, debug, chatUrl, newChat, workflowConfig, independentAudit }).catch((err) => ({
+      processEntry({ entry, backend, monitor, selectors, stateDir, show, timeoutMs, debug, chatUrl, newChat, workflowConfig, independentAudit, stallInspect }).catch((err) => ({
         name: entry.name,
         pdfs: [],
         aborted: true,
@@ -424,8 +454,10 @@ async function main() {
       }))
     );
   } finally {
+    await monitor.stop().catch(() => {});
     await backend.dispose().catch(() => {});
   }
+  log(`Total wall-clock: ${humanizeDuration(Date.now() - runStarted)}`);
 
   // ---- Summary ----
   log('\n===== SUMMARY =====');
@@ -440,7 +472,8 @@ async function main() {
       const st = p.status != null ? `status ${p.status}` : 'no status';
       const attempts = p.attempts > 1 ? `, ${p.attempts} attempts` : '';
       const gates = p.gatesPassed && p.gatesPassed.length ? `, gates ${p.gatesPassed.join('→')}` : '';
-      log(`    ${p.error ? '✗' : '✓'} ${p.group || p.pdf} (${p.pdf}): ${st}${attempts}${gates}${p.error ? ` — ${p.error}` : ` — ${p.files.length} file(s)`}`);
+      const took = p.durationMs ? `, ${humanizeDuration(p.durationMs)}` : '';
+      log(`    ${p.error ? '✗' : '✓'} ${p.group || p.pdf} (${p.pdf}): ${st}${attempts}${gates}${took}${p.error ? ` — ${p.error}` : ` — ${p.files.length} file(s)`}`);
     }
     if (errCount > 0 || s.aborted || s.fatal) hadError = true;
   }

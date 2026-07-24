@@ -120,6 +120,9 @@ class StaticTextSpec:
     """One manually transcribed static text line in BASE_SIZE pixel coordinates."""
     text: str
     bbox: tuple[int, int, int, int]
+    table_id: str = ""
+    cell_id: str = ""
+    reading_order: int = -1
     angle: Literal[0, 90, 180, 270] = 0
     source: Literal["manual", "ocr_verified"] = "manual"
 
@@ -149,6 +152,7 @@ STATUS_CODES: dict[int, str] = {
 }
 OTSL_TOKENS = ("<fcel>", "<ecel>", "<lcel>", "<ucel>", "<xcel>", "<nl>")
 OTSL_TOKEN_RE = re.compile("(" + "|".join(map(re.escape, OTSL_TOKENS)) + ")")
+TABLE_TEXT_BBOX_FIELDS = ("text", "bbox", "table_id", "cell_id", "angle", "reading_order")
 
 
 def F(
@@ -190,10 +194,21 @@ def S(
     text: str,
     bbox: tuple[int, int, int, int],
     *,
+    table_id: str = "",
+    cell_id: str = "",
+    reading_order: int = -1,
     angle: Literal[0, 90, 180, 270] = 0,
     source: Literal["manual", "ocr_verified"] = "manual",
 ) -> StaticTextSpec:
-    return StaticTextSpec(text=text, bbox=bbox, angle=angle, source=source)
+    return StaticTextSpec(
+        text=text,
+        bbox=bbox,
+        table_id=table_id,
+        cell_id=cell_id,
+        reading_order=reading_order,
+        angle=angle,
+        source=source,
+    )
 
 
 def E(
@@ -767,36 +782,6 @@ def _text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFo
     return box[2] - box[0]
 
 
-def _wrap(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int, max_lines: int) -> list[str] | None:
-    text = str(text).strip()
-    if not text:
-        return [""]
-    words = text.split()
-    lines: list[str] = []
-    current = ""
-    for word in words:
-        candidate = word if not current else f"{current} {word}"
-        if _text_width(draw, candidate, font) <= max_width:
-            current = candidate
-            continue
-        if current:
-            lines.append(current)
-            current = ""
-        token = word
-        while token and _text_width(draw, token, font) > max_width:
-            cut = len(token)
-            while cut > 1 and _text_width(draw, token[:cut], font) > max_width:
-                cut -= 1
-            lines.append(token[:cut])
-            token = token[cut:]
-            if len(lines) > max_lines:
-                return None
-        current = token
-    if current or not lines:
-        lines.append(current)
-    return lines if len(lines) <= max_lines else None
-
-
 def _scale_box(box: tuple[int, int, int, int], sx: float, sy: float) -> tuple[int, int, int, int]:
     return tuple(int(round(v * (sx if index % 2 == 0 else sy))) for index, v in enumerate(box))  # type: ignore[return-value]
 
@@ -885,16 +870,31 @@ def _synthetic_value(spec: FieldSpec, seed: int, scenario: str) -> str:
     """Deterministic fallback for tests. The orchestrator should normally fill proposals once."""
     rng = _field_rng(seed, spec.canonical_key)
     token = rng.randint(1000, 999999)
-    templates: dict[str, str] = {
-        "identifier": f"ID-{token}", "code": f"C{token % 100000}",
-        "country": f"Testland-{token % 97}", "date": f"{1 + token % 28:02d}.{1 + token % 12:02d}.{2020 + token % 15}",
-        "time": f"{token % 24:02d}:{token % 60:02d}", "integer": str(1 + token % 999),
-        "uri": f"https://example-{token}.test", "measurement": f"{1 + token % 9999} kg",
-        "money": f"{token % 100000}.{token % 100:02d}", "currency": "USD",
-        "address": f"{1 + token % 999} Synthetic Street, Test City", "text": f"{scenario.upper()} VALUE {token}",
-        "boolean": "true",
+    candidates: dict[str, tuple[str, ...]] = {
+        "identifier": (f"ID-{token}", f"I{token}"),
+        "code": (f"C{token % 100000}", f"C{token % 1000}"),
+        "country": (f"Testland-{token % 97}", "Testland"),
+        "date": (f"{1 + token % 28:02d}.{1 + token % 12:02d}.{2020 + token % 15}",),
+        "time": (f"{token % 24:02d}:{token % 60:02d}",),
+        "integer": (str(1 + token % 999), "1"),
+        "uri": (f"https://example-{token}.test", "https://example.test"),
+        "measurement": (f"{1 + token % 9999} kg", "1 kg"),
+        "money": (f"{token % 100000}.{token % 100:02d}", "1.00"),
+        "currency": ("USD",),
+        "address": (f"{1 + token % 999} Synthetic Street, Test City", "1 Test Street"),
+        "text": (f"{scenario.upper()} VALUE {token}", f"VALUE {token}"),
+        "boolean": ("true",),
     }
-    return templates[spec.semantic_type][:spec.max_chars]
+    for candidate in candidates[spec.semantic_type]:
+        if len(candidate) <= spec.max_chars:
+            return candidate
+    raise GeneratorError(
+        30,
+        "SYNTHETIC_VALUE_CANNOT_SATISFY_MAX_CHARS",
+        "record_resolution",
+        f"{spec.local_key}: no complete {spec.semantic_type} value satisfies max_chars={spec.max_chars}",
+        field=spec.local_key,
+    )
 
 
 def _resolve_one_field(
@@ -1088,6 +1088,7 @@ def propose_missing_values(
             continue
         proposal = by_key.setdefault(spec.canonical_key, {
             "canonical_key": spec.canonical_key,
+            "resolution_kind": spec.missing_policy,
             "semantic_type": spec.semantic_type,
             "presence": spec.presence,
             "max_chars": spec.max_chars,
@@ -1096,6 +1097,14 @@ def propose_missing_values(
             "source_candidates": list(spec.source_candidates),
             "derived_from": list(spec.derived_from),
         })
+        if proposal["resolution_kind"] != spec.missing_policy:
+            raise GeneratorError(
+                30,
+                "AMBIGUOUS_PROPOSAL_RESOLUTION_KIND",
+                "compatibility",
+                f"{spec.canonical_key}: aliases disagree on missing-value resolution kind",
+                field=spec.local_key,
+            )
         proposal["used_by"].append(spec.local_key)
         proposal["max_chars"] = min(proposal["max_chars"], spec.max_chars)
         if include_suggestions and spec.missing_policy == "synthesize":
@@ -1121,15 +1130,6 @@ def _bbox_overlap(a: list[int], b: list[int]) -> int:
 
 def _bbox_area(box: Sequence[float]) -> float:
     return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
-
-
-def _cover_ratio(inner: Sequence[float], outer: Sequence[float]) -> float:
-    area = _bbox_area(inner)
-    return 0.0 if area <= 0 else _bbox_overlap([int(v) for v in inner], [int(v) for v in outer]) / area
-
-
-def _union_boxes(boxes: Sequence[Sequence[float]]) -> list[float]:
-    return [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
 
 
 def _to_1000(box: Sequence[float], width: int, height: int) -> list[int]:
@@ -1166,24 +1166,6 @@ def _write_text_atomic(path: Path, text: str) -> None:
 
 
 
-def _extract_manual_static_text(image_size: tuple[int, int]) -> list[dict[str, Any]]:
-    width, height = image_size
-    sx, sy = width / BASE_SIZE[0], height / BASE_SIZE[1]
-    output: list[dict[str, Any]] = []
-    for item in STATIC_TEXT_CATALOG:
-        if not item.text.strip():
-            continue
-        output.append({
-            "text": " ".join(item.text.split()),
-            "bbox_px": [float(v) for v in _scale_box(item.bbox, sx, sy)],
-            "source": "manual_static",
-            "angle": item.angle,
-        })
-    return output
-
-
-
-
 def _generated_text_lines(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for field in annotations:
@@ -1194,35 +1176,39 @@ def _generated_text_lines(annotations: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _deduplicate_text_items(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove duplicate text layers, preferring generated text and PDF text over raster fallbacks."""
-    priority = {"generated": 0, "manual_static": 1, "pdf_text": 2, "raster_text": 3}
-    ordered = sorted(items, key=lambda item: (priority.get(item.get("source", ""), 9), item["bbox_px"][1], item["bbox_px"][0]))
+    """Remove exact same-source records without suppressing similar visible lines."""
+    def identity(item: Mapping[str, Any]) -> tuple[Any, ...]:
+        source_identity = (
+            item.get("local_key")
+            or item.get("static_id")
+            or item.get("source_id")
+            or item.get("source")
+            or "unknown"
+        )
+        return (
+            str(item.get("source", "")),
+            str(source_identity),
+            " ".join(str(item.get("text", "")).split()),
+            tuple(round(float(value), 6) for value in item.get("bbox_px", ())),
+            int(item.get("angle", 0)),
+        )
+
+    ordered = sorted(
+        items,
+        key=lambda item: (
+            item["bbox_px"][1], item["bbox_px"][0], item["bbox_px"][3], item["bbox_px"][2],
+            str(item.get("text", "")), str(item.get("source", "")),
+        ),
+    )
     kept: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
     for item in ordered:
-        text = " ".join(item["text"].lower().split())
-        box = item["bbox_px"]
-        duplicate = False
-        for existing in kept:
-            other_text = " ".join(existing["text"].lower().split())
-            other_box = existing["bbox_px"]
-            overlap = _bbox_overlap([int(v) for v in box], [int(v) for v in other_box])
-            if overlap <= 0:
-                continue
-            smaller = min(_bbox_area(box), _bbox_area(other_box))
-            text_related = text == other_text or (len(text) >= 4 and text in other_text) or (len(other_text) >= 4 and other_text in text)
-            if smaller > 0 and overlap / smaller >= 0.65 and text_related:
-                duplicate = True
-                break
-            # A raster fallback often contains several PDF text lines in one large box.
-            cx = (other_box[0] + other_box[2]) / 2.0
-            cy = (other_box[1] + other_box[3]) / 2.0
-            shared_words = set(text.split()) & set(other_text.split())
-            if item.get("source") == "raster_text" and box[0] <= cx <= box[2] and box[1] <= cy <= box[3] and shared_words:
-                duplicate = True
-                break
-        if not duplicate:
-            kept.append(item)
-    return sorted(kept, key=lambda item: (item["bbox_px"][1], item["bbox_px"][0], item["text"]))
+        key = identity(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(item)
+    return kept
 
 
 def _clean_cell_text(text: str) -> str:
@@ -1282,37 +1268,6 @@ EDGE_STRESS_KEYS = {
 }
 
 
-def _fast_stress_text(spec: FieldSpec, token: str, width_factor: float) -> str:
-    usable_width = max(1, spec.bbox[2] - spec.bbox[0] - 2 * spec.padding)
-    chars_per_line = max(1, int(usable_width / max(1.0, spec.font_size * width_factor)))
-    target = min(spec.max_chars, max(1, int(chars_per_line * spec.max_lines * 0.78)))
-    return (token * ((target // len(token)) + 1))[:target]
-
-
-def _edge_record(profile: str) -> dict[str, Any]:
-    local = make_weird_data()
-    profiles = {
-        "wide_exact_fit": ("W", 0.95), "unbroken_tokens": ("ZX9_", 0.62),
-        "multilingual_punctuation": ("ΩЖĄéß№42/", 1.20),
-    }
-    if profile in profiles:
-        token, factor = profiles[profile]
-        for spec in FIELD_CATALOG:
-            if spec.local_key in EDGE_STRESS_KEYS:
-                local[spec.local_key] = _fast_stress_text(spec, token, factor)
-    elif profile == "dense_multiline":
-        for spec in FIELD_CATALOG:
-            if spec.local_key in EDGE_STRESS_KEYS and spec.max_lines > 1:
-                local[spec.local_key] = _fast_stress_text(spec, "WEIRD WORD ", 0.62)
-    elif profile != "baseline":
-        raise ValueError(f"Unknown edge profile={profile}")
-    specs = {spec.local_key: spec for spec in FIELD_CATALOG}
-    return {specs[key].canonical_key: value for key, value in local.items()}
-
-
-
-
-
 # =============================================================================
 # AGENTIC AUDIT HARDENING LAYER
 #
@@ -1333,7 +1288,8 @@ try:
 except Exception:  # Optional. Pillow fallback remains available.
     TTFont = None  # type: ignore[assignment]
 
-VISUAL_REVIEW_SCHEMA_VERSION = "synthetic-document-visual-review/1.2"
+MACHINE_VISUAL_REVIEW_SCHEMA_VERSION = "synthetic-document-machine-visual-review/1.0"
+ORCHESTRATOR_VISUAL_REVIEW_SCHEMA_VERSION = "synthetic-document-visual-review/1.2"
 VISUAL_REVIEW_REQUIRED_CHECKS = (
     "template_geometry",
     "background_reconstruction",
@@ -1496,9 +1452,29 @@ def _verify_template_lock(source_pdf: Path) -> None:
             "self_test",
             "TEMPLATE_PIXEL_SHA256 must contain the approved selected-page rendered-pixel hash.",
         )
-    reference = _render_pdf_page(source_pdf, BASE_DPI).convert("RGB")
+    try:
+        reference = _render_pdf_page(source_pdf, BASE_DPI).convert("RGB")
+    except FileNotFoundError as exc:
+        raise GeneratorError(
+            10,
+            "SOURCE_PDF_NOT_FOUND",
+            "input_validation",
+            f"Source PDF does not exist: {source_pdf}",
+        ) from exc
+    except Exception as exc:
+        raise GeneratorError(
+            10,
+            "SOURCE_PDF_INVALID",
+            "input_validation",
+            f"Source PDF cannot be rendered at page index {SOURCE_PAGE_INDEX}: {exc}",
+        ) from exc
     if reference.size != BASE_SIZE:
-        reference = reference.resize(BASE_SIZE, Image.Resampling.LANCZOS)
+        raise GeneratorError(
+            10,
+            "TEMPLATE_REFERENCE_SIZE_MISMATCH",
+            "input_validation",
+            f"Selected page rendered at {reference.size}, expected exact reference size {BASE_SIZE} at {BASE_DPI} DPI.",
+        )
     actual = _rendered_pixel_sha256(reference)
     if actual.lower() != TEMPLATE_PIXEL_SHA256.lower():
         raise GeneratorError(
@@ -1649,10 +1625,6 @@ def _effective_field(spec: FieldSpec) -> dict[str, Any]:
 
 def _field_spec_map() -> dict[str, FieldSpec]:
     return {spec.local_key: spec for spec in FIELD_CATALOG}
-
-
-def _effective_map() -> dict[str, dict[str, Any]]:
-    return {spec.local_key: _effective_field(spec) for spec in FIELD_CATALOG}
 
 
 def _box_inside(inner: Sequence[int | float], outer: Sequence[int | float]) -> bool:
@@ -2114,6 +2086,9 @@ def _manual_static_text(image_size: tuple[int, int]) -> list[dict[str, Any]]:
             "source": "manual_static",
             "angle": item.angle,
             "static_id": f"static_{index:04d}",
+            "table_id": item.table_id,
+            "cell_id": item.cell_id,
+            "reading_order": item.reading_order,
         })
     return items
 
@@ -2272,31 +2247,104 @@ def validate_otsl(otsl: str) -> dict[str, Any]:
     return {"valid": True, "rows": len(rows), "columns": width, "token_count": sum(len(row) for row in rows)}
 
 
+def _build_table_text_payload(
+    table: TableSpec,
+    cells: Sequence[CellSpec],
+    items: Sequence[Mapping[str, Any]],
+    image_size: tuple[int, int],
+) -> list[dict[str, Any]]:
+    """Serialize table text with explicit table/cell identity and deterministic order."""
+    width, height = image_size
+    sx, sy = width / BASE_SIZE[0], height / BASE_SIZE[1]
+    ordered = sorted(
+        items,
+        key=lambda item: (
+            item["bbox_px"][1], item["bbox_px"][0], item["bbox_px"][3], item["bbox_px"][2],
+            str(item.get("text", "")), str(item.get("source", "")),
+        ),
+    )
+    next_order: dict[str, int] = defaultdict(int)
+    for item in ordered:
+        cell_id = str(item.get("cell_id", ""))
+        reading_order = item.get("reading_order")
+        if cell_id and isinstance(reading_order, int) and not isinstance(reading_order, bool) and reading_order >= 0:
+            next_order[cell_id] = max(next_order[cell_id], reading_order + 1)
+
+    payload: list[dict[str, Any]] = []
+    for item in ordered:
+        if not str(item.get("text", "")).strip():
+            continue
+        box_px = item["bbox_px"]
+        cell_id = str(item.get("cell_id", ""))
+        if not cell_id:
+            containing = [cell for cell in cells if _box_inside(box_px, _scale_box(cell.bbox, sx, sy))]
+            containing.sort(key=lambda cell: (_bbox_area(cell.bbox), cell.row, cell.column, cell.cell_id))
+            cell_id = containing[0].cell_id if containing else ""
+        reading_order = item.get("reading_order")
+        if not isinstance(reading_order, int) or isinstance(reading_order, bool) or reading_order < 0:
+            reading_order = next_order[cell_id]
+            next_order[cell_id] += 1
+        payload.append({
+            "text": str(item["text"]),
+            "bbox": _to_1000(box_px, width, height),
+            "table_id": str(item.get("table_id") or table.table_id),
+            "cell_id": cell_id,
+            "angle": int(item.get("angle", 0)),
+            "reading_order": reading_order,
+        })
+    payload.sort(key=lambda item: (item["bbox"][1], item["bbox"][0], item["bbox"][3], item["bbox"][2], item["text"]))
+    return payload
+
+
 def _validate_table_text_payload(payload: Any, table_index: int) -> list[dict[str, Any]]:
     artifact = f"labels/tables/table_{table_index:03d}.text_bbox.json"
     errors: list[dict[str, Any]] = []
     if not isinstance(payload, list):
         return [_error("TABLE_TEXT_BBOX_SCHEMA", "table_text_bbox_validation", "Table text-bbox output must be an array", artifact=artifact)]
-    table_box = _to_1000(TABLE_CATALOG[table_index].bbox, BASE_SIZE[0], BASE_SIZE[1])
+    table = TABLE_CATALOG[table_index]
+    table_box = _to_1000(table.bbox, BASE_SIZE[0], BASE_SIZE[1])
+    cells = {cell.cell_id: cell for cell in make_table_cells().get(table.table_id, ())}
     previous: tuple[Any, ...] | None = None
-    seen: set[tuple[str, tuple[int, int, int, int]]] = set()
+    seen: set[tuple[Any, ...]] = set()
+    seen_orders: set[tuple[str, int]] = set()
     for item in payload:
-        if not isinstance(item, dict) or set(item) != {"text", "bbox"}:
+        if not isinstance(item, dict) or set(item) != set(TABLE_TEXT_BBOX_FIELDS):
             errors.append(_error("TABLE_TEXT_BBOX_SCHEMA", "table_text_bbox_validation", "Invalid table text-bbox item schema", artifact=artifact))
             continue
         text = item["text"]
         box = item["bbox"]
+        table_id = item["table_id"]
+        cell_id = item["cell_id"]
+        angle = item["angle"]
+        reading_order = item["reading_order"]
         if not isinstance(text, str) or not text.strip():
             errors.append(_error("TABLE_TEXT_BBOX_EMPTY", "table_text_bbox_validation", "Table text-bbox item has empty text", artifact=artifact))
+        if table_id != table.table_id:
+            errors.append(_error("TABLE_TEXT_BBOX_TABLE_ID", "table_text_bbox_validation", f"Expected table_id={table.table_id!r}, got {table_id!r}", artifact=artifact))
+        if not isinstance(cell_id, str) or cell_id not in cells:
+            errors.append(_error("TABLE_TEXT_BBOX_CELL_ID", "table_text_bbox_validation", f"Unknown cell_id={cell_id!r}", artifact=artifact))
+        if not isinstance(angle, int) or isinstance(angle, bool) or angle not in {0, 90, 180, 270}:
+            errors.append(_error("TABLE_TEXT_BBOX_ANGLE", "table_text_bbox_validation", f"Invalid angle={angle!r}", artifact=artifact))
+        if not isinstance(reading_order, int) or isinstance(reading_order, bool) or reading_order < 0:
+            errors.append(_error("TABLE_TEXT_BBOX_READING_ORDER", "table_text_bbox_validation", f"Invalid reading_order={reading_order!r}", artifact=artifact))
         if not isinstance(box, list) or len(box) != 4 or not all(isinstance(value, int) for value in box) or not (0 <= box[0] < box[2] <= 1000 and 0 <= box[1] < box[3] <= 1000):
             errors.append(_error("INVALID_BBOX", "table_text_bbox_validation", "Invalid table text bbox", artifact=artifact))
             continue
         if not _box_inside(box, table_box):
             errors.append(_error("TABLE_TEXT_BBOX_OUTSIDE_TABLE", "table_text_bbox_validation", "Table text bbox lies outside its table", artifact=artifact))
-        identity = (text, tuple(box))
+        if isinstance(cell_id, str) and cell_id in cells:
+            cell_box = _to_1000(cells[cell_id].bbox, BASE_SIZE[0], BASE_SIZE[1])
+            if not _box_inside(box, cell_box):
+                errors.append(_error("TABLE_TEXT_BBOX_OUTSIDE_CELL", "table_text_bbox_validation", f"Text bbox lies outside cell_id={cell_id!r}", artifact=artifact))
+        identity = (table_id, cell_id, reading_order, text, tuple(box), angle)
         if identity in seen:
             errors.append(_error("TABLE_TEXT_BBOX_DUPLICATE", "table_text_bbox_validation", "Duplicate table text line", artifact=artifact))
         seen.add(identity)
+        if isinstance(cell_id, str) and isinstance(reading_order, int) and not isinstance(reading_order, bool):
+            order_identity = (cell_id, reading_order)
+            if order_identity in seen_orders:
+                errors.append(_error("TABLE_TEXT_BBOX_READING_ORDER_DUPLICATE", "table_text_bbox_validation", f"Duplicate reading_order={reading_order} in cell_id={cell_id!r}", artifact=artifact))
+            seen_orders.add(order_identity)
         order = (box[1], box[0], box[3], box[2], text)
         if previous is not None and order < previous:
             errors.append(_error("TABLE_TEXT_BBOX_SORT_INVALID", "table_text_bbox_validation", "Table text items are not sorted", artifact=artifact))
@@ -2500,12 +2548,7 @@ def _render_document_impl(
         table_box_px = _scale_box(table.bbox, sx, sy)
         inside = [item for item in all_text if _box_inside(item["bbox_px"], table_box_px)]
         inside.sort(key=lambda item: (item["bbox_px"][1], item["bbox_px"][0], item["bbox_px"][3], item["bbox_px"][2], item["text"]))
-        text_payload = [
-            {"text": item["text"], "bbox": _to_1000(item["bbox_px"], image.width, image.height)}
-            for item in inside
-            if str(item["text"]).strip()
-        ]
-        text_payload.sort(key=lambda item: (item["bbox"][1], item["bbox"][0], item["bbox"][3], item["bbox"][2], item["text"]))
+        text_payload = _build_table_text_payload(table, cells_by_table[table.table_id], inside, image.size)
         text_path = tables_dir / f"table_{index:03d}.text_bbox.json"
         _write_json(text_path, text_payload)
         table_text_counts.append(len(text_payload))
@@ -2635,8 +2678,18 @@ def render_document(
     placement_profile: str = "natural",
 ) -> dict[str, Any]:
     output_path = Path(output_dir)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    staged = Path(tempfile.mkdtemp(prefix=f".{output_path.name}.stage-", dir=output_path.parent))
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        staged = Path(tempfile.mkdtemp(prefix=f".{output_path.name}.stage-", dir=output_path.parent))
+    except Exception as exc:
+        return _make_report(
+            70,
+            "persistent_output",
+            str(exc),
+            {},
+            {},
+            errors=[_error("PERSISTENT_OUTPUT_SETUP_FAILED", "persistent_output", str(exc), artifact=str(output_path))],
+        )
     try:
         _verify_template_lock(Path(source_pdf))
         if TEMPLATE_CONTENT_MODE == "scanned" and not STATIC_TEXT_CATALOG_COMPLETE:
@@ -2673,9 +2726,12 @@ def render_document(
     # A failed render publishes only its failure report, so a previous successful
     # document can never masquerade as the result of the failed request.
     if report.get("status_code") != 0:
-        _remove_output_path(staged)
-        staged.mkdir(parents=True, exist_ok=True)
-        _write_json(staged / "report.json", report)
+        try:
+            _remove_output_path(staged)
+            staged.mkdir(parents=True, exist_ok=True)
+            _write_json(staged / "report.json", report)
+        except Exception as exc:
+            return _make_report(70, "persistent_output", str(exc), {}, {}, errors=[_error("FAILURE_REPORT_WRITE_FAILED", "persistent_output", str(exc), artifact="report.json")])
     try:
         _publish_output_directory(staged, output_path)
     except PermissionError as exc:
@@ -2683,7 +2739,7 @@ def render_document(
         return _make_report(70, "persistent_output", str(exc), {}, {}, errors=[_error("PERSISTENT_OUTPUT_WRITE_FAILED", "persistent_output", str(exc))])
     except Exception as exc:
         _remove_output_path(staged)
-        return _make_report(99, "unexpected", str(exc), {}, {}, errors=[_error("OUTPUT_PUBLISH_FAILED", "unexpected", str(exc))])
+        return _make_report(70, "persistent_output", str(exc), {}, {}, errors=[_error("OUTPUT_PUBLISH_FAILED", "persistent_output", str(exc), artifact=str(output_path))])
     return report
 
 
@@ -2823,6 +2879,11 @@ def get_generator_manifest() -> dict[str, Any]:
         "derived_keys": derived,
         "table_definitions": tables,
         "supported_annotation_formats": ["layout", "otsl", "table_text_bbox", "key_information"],
+        "table_text_bbox_schema": {
+            "required_fields": list(TABLE_TEXT_BBOX_FIELDS),
+            "bbox_coordinate_space": "page_0_to_1000",
+            "reading_order_scope": "within_cell",
+        },
         "otsl_tokens": list(OTSL_TOKENS),
         "status_codes": {str(code): name for code, name in STATUS_CODES.items()},
         "public_api": list(PUBLIC_API),
@@ -2832,7 +2893,8 @@ def get_generator_manifest() -> dict[str, Any]:
         "artificial_degradation": False,
         "static_text_catalog_complete": STATIC_TEXT_CATALOG_COMPLETE,
         "requires_external_visual_review": True,
-        "visual_review_schema_version": VISUAL_REVIEW_SCHEMA_VERSION,
+        "visual_review_schema_version": ORCHESTRATOR_VISUAL_REVIEW_SCHEMA_VERSION,
+        "machine_visual_review_schema_version": MACHINE_VISUAL_REVIEW_SCHEMA_VERSION,
     }
     return manifest
 
@@ -2984,9 +3046,9 @@ def self_test() -> dict[str, Any]:
             "reference_dpi", "template_pixel_sha256", "supported_input_modes", "supported_output_formats", "pdf_support", "local_fields",
             "local_to_canonical_mappings", "field_constraints", "required_canonical_keys", "recommended_canonical_keys",
             "optional_canonical_keys", "synthesizable_keys", "derived_keys", "table_definitions",
-            "supported_annotation_formats", "otsl_tokens", "status_codes", "scan_only", "uses_ocr",
+            "supported_annotation_formats", "table_text_bbox_schema", "otsl_tokens", "status_codes", "scan_only", "uses_ocr",
             "uses_pdf_text_layer", "artificial_degradation", "requires_external_visual_review",
-            "visual_review_schema_version",
+            "visual_review_schema_version", "machine_visual_review_schema_version",
         }
         missing_manifest = required_manifest - set(manifest)
         if missing_manifest:
@@ -3001,8 +3063,10 @@ def self_test() -> dict[str, Any]:
             errors.append("Manifest does not declare strict scan-only operation")
         if manifest.get("artificial_degradation") is not False:
             errors.append("Manifest must declare artificial_degradation=false")
-        if manifest.get("visual_review_schema_version") != VISUAL_REVIEW_SCHEMA_VERSION:
-            errors.append("Manifest visual-review schema version is stale")
+        if manifest.get("visual_review_schema_version") != ORCHESTRATOR_VISUAL_REVIEW_SCHEMA_VERSION:
+            errors.append("Manifest orchestrator visual-review schema version is stale")
+        if manifest.get("machine_visual_review_schema_version") != MACHINE_VISUAL_REVIEW_SCHEMA_VERSION:
+            errors.append("Manifest machine visual-review schema version is stale")
         first = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         second = json.dumps(get_generator_manifest(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if first != second:
@@ -3014,6 +3078,34 @@ def self_test() -> dict[str, Any]:
         proposal_b = propose_missing_values({}, seed=17, scenario="self_test")
         if proposal_a != proposal_b:
             errors.append("Missing-value proposals are nondeterministic")
+        if any(item.get("resolution_kind") not in {"synthesize", "derive"} for item in proposal_a.get("proposals", [])):
+            errors.append("Missing-value proposals do not explicitly distinguish synthesis from derivation")
+        if TABLE_CATALOG:
+            first_table = TABLE_CATALOG[0]
+            first_cells = cells_by_table.get(first_table.table_id, ())
+            if first_cells:
+                first_cell = first_cells[0]
+                valid_table_text = [{
+                    "text": "self-test",
+                    "bbox": _to_1000(first_cell.bbox, BASE_SIZE[0], BASE_SIZE[1]),
+                    "table_id": first_table.table_id,
+                    "cell_id": first_cell.cell_id,
+                    "angle": 0,
+                    "reading_order": 0,
+                }]
+                if _validate_table_text_payload(valid_table_text, 0):
+                    errors.append("Valid six-key table text-bbox payload was rejected")
+                legacy_errors = _validate_table_text_payload([{"text": "legacy", "bbox": [0, 0, 1, 1]}], 0)
+                if not any(item.get("code") == "TABLE_TEXT_BBOX_SCHEMA" for item in legacy_errors):
+                    errors.append("Legacy two-key table text-bbox payload was not rejected")
+        dedup_probe = _deduplicate_text_items([
+            {"text": "Alpha", "bbox_px": [0.0, 0.0, 20.0, 10.0], "source": "manual_static", "static_id": "a", "angle": 0},
+            {"text": "Alpha Beta", "bbox_px": [0.0, 0.0, 30.0, 10.0], "source": "manual_static", "static_id": "b", "angle": 0},
+            {"text": "alpha", "bbox_px": [0.0, 0.0, 20.0, 10.0], "source": "manual_static", "static_id": "c", "angle": 0},
+            {"text": "Alpha", "bbox_px": [0.0, 0.0, 20.0, 10.0], "source": "manual_static", "static_id": "a", "angle": 0},
+        ])
+        if [item["text"] for item in dedup_probe] != ["Alpha", "alpha", "Alpha Beta"]:
+            errors.append("Exact-identity text deduplication regression")
     except Exception as exc:
         errors.append(f"Structural smoke test failed: {exc}")
 
@@ -3053,7 +3145,7 @@ def _local_normal_record() -> dict[str, str]:
         base = examples[spec.semantic_type]
         if spec.semantic_type == "text":
             base = spec.local_key.replace(".", " ").title()
-        values[spec.local_key] = base[:spec.max_chars]
+        values[spec.local_key] = base if len(base) <= spec.max_chars else _synthetic_value(spec, 0, "standard")
     return values
 
 
@@ -3260,10 +3352,23 @@ def generate_edge_cases(
             scope="generator_validation",
         )
     owner_created = output_dir is None
-    owner = Path(output_dir) if output_dir is not None else Path(tempfile.mkdtemp(prefix="generator_edge_cases_"))
-    owner.mkdir(parents=True, exist_ok=True)
-    artifacts = owner / "artifacts"
-    artifacts.mkdir(parents=True, exist_ok=True)
+    owner = Path(output_dir) if output_dir is not None else None
+    try:
+        if owner is None:
+            owner = Path(tempfile.mkdtemp(prefix="generator_edge_cases_"))
+        owner.mkdir(parents=True, exist_ok=True)
+        artifacts = owner / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return _make_report(
+            70,
+            "persistent_output",
+            str(exc),
+            {"edge_cases": False},
+            {"edge_cases_total": len(EDGE_CASE_NAMES), "edge_cases_passed": 0},
+            errors=[_error("PERSISTENT_OUTPUT_SETUP_FAILED", "persistent_output", str(exc), artifact=str(output_dir or "<temporary>"))],
+            scope="generator_validation",
+        )
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
@@ -3636,7 +3741,7 @@ def _validate_visual_review(
     if set(review) != expected_keys:
         errors.append(_error("VISUAL_REVIEW_SCHEMA", "visual_quality", "Visual-review envelope has the wrong top-level schema"))
         return False, errors
-    if review["schema_version"] != VISUAL_REVIEW_SCHEMA_VERSION or review["generator_id"] != GENERATOR_ID or review["template_version"] != TEMPLATE_VERSION:
+    if review["schema_version"] != MACHINE_VISUAL_REVIEW_SCHEMA_VERSION or review["generator_id"] != GENERATOR_ID or review["template_version"] != TEMPLATE_VERSION:
         errors.append(_error("VISUAL_REVIEW_IDENTITY", "visual_quality", "Visual-review identity or version mismatch"))
     writer_role = review.get("writer_role")
     reviewer_role = review.get("reviewer_role")
@@ -3700,7 +3805,18 @@ def audit_generator(
 ) -> dict[str, Any]:
     source = Path(source_pdf)
     output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return _make_report(
+            70,
+            "persistent_output",
+            str(exc),
+            {name: False for name in REQUIRED_GENERATOR_CHECKS},
+            {},
+            errors=[_error("PERSISTENT_OUTPUT_SETUP_FAILED", "persistent_output", str(exc), artifact=str(output))],
+            scope="generator_validation",
+        )
     work = output / "_audit_artifacts"
 
     # Two-phase audit: the first call performs all machine work and creates
@@ -3988,52 +4104,79 @@ def main() -> None:
     command.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
 
-    key_map = _json_load(args.key_map) if getattr(args, "key_map", None) else None
-    if args.command == "describe":
-        payload = get_generator_manifest()
-    elif args.command == "schema":
-        payload = get_canonical_schema()
-    elif args.command == "list-fields":
-        payload = get_available_fields()
-    elif args.command == "self-test":
-        payload = self_test()
-    elif args.command == "assess":
-        payload = assess_compatibility(_json_load(args.data), key_map=key_map)
-    elif args.command == "propose-missing":
-        payload = propose_missing_values(_json_load(args.data), key_map=key_map, seed=args.seed, scenario=args.scenario)
-    elif args.command == "make-weird-data":
-        payload = _canonical_weird_record() if args.canonical else make_weird_data()
-    elif args.command == "render":
-        payload = render_document(
-            args.pdf,
-            _json_load(args.data),
-            args.output_dir,
-            output_pdf=args.output_pdf,
-            input_mode=args.input_mode,
-            key_map=key_map,
-            allow_synthesis=args.allow_synthesis,
-            require_required=not args.allow_missing_required,
-            dpi=args.dpi,
-            seed=args.seed,
-            scenario=args.scenario,
-            placement_profile=args.placement,
+    try:
+        key_map = _json_load(args.key_map) if getattr(args, "key_map", None) else None
+        if args.command == "describe":
+            payload = get_generator_manifest()
+        elif args.command == "schema":
+            payload = get_canonical_schema()
+        elif args.command == "list-fields":
+            payload = get_available_fields()
+        elif args.command == "self-test":
+            payload = self_test()
+        elif args.command == "assess":
+            payload = assess_compatibility(_json_load(args.data), key_map=key_map)
+        elif args.command == "propose-missing":
+            payload = propose_missing_values(_json_load(args.data), key_map=key_map, seed=args.seed, scenario=args.scenario)
+        elif args.command == "make-weird-data":
+            payload = _canonical_weird_record() if args.canonical else make_weird_data()
+        elif args.command == "render":
+            payload = render_document(
+                args.pdf,
+                _json_load(args.data),
+                args.output_dir,
+                output_pdf=args.output_pdf,
+                input_mode=args.input_mode,
+                key_map=key_map,
+                allow_synthesis=args.allow_synthesis,
+                require_required=not args.allow_missing_required,
+                dpi=args.dpi,
+                seed=args.seed,
+                scenario=args.scenario,
+                placement_profile=args.placement,
+            )
+        elif args.command == "edge-cases":
+            payload = generate_edge_cases(args.pdf, args.output_dir, seed=args.seed, keep_artifacts=args.keep_artifacts)
+        elif args.command == "audit":
+            payload = audit_generator(args.pdf, args.output_dir, seed=args.seed, keep_artifacts=args.keep_artifacts, visual_review=args.visual_review)
+        elif args.command == "validate-output":
+            payload = validate_output_contract(args.output_dir)
+        else:
+            raise AssertionError(args.command)
+    except GeneratorError as exc:
+        payload = _make_report(exc.status_code, exc.stage, exc.message, {}, {}, errors=[exc.as_error()], scope="generator_validation")
+    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+        payload = _make_report(
+            10,
+            "input_validation",
+            str(exc),
+            {},
+            {},
+            errors=[_error("CLI_INPUT_INVALID", "input_validation", str(exc), artifact=str(getattr(exc, "filename", None) or "input"))],
+            scope="generator_validation",
         )
-    elif args.command == "edge-cases":
-        payload = generate_edge_cases(args.pdf, args.output_dir, seed=args.seed, keep_artifacts=args.keep_artifacts)
-    elif args.command == "audit":
-        payload = audit_generator(args.pdf, args.output_dir, seed=args.seed, keep_artifacts=args.keep_artifacts, visual_review=args.visual_review)
-    elif args.command == "validate-output":
-        payload = validate_output_contract(args.output_dir)
-    else:
-        raise AssertionError(args.command)
+    except Exception as exc:
+        payload = _make_report(99, "unexpected", str(exc), {}, {}, errors=[_error("UNEXPECTED_ERROR", "unexpected", str(exc))], scope="generator_validation")
 
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
     output_path = getattr(args, "output", None)
-    if output_path is not None and args.command in {"describe", "schema", "list-fields", "self-test", "make-weird-data"}:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(text + "\n", encoding="utf-8")
-    else:
-        print(text)
+    try:
+        if output_path is not None and args.command in {"describe", "schema", "list-fields", "self-test", "make-weird-data"}:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(text + "\n", encoding="utf-8")
+        else:
+            print(text)
+    except Exception as exc:
+        payload = _make_report(
+            70,
+            "persistent_output",
+            str(exc),
+            {},
+            {},
+            errors=[_error("CLI_OUTPUT_WRITE_FAILED", "persistent_output", str(exc), artifact=str(output_path or "stdout"))],
+            scope="generator_validation",
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
     if isinstance(payload, Mapping) and "status_code" in payload:
         exit_code = int(payload["status_code"])

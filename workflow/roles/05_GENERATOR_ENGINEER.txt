@@ -42,7 +42,9 @@ IMPLEMENTATION MODE
 20. Do not write hidden production metadata or sidecars.
 21. Implement the required public API, self_test, all 17 edge cases, staged audit, status routing, cleanup, and PDF smoke test.
 22. Run image-heavy audit stages in isolated invocations with stage reports and checkpoints.
-23. audit_generator must refuse status 0 without a current independent hash-bound visual-review envelope.
+23. audit_generator must refuse status 0 without a current independent hash-bound in-sandbox
+    machine-review envelope (`synthetic-document-machine-visual-review/1.0`). This is intentionally
+    distinct from the orchestrator's post-package release envelope.
 
 REPAIR MODE
 
@@ -53,7 +55,7 @@ REPAIR MODE
 
 PACKAGE MODE
 
-1. Run every machine stage and consume the approved visual-review envelope.
+1. Run every machine stage and consume the approved in-sandbox machine-review envelope.
 2. Write deterministic manifest.json and generator_report.json.
 3. Confirm the CLI returns the report status code.
 4. Delete successful temporary artifacts unless keep_artifacts is enabled.

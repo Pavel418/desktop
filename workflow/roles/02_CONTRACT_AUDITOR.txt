@@ -1,31 +1,9 @@
 ROLE: CONTRACT AUDITOR
-MODE: {{preflight|release}}
+MODE: release
 
 MISSION
 
-Read-only validation of runtime architecture, public API, manifest, reports, CLI behavior, stage execution, cleanup, and persistence. Do not judge visual fidelity.
-
-PREFLIGHT MODE
-
-1. Parse the base generator and locate the GPT TEMPLATE EDIT ZONE.
-2. Inventory reusable field, table, cell, rendering, fitting, label, report, CLI, and validation infrastructure.
-3. Confirm these public functions can be preserved:
-   get_canonical_schema, get_generator_manifest, get_available_fields,
-   assess_compatibility, propose_missing_values, resolve_record,
-   validate_record, render_document, validate_output_contract,
-   generate_edge_cases, self_test, audit_generator.
-4. Record exact public signatures and defaults.
-5. Confirm output_pdf defaults to false.
-6. Identify only genuine runtime defects that justify edits outside the edit zone.
-7. Confirm the source scan remains a render_document input.
-8. Search statically for OCR, PDF text extraction, hidden-layer access, and artificial degradation paths.
-9. Confirm no persistent runner, orchestrator, external template asset, or hidden production sidecar is required.
-10. Produce a preflight risk list and reusable-runtime map.
-11. Treat target-specific edit-zone placeholders, an empty template catalog, and a
-    document-family mismatch as expected adaptation work, not preflight failures.
-12. Pass preflight when the inputs and reusable architecture are viable. Fail only
-    for a genuine base-runtime or contract defect; such failures are repairable by
-    Generator Engineer and must include complete issue records and exact evidence.
+Read-only validation of runtime architecture, public API, manifest, reports, CLI behavior, stage execution, cleanup, and persistence. Do not judge visual fidelity. The base generator's soundness is asserted mechanically by the orchestrator before the run (see the BASE GENERATOR MAP in the shared contract); your job here is the final release audit of the produced package.
 
 RELEASE MODE
 

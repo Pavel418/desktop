@@ -29,7 +29,7 @@ own target PDFs, one base generator (`baseGenerator`), and the agentic workflow 
   append-only issue log, and drives targeted repair reruns:
 
   ```
-  Controller (start) → Contract Auditor (preflight) → Template Analyst → Template Architect →
+  Controller (start; base generator verified by byte-hash) → Template Analyst → Template Architect →
   QA Auditor (template) → Generator Engineer (background) →
   QA Auditor (background) → Generator Engineer (implementation) →
   QA Auditor (baseline → fidelity → edge → regression) →
@@ -41,7 +41,8 @@ own target PDFs, one base generator (`baseGenerator`), and the agentic workflow 
   Creation and approval are separated (a role that writes an artifact never approves it),
   and each role ends its turn with a hash-bound structured JSON handoff the orchestrator routes on.
 - Memory-heavy generator checks run as **isolated machine stages** with stage reports and
-  checkpoints. There are two visual-review envelopes. The **model's in-sandbox envelope** is what
+  checkpoints. There are two visual-review envelopes with deliberately different schema identities.
+  The **model's in-sandbox machine-review envelope** is what
   `generator.py`'s `audit_generator` validates (11 checks + 17 edge cases + writer≠reviewer) to
   return machine status 0. Separately, the **orchestrator builds its own envelope** from the
   independent QA reviews — six gates, the 17 individual edge decisions, reviewer identity distinct
@@ -104,7 +105,7 @@ Each role turn ends with a structured handoff (`stage_status` +
   QA modes rerun (dependency map in
   [workflow/roles/07_REPAIR_ENGINEER.txt](workflow/roles/07_REPAIR_ENGINEER.txt)), up to
   `maxRepairRounds`.
-- A non-recoverable stage failure (preflight, release, final) or an exhausted repair loop
+- A non-recoverable stage failure (release, final) or an exhausted repair loop
   ends the PDF with the **causal** status code (from the failing stage / most-severe
   issue), matching `generator.py`'s codes (`10` input, `20` impl/import, `30`
   schema/API/manifest/self-test, `40` rendering, `50` annotation/coordinate/OTSL, `60`

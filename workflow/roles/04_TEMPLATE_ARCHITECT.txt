@@ -7,7 +7,9 @@ Convert the approved scan inventory into one complete, explicit template specifi
 A. PAGE AND TABLE GEOMETRY
 
 1. Define selected page, reference size, DPI, and template pixel hash.
-2. Define every top-level table bbox in visual order.
+2. Define every top-level table bbox in visual order. A table bbox encloses ONLY the visible grid,
+   tight to its outermost gridlines — never the page margin, outer border, or preprint text lying
+   outside the grid. Border/margin preprint (including rotated frame text) is not part of any table.
 3. Represent a visually continuous grid as one table. Split only genuinely independent grids.
 4. Use every visible row and column boundary, including asymmetric boundaries that create merged logical rows or columns.
 5. Define logical rows, columns, anchor cells, row spans, column spans, and cell bboxes.
@@ -21,7 +23,12 @@ B. STATIC CONTENT
 
 1. Catalog every readable, visually contiguous static table-text line.
 2. Each static line must have text_id, exact text, bbox, angle, table_id, cell_id, and reading order.
-3. Define top-level text regions outside tables.
+   Each bbox must tightly enclose ONLY that line's visible dark glyphs — not the whole cell or row
+   band. Adjacent lines in different languages (e.g. an Arabic line beside its English translation)
+   get separate, individually tight bboxes; never let one line's bbox spill into another's glyphs.
+3. Define top-level text regions outside tables. Do NOT catalog margin/border preprint text (rotated
+   frame strings, printer/edition codes) as a static-text region — it is preserved background per the
+   analyst, so it is never subject to the "top-level text must lie outside every table" rule.
 4. Define only real semantic images. Exclude backgrounds, form layers, decorative lines, and rasterized text.
 5. For ambiguous readable text, require a second independent visual transcription. Block unresolved disagreements.
 
@@ -32,6 +39,8 @@ Create one field for every writable or populated variable region. Every field mu
 - local_key and canonical_key
 - semantic_type, presence, missing_policy
 - boundary_bbox, reference_bbox, container_bbox
+  (boundary_bbox must NOT intersect any static-text bbox: begin the field after the printed label's
+  glyphs, leaving small clearance, so a generated value can never cover a printed label)
 - table_id and cell_id when applicable
 - max_chars, max_lines
 - font path/family, weight, size, min_font_size, text color
@@ -43,9 +52,16 @@ Create one field for every writable or populated variable region. Every field mu
 
 D. SEMANTICS
 
-1. Reuse shared canonical concepts; use document-specific keys only when necessary.
-2. Keep shipper, exporter, seller, consignor, carrier, consignee, importer, buyer, and similar roles distinct.
-3. Never leave canonical_key empty.
+1. Bind a field to a shared canonical role ONLY when its printed label (recorded by the analyst, in
+   any language) unambiguously establishes that role. When the label is ambiguous, absent, or denotes
+   a document-specific fact, use a descriptive document-specific canonical_key — do NOT guess a
+   canonical business type. A canonical_key that contradicts the field's printed-label meaning is a
+   defect (e.g. binding a "Remarks/Observaciones/Remarques" box to a certification statement, a
+   "Consignor/Expedidor" block to exporter, or an unlabeled code to customs.number).
+2. Keep shipper, exporter, seller, consignor, carrier, consignee, importer, buyer, and similar roles
+   distinct; bind to the exact role the label names, never a near neighbour.
+3. Never leave canonical_key empty — but a document-specific key is a valid, preferred value when no
+   canonical role is established. Guessing a canonical role is worse than a precise document-specific key.
 4. Do not create boolean presence fields for signatures, stamps, or logos.
 5. Declare aliases and list strategies explicitly.
 6. Do not bind list data permanently to item zero.
@@ -70,10 +86,21 @@ OUTPUTS
 
 The overlay must show table IDs, cell keys, field keys, boundaries, containers, reference anchors, reconstruction masks, semantic images, and top-level layout elements.
 
+REPAIR MODE
+
+When applying an assigned repair (fixing specific open issues rather than authoring the first spec):
+change ONLY the elements named in those issues. Every other field, bbox, binding, table, and static
+line already in the approved specification must remain byte-for-byte identical. Do NOT re-derive or
+re-emit the whole specification — regenerating unaffected parts is the main cause of new defects and
+non-convergence. Return a change record listing exactly which elements changed and their old/new
+values, not a fresh full spec.
+
 PASS CONDITIONS
 
 - Every writable region is represented or explicitly excluded.
 - Every field lies inside the correct logical container.
-- Every table grid is complete.
-- Every readable table-text line has an explicit cell assignment.
+- Every table grid is complete, and every table bbox is tight to its grid (no margin/border).
+- Every readable table-text line has an explicit cell assignment and a glyph-tight bbox.
+- No field boundary_bbox intersects any static-text bbox.
+- Every field's canonical_key matches its printed-label business meaning (no guessed roles).
 - All placement and typography parameters are active, not optional placeholders.

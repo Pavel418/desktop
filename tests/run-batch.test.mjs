@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { processEntry, runPool } from '../run-batch.mjs';
+import { processEntry, runPool, isRetryableInfraError, persistAttempt, pruneOldRunLogs } from '../run-batch.mjs';
 import { PERSISTENT_FILES, EDGE_CASES, VISUAL_REVIEW_SCHEMA_VERSION } from '../workflow-orchestrator.mjs';
 
 // Realistic package-file contents so the orchestrator's envelope build sees valid JSON.
@@ -269,4 +269,137 @@ test('processEntry: a thrown controller error is recorded and does not abort the
   assert.equal(summary.pdfs.length, 2);
   assert.equal(summary.aborted, false);
   assert.match(summary.pdfs[0].error, /boom/);
+});
+
+// ---------------------------------------------------------------------------
+// Provider-side failure handling
+// ---------------------------------------------------------------------------
+
+test('isRetryableInfraError: provider/browser failures are retryable, workflow results are not', () => {
+  for (const message of ['attachment_upload_rejected', 'send_not_triggered', 'response_stalled_no_output',
+    'timeout_waiting_for_response', 'attachment_not_registered', 'chatgpt_server_error']) {
+    assert.equal(isRetryableInfraError(new Error(message)), true, `${message} must be retryable`);
+  }
+  assert.equal(isRetryableInfraError(new Error('boom')), false);
+  assert.equal(isRetryableInfraError(null), false);
+  // An explicit flag wins, so new controller errors opt in without editing the list.
+  const flagged = new Error('something_new');
+  flagged.retryable = true;
+  assert.equal(isRetryableInfraError(flagged), true);
+});
+
+test('processEntry: a provider-side failure retries in a fresh chat without spending a workflow attempt', async () => {
+  const { entry } = await makeTempEntry('e-infra', ['a.pdf']);
+  const recorder = { calls: [] };
+  const passing = passingControllerFactory(recorder);
+  let made = 0;
+  const summary = await processEntry({
+    entry, backend: fakeBackend, selectors: {}, stateDir: entry.root,
+    show: false, timeoutMs: 1000,
+    // maxRetry 0 means: NO workflow retries at all. A provider-side failure must still be retried,
+    // out of its own budget — an outage used to consume the whole file in seconds.
+    workflowConfig: { ...FAST_WF, maxRetry: 0, maxInfraRetries: 2, infraBackoffMs: [0, 0] },
+    makeController: (args) => {
+      made += 1;
+      if (made === 1) {
+        return {
+          async query() {
+            const err = new Error('attachment_upload_rejected');
+            err.retryable = true;
+            err.data = { statuses: [503] };
+            throw err;
+          },
+          async followUp() { throw new Error('unreachable'); },
+          async downloadLastAssistantEntities() { return []; },
+          async downloadLastAssistantFiles() { return []; }
+        };
+      }
+      return passing(args);
+    },
+    independentAudit: false
+  });
+
+  assert.equal(made, 2, 'a second, fresh chat was opened after the provider-side failure');
+  assert.equal(summary.pdfs.length, 1);
+  assert.equal(summary.pdfs[0].status, 0, 'the file still completes');
+  assert.equal(summary.pdfs[0].error, null);
+  assert.equal(summary.pdfs[0].infraRetries, 1);
+});
+
+test('processEntry: provider-side retries are bounded and then give up', async () => {
+  const { entry } = await makeTempEntry('e-infra-cap', ['a.pdf']);
+  let attempts = 0;
+  const summary = await processEntry({
+    entry, backend: fakeBackend, selectors: {}, stateDir: entry.root,
+    show: false, timeoutMs: 1000,
+    workflowConfig: { ...FAST_WF, maxRetry: 0, maxInfraRetries: 2, infraBackoffMs: [0, 0] },
+    makeController: () => ({
+      async query() { attempts += 1; const e = new Error('send_not_triggered'); e.retryable = true; throw e; },
+      async followUp() { throw new Error('unreachable'); },
+      async downloadLastAssistantEntities() { return []; },
+      async downloadLastAssistantFiles() { return []; }
+    }),
+    independentAudit: false
+  });
+  assert.equal(attempts, 3, 'the first try plus exactly maxInfraRetries retries');
+  assert.match(summary.pdfs[0].error, /send_not_triggered/);
+  assert.equal(summary.pdfs[0].infraRetries, 2);
+});
+
+test('processEntry: turns completed before a mid-run throw are written to disk', async () => {
+  const { entry } = await makeTempEntry('e-partial', ['a.pdf']);
+  let calls = 0;
+  await processEntry({
+    entry, backend: fakeBackend, selectors: {}, stateDir: entry.root,
+    show: false, timeoutMs: 1000,
+    workflowConfig: { ...FAST_WF, maxRetry: 0, maxInfraRetries: 0 },
+    makeController: () => ({
+      async query({ prompt }) {
+        calls += 1;
+        const { role, mode } = roleFromMessage(prompt);
+        const runId = String(prompt).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
+        return { text: '```json\n' + JSON.stringify({
+          run_id: runId, role, mode, stage_status: 'passed', recommended_status_code: null,
+          artifacts: [{ path: 'temporary/x.json', sha256: 'a'.repeat(64) }],
+          new_issues: [], verified_issues: [], required_reruns: [], next_role: null
+        }) + '\n```' };
+      },
+      async followUp() {
+        const err = new Error('response_stalled_no_output');
+        err.retryable = true;
+        throw err;
+      },
+      async downloadLastAssistantEntities() { return []; },
+      async downloadLastAssistantFiles() { return []; }
+    }),
+    independentAudit: false
+  });
+
+  // The opening turn completed before the stall; its text must survive, because a temporary chat
+  // keeps no server-side copy.
+  const transcript = await fs.readFile(path.join(entry.outDir, '01-a', 'a.response.txt'), 'utf8');
+  assert.match(transcript, /turn 1: controller\/start/);
+  assert.equal(calls, 1);
+  await fs.access(path.join(entry.outDir, '01-a', 'a.issues.json'));
+});
+
+test('persistAttempt: names retries distinctly and skips empty runs', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'persist-'));
+  const first = await persistAttempt(dir, 'file_9', 0, [{ role: 'controller', mode: 'start', text: 'A' }], []);
+  const second = await persistAttempt(dir, 'file_9', 1, [{ role: 'controller', mode: 'start', text: 'B' }], []);
+  assert.equal(path.basename(first), 'file_9.response.txt');
+  assert.equal(path.basename(second), 'file_9.attempt2.response.txt');
+  assert.match(await fs.readFile(first, 'utf8'), /A/, 'a later attempt never overwrites an earlier one');
+  assert.equal(await persistAttempt(dir, 'file_9', 2, [], []), null, 'nothing to write, nothing written');
+});
+
+test('pruneOldRunLogs: keeps the newest run logs and deletes the rest', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'runlogs-'));
+  for (const n of ['2026-07-20', '2026-07-21', '2026-07-22', '2026-07-23']) {
+    await fs.writeFile(path.join(dir, `batch-run-${n}.log`), 'x');
+  }
+  await fs.writeFile(path.join(dir, 'batch-run.log'), 'current');
+  await pruneOldRunLogs(dir, 2);
+  const left = (await fs.readdir(dir)).sort();
+  assert.deepEqual(left, ['batch-run-2026-07-22.log', 'batch-run-2026-07-23.log', 'batch-run.log']);
 });

@@ -397,26 +397,36 @@ function roleFromMessage(message) {
   return { role: m ? m[1].toLowerCase() : 'unknown', mode: m && m[2] ? m[2] : null };
 }
 
-function assignedIssueIds(message) {
+function assignedIssueRecords(message) {
   const match = String(message).match(/Assigned open issues to address:\s*```json\s*([\s\S]*?)```/);
   if (!match) return [];
   try {
     const records = JSON.parse(match[1]);
-    return Array.isArray(records) ? records.map((record) => String(record?.issue_id || '')).filter(Boolean) : [];
+    return Array.isArray(records)
+      ? records
+          .filter((record) => record && String(record.issue_id || ''))
+          .map((record) => ({ issue_id: String(record.issue_id), owner: String(record.owner || '') }))
+      : [];
   } catch {
     return [];
   }
 }
 
+function assignedIssueIds(message) {
+  return assignedIssueRecords(message).map((r) => r.issue_id).filter(Boolean);
+}
+
 // A controller whose replies are derived from the role/mode named in the outgoing
 // message. `fail` maps "role/mode" -> number of times to return stage_status "failed"
-// before passing. `severity`/`domain` shape the emitted issue.
-function scriptedController(recorder, { fail = {}, severity = 'minor', domain = 'placement', writeFiles = true } = {}) {
+// before passing. `severity`/`domain` shape the emitted issue. `owner` overrides the
+// domain-derived issue owner (used to exercise cross-gate ownership routing).
+function scriptedController(recorder, { fail = {}, severity = 'minor', domain = 'placement', owner = null, strictOwnership = false, writeFiles = true } = {}) {
   const failCounts = { ...fail };
   return () => {
     const reply = (message) => {
       const { role, mode } = roleFromMessage(message);
       const assigned = assignedIssueIds(message);
+      const assignedRecords = assignedIssueRecords(message);
       const runId = String(message).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
       const key = mode ? `${role}/${mode}` : role;
       recorder.turns.push(key);
@@ -433,20 +443,40 @@ function scriptedController(recorder, { fail = {}, severity = 'minor', domain = 
           stage: mode || role,
           artifact: `/mnt/data/${key}.json`,
           evidence: `Scripted evidence for ${key}`,
-          owner: domain === 'geometry' || domain === 'semantics' ? 'template_architect' : 'generator_engineer',
+          owner: owner || (domain === 'geometry' || domain === 'semantics' ? 'template_architect' : 'generator_engineer'),
           required_reruns: [mode || role],
           status: 'open'
         }];
       }
-      const mayResolveAssigned =
-        (role === 'generator_engineer' && mode === 'repair') ||
-        role === 'template_architect' || role === 'qa_auditor' || role === 'contract_auditor';
+      const isWriter = (role === 'generator_engineer' && mode === 'repair') || role === 'template_architect';
+      const isAuditor = role === 'qa_auditor' || role === 'contract_auditor';
+      let verified_issues;
+      if (strictOwnership) {
+        // Faithful writer→auditor separation: a writer fixes only the assigned issues it OWNS
+        // and parks them for verification; an independent auditor later verifies whatever is
+        // parked. This lets the stateless scripted controller model major-issue recovery (which
+        // otherwise depends on chat history) and, crucially, leaves an architect-owned issue
+        // unresolved if only the generator engineer is ever scheduled to repair it.
+        recorder.pendingVerify = recorder.pendingVerify || [];
+        if (stage_status === 'passed' && isWriter) {
+          const ownedIds = assignedRecords.filter((r) => r.owner === role).map((r) => r.issue_id);
+          for (const id of ownedIds) if (!recorder.pendingVerify.includes(id)) recorder.pendingVerify.push(id);
+          verified_issues = ownedIds;
+        } else if (stage_status === 'passed' && isAuditor) {
+          verified_issues = recorder.pendingVerify.splice(0);
+        } else {
+          verified_issues = [];
+        }
+      } else {
+        const mayResolveAssigned = isWriter || role === 'qa_auditor' || role === 'contract_auditor';
+        verified_issues = stage_status === 'passed' && mayResolveAssigned ? assigned : [];
+      }
       const handoff = {
         run_id: runId, role, mode, stage_status,
         recommended_status_code: role === 'final_auditor' || (role === 'controller' && mode === 'finalize') ? 0 : null,
         artifacts: [{ path: `temporary/${key}.json`, sha256: 'a'.repeat(64) }],
         new_issues,
-        verified_issues: stage_status === 'passed' && mayResolveAssigned ? assigned : [],
+        verified_issues,
         required_reruns: [], next_role: null
       };
       if (role === 'qa_auditor' && mode === 'edge' && stage_status === 'passed') {
@@ -854,6 +884,32 @@ test('run(): template geometry repair is applied by Template Architect', async (
   assert.ok(recorder.turns.includes('repair_engineer'));
 });
 
+test('run(): an architect-owned issue at a non-template gate routes repair to the Template Architect', async () => {
+  // Regression: a reconstruction-domain issue owned by the template_architect can surface at
+  // the background gate (e.g. a reconstruction mask that must be widened in template_spec.json).
+  // Writer routing must honor the issue `owner`, not infer it from the gate — otherwise the
+  // architect is never scheduled, the generator engineer returns `blocked`, and the whole repair
+  // aborts on round 1. The architect must be invoked during the background repair and the gate
+  // must recover.
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  const orch = new WorkflowOrchestrator({ roles: makeRoles(), config: { perTurnTimeoutMs: 1000, maxRepairRounds: 2 } });
+  const res = await orch.run({
+    pdf: t.pdf, baseGenerator: t.gen, outDir: t.out,
+    controller: scriptedController(recorder, {
+      fail: { 'qa_auditor/background': 1 }, severity: 'major', domain: 'reconstruction',
+      owner: 'template_architect', strictOwnership: true
+    })()
+  });
+  assert.equal(res.success, true);
+  assert.ok(res.gatesPassed.includes('background'));
+  // The background repair must have run the Template Architect as a writer (it appears again
+  // after the initial creation-stage architect turn), proving ownership routed across the gate.
+  assert.ok(recorder.turns.filter((turn) => turn === 'template_architect').length >= 2,
+    'template architect should be scheduled to repair its own issue during the background gate');
+  assert.ok(recorder.turns.includes('repair_engineer'));
+});
+
 test('run(): a QA gate that never recovers fails with the causal domain code', async () => {
   const t = await tmpOut();
   const recorder = { turns: [] };
@@ -874,11 +930,16 @@ test('run(): a failed creation stage stops before its auditor', async () => {
   const orch = new WorkflowOrchestrator({ roles: makeRoles(), config: { perTurnTimeoutMs: 1000 } });
   const res = await orch.run({
     pdf: t.pdf, baseGenerator: t.gen, outDir: t.out,
-    controller: scriptedController(recorder, { fail: { 'generator_engineer/background': 1 }, domain: 'reconstruction' })()
+    // Fails every attempt including its self-repair budget (1 initial + maxSelfRepairs), so the
+    // fail-closed guarantee is tested THROUGH self-repair rather than in its absence: however many
+    // attempts a writer gets, an auditor must never receive a failed artifact.
+    controller: scriptedController(recorder, { fail: { 'generator_engineer/background': 3 }, domain: 'reconstruction' })()
   });
   assert.equal(res.success, false);
   assert.equal(res.statusCode, 60);
   assert.equal(res.failedStage, 'background');
+  assert.equal(recorder.turns.filter((x) => x === 'generator_engineer/background').length, 3,
+    'the writer got its self-repair attempts');
   assert.ok(!recorder.turns.includes('qa_auditor/background'));
   assert.equal(recorder.downloads || 0, 0, 'an early failure must not invoke the downloader');
 });
@@ -896,6 +957,687 @@ test('run(): an unparseable handoff aborts with status 99', async () => {
   assert.equal(res.statusCode, 99);
   assert.equal(res.success, false);
 });
+
+// ChatGPT's own error card ("Something went wrong while processing your request.") is a provider
+// transient. Wrap a scripted controller so the first `failCount` turns answer with that card.
+function serverErrorController(recorder, failCount, opts = {}) {
+  const base = scriptedController(recorder, opts)();
+  recorder.messages = [];
+  recorder.errorReplies = 0;
+  let remaining = failCount;
+  const errorReply = () => {
+    remaining -= 1;
+    recorder.errorReplies += 1;
+    return {
+      text: 'Something went wrong while processing your request.\n\nRetry',
+      meta: { hasError: true, completionReason: 'terminal_error' }
+    };
+  };
+  return {
+    ...base,
+    async query(args) {
+      recorder.messages.push(args.prompt);
+      if (remaining > 0) return errorReply();
+      return base.query(args);
+    },
+    async followUp(args) {
+      recorder.messages.push(args.text);
+      if (remaining > 0) return errorReply();
+      return base.followUp(args);
+    }
+  };
+}
+
+// Builds a controller where the template gate fails once, the architect repairs it while reporting
+// `writerReportsFix ? [id] : []`, and every later template audit passes WITHOUT echoing any id.
+// Both writer behaviours were observed live and neither may deadlock the gate.
+function terseAuditController(recorder, { writerReportsFix }) {
+  let templateAudits = 0;
+  const reply = (message) => {
+    const { role, mode } = roleFromMessage(message);
+    const runId = String(message).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
+    recorder.turns.push(mode ? `${role}/${mode}` : role);
+    const handoff = {
+      run_id: runId, role, mode, stage_status: 'passed',
+      recommended_status_code: role === 'final_auditor' || (role === 'controller' && mode === 'finalize') ? 0 : null,
+      artifacts: [{ path: `temporary/${role}.json`, sha256: 'a'.repeat(64) }],
+      new_issues: [], verified_issues: [], required_reruns: [], next_role: null
+    };
+    if (role === 'qa_auditor' && mode === 'template') {
+      templateAudits += 1;
+      if (templateAudits === 1) {
+        handoff.stage_status = 'failed';
+        handoff.new_issues = [{
+          issue_id: 'ISSUE-0001', severity: 'major', domain: 'geometry', code: 'BBOX',
+          stage: 'template', artifact: 'a.png', field: null, table: null, cell: null,
+          bbox: [0, 0, 1, 1], evidence: 'clipped glyphs', owner: 'template_architect',
+          required_reruns: ['template'], status: 'open'
+        }];
+      }
+    }
+    if (role === 'template_architect' && templateAudits >= 1) {
+      handoff.stage_status = 'ready_for_review';
+      if (writerReportsFix) handoff.verified_issues = ['ISSUE-0001'];
+    }
+    if (role === 'qa_auditor' && mode === 'edge') handoff.edge_decisions = fullEdgeDecisions();
+    return { text: `notes\n\`\`\`json\n${JSON.stringify(handoff)}\n\`\`\`` };
+  };
+  return {
+    async query({ prompt }) { return reply(prompt); },
+    async followUp({ text }) { return reply(text); },
+    async downloadLastAssistantEntities({ outDir }) {
+      const out = [];
+      for (const name of PERSISTENT_FILES) {
+        const p = path.join(outDir, name);
+        await fs.writeFile(p, persistentFileContent(name));
+        out.push({ path: p, name });
+      }
+      return out;
+    },
+    async downloadLastAssistantFiles() { return []; }
+  };
+}
+
+test('run(): a writer blocked by a deficient upstream artifact sends it back and resumes', async () => {
+  // Observed live: the analyst left 24 static-text lines as placeholder descriptions, the architect
+  // correctly refused to invent them and returned blocked with required_reruns naming the inventory.
+  // The repair loop only covers audit failures, so the run used to end at status 80 with the fix
+  // (re-transcribe) known but never attempted.
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  let analystTurns = 0;
+  let architectTurns = 0;
+  const reply = (message) => {
+    const { role, mode } = roleFromMessage(message);
+    const runId = String(message).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
+    recorder.turns.push(mode ? `${role}/${mode}` : role);
+    const handoff = {
+      run_id: runId, role, mode, stage_status: 'passed',
+      recommended_status_code: role === 'final_auditor' || (role === 'controller' && mode === 'finalize') ? 0 : null,
+      artifacts: [{ path: `temporary/${role}.json`, sha256: 'a'.repeat(64) }],
+      new_issues: [], verified_issues: [], required_reruns: [], next_role: null
+    };
+    if (role === 'template_analyst') analystTurns += 1;
+    if (role === 'template_architect') {
+      architectTurns += 1;
+      // Blocked the FIRST time only: the second analyst pass supplies the missing transcriptions.
+      if (architectTurns === 1) {
+        handoff.stage_status = 'blocked';
+        handoff.recommended_status_code = 80;
+        handoff.next_role = 'template_analyst';
+        handoff.required_reruns = ['scan_inventory_static_text_transcription'];
+        handoff.new_issues = [{
+          issue_id: 'ISSUE-0001', severity: 'critical', domain: 'semantics',
+          code: 'EXACT_STATIC_TEXT_NOT_ESTABLISHED', stage: 'template_specification',
+          artifact: 'scan_inventory.json', field: null, table: 'coo_form', cell: null,
+          bbox: [0, 0, 1, 1], evidence: '24 placeholder transcriptions', owner: 'template_architect',
+          required_reruns: ['scan_inventory_static_text_transcription'], status: 'blocked'
+        }];
+      } else {
+        handoff.stage_status = 'ready_for_review';
+        handoff.verified_issues = ['ISSUE-0001'];
+      }
+    }
+    if (role === 'qa_auditor' && mode === 'edge') handoff.edge_decisions = fullEdgeDecisions();
+    return { text: `notes\n\`\`\`json\n${JSON.stringify(handoff)}\n\`\`\`` };
+  };
+  const controller = {
+    async query({ prompt }) { return reply(prompt); },
+    async followUp({ text }) { return reply(text); },
+    async downloadLastAssistantEntities({ outDir }) {
+      const out = [];
+      for (const name of PERSISTENT_FILES) {
+        const p = path.join(outDir, name);
+        await fs.writeFile(p, persistentFileContent(name));
+        out.push({ path: p, name });
+      }
+      return out;
+    },
+    async downloadLastAssistantFiles() { return []; }
+  };
+
+  const orch = new WorkflowOrchestrator({
+    roles: makeRoles(),
+    config: { perTurnTimeoutMs: 1000, enforceEdgeDecisions: true, maxUpstreamRecoveries: 2 }
+  });
+  const res = await orch.run({ pdf: t.pdf, baseGenerator: t.gen, outDir: t.out, controller });
+  assert.equal(analystTurns, 2, 'the analyst is re-run to resolve the blocker it caused');
+  assert.equal(architectTurns, 2, 'the architect then re-runs and proceeds');
+  // Order matters: analyst → architect → analyst → architect, never forward-jumping.
+  const seq = recorder.turns.filter((x) => x === 'template_analyst' || x === 'template_architect');
+  assert.deepEqual(seq, ['template_analyst', 'template_architect', 'template_analyst', 'template_architect']);
+  assert.equal(res.statusCode, 0, 'the run completes after the upstream fix');
+});
+
+test('run(): a writer that judges its own output not approvable gets another attempt', async () => {
+  // Observed live: the architect simulated its own reconstruction plan, measured 98,560 residual ink
+  // pixels, and returned `failed` with an issue against its own work. The run ended with the defect
+  // precisely known and never addressed.
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  let architectTurns = 0;
+  const reply = (message) => {
+    const { role, mode } = roleFromMessage(message);
+    const runId = String(message).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
+    recorder.turns.push(mode ? `${role}/${mode}` : role);
+    const handoff = {
+      run_id: runId, role, mode, stage_status: 'passed',
+      recommended_status_code: role === 'final_auditor' || (role === 'controller' && mode === 'finalize') ? 0 : null,
+      artifacts: [{ path: `temporary/${role}.json`, sha256: 'a'.repeat(64) }],
+      new_issues: [], verified_issues: [], required_reruns: [], next_role: null
+    };
+    if (role === 'template_architect') {
+      architectTurns += 1;
+      if (architectTurns === 1) {
+        // Self-owned finding, and NO upstream role named — so only self-repair can rescue this.
+        handoff.stage_status = 'failed';
+        handoff.recommended_status_code = 60;
+        handoff.next_role = 'controller';
+        handoff.new_issues = [{
+          issue_id: 'ISSUE-0001', severity: 'major', domain: 'reconstruction',
+          code: 'RESIDUAL_SOURCE_VALUE_PIXELS', stage: 'template_specification',
+          artifact: 'reconstruction_simulation.png', field: null, table: 'coo_form', cell: null,
+          bbox: [0, 0, 1, 1], evidence: '98560 residual ink pixels', owner: 'template_architect',
+          required_reruns: ['template_specification'], status: 'open'
+        }];
+      } else {
+        handoff.stage_status = 'ready_for_review';
+        handoff.verified_issues = ['ISSUE-0001'];
+      }
+    }
+    if (role === 'qa_auditor' && mode === 'edge') handoff.edge_decisions = fullEdgeDecisions();
+    return { text: `notes\n\`\`\`json\n${JSON.stringify(handoff)}\n\`\`\`` };
+  };
+  const controller = {
+    async query({ prompt }) { return reply(prompt); },
+    async followUp({ text }) { return reply(text); },
+    async downloadLastAssistantEntities({ outDir }) {
+      const out = [];
+      for (const name of PERSISTENT_FILES) {
+        const p = path.join(outDir, name);
+        await fs.writeFile(p, persistentFileContent(name));
+        out.push({ path: p, name });
+      }
+      return out;
+    },
+    async downloadLastAssistantFiles() { return []; }
+  };
+  const orch = new WorkflowOrchestrator({
+    roles: makeRoles(),
+    config: { perTurnTimeoutMs: 1000, enforceEdgeDecisions: true, maxSelfRepairs: 2 }
+  });
+  const res = await orch.run({ pdf: t.pdf, baseGenerator: t.gen, outDir: t.out, controller });
+  assert.equal(architectTurns, 2, 'the writer gets a second attempt with its own findings assigned');
+  // The analyst must NOT be re-run: the finding was self-owned, not upstream.
+  assert.equal(recorder.turns.filter((x) => x === 'template_analyst').length, 1);
+  assert.equal(res.statusCode, 0, 'the run proceeds once the writer fixes its own work');
+});
+
+test('run(): the FIRST creation stage can still recover when it blocks', async () => {
+  // Observed live: the analyst blocked with six blocker crops for unreadable lines — the honest
+  // behaviour its prompt asks for — and the run ended at status 80 in five minutes. It is the first
+  // write step, so it has no upstream role to return to, and the contract restricts issue `owner` to
+  // the two spec/generator writers, so its findings can never name itself either. It was the only role
+  // with no recovery path at all.
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  let analystTurns = 0;
+  const reply = (message) => {
+    const { role, mode } = roleFromMessage(message);
+    const runId = String(message).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
+    recorder.turns.push(mode ? `${role}/${mode}` : role);
+    const handoff = {
+      run_id: runId, role, mode, stage_status: 'passed',
+      recommended_status_code: role === 'final_auditor' || (role === 'controller' && mode === 'finalize') ? 0 : null,
+      artifacts: [{ path: `temporary/${role}.json`, sha256: 'a'.repeat(64) }],
+      new_issues: [], verified_issues: [], required_reruns: [], next_role: null
+    };
+    if (role === 'template_analyst') {
+      analystTurns += 1;
+      if (analystTurns === 1) {
+        handoff.stage_status = 'blocked';
+        handoff.recommended_status_code = 80;
+        handoff.next_role = 'controller';
+        // Note the owner: the contract only permits these two writers, never template_analyst.
+        handoff.new_issues = [{
+          issue_id: 'ISSUE-0001', severity: 'critical', domain: 'semantics',
+          code: 'STATIC_TEXT_UNREADABLE', stage: 'scan_inventory',
+          artifact: 'blockers/u001.png', field: null, table: 'coo_form', cell: null,
+          bbox: [0, 0, 1, 1], evidence: 'six lines could not be transcribed',
+          owner: 'template_architect', required_reruns: ['scan_inventory'], status: 'blocked'
+        }];
+      } else {
+        handoff.stage_status = 'ready_for_review';
+        handoff.verified_issues = ['ISSUE-0001'];
+      }
+    }
+    if (role === 'qa_auditor' && mode === 'edge') handoff.edge_decisions = fullEdgeDecisions();
+    return { text: `notes\n\`\`\`json\n${JSON.stringify(handoff)}\n\`\`\`` };
+  };
+  const controller = {
+    async query({ prompt }) { return reply(prompt); },
+    async followUp({ text }) { return reply(text); },
+    async downloadLastAssistantEntities({ outDir }) {
+      const out = [];
+      for (const name of PERSISTENT_FILES) {
+        const p = path.join(outDir, name);
+        await fs.writeFile(p, persistentFileContent(name));
+        out.push({ path: p, name });
+      }
+      return out;
+    },
+    async downloadLastAssistantFiles() { return []; }
+  };
+  const orch = new WorkflowOrchestrator({
+    roles: makeRoles(),
+    config: { perTurnTimeoutMs: 1000, enforceEdgeDecisions: true, maxSelfRepairs: 2 }
+  });
+  const res = await orch.run({ pdf: t.pdf, baseGenerator: t.gen, outDir: t.out, controller });
+  assert.equal(analystTurns, 2, 'the first creation stage gets a second attempt');
+  assert.equal(res.statusCode, 0, 'the run proceeds after it resolves its own blockers');
+});
+
+test('run(): self-repair is bounded and then fails with the causal status', async () => {
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  let architectTurns = 0;
+  const reply = (message) => {
+    const { role, mode } = roleFromMessage(message);
+    const runId = String(message).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
+    recorder.turns.push(mode ? `${role}/${mode}` : role);
+    const handoff = {
+      run_id: runId, role, mode, stage_status: 'passed', recommended_status_code: null,
+      artifacts: [{ path: `temporary/${role}.json`, sha256: 'a'.repeat(64) }],
+      new_issues: [], verified_issues: [], required_reruns: [], next_role: null
+    };
+    if (role === 'template_architect') {
+      architectTurns += 1;
+      handoff.stage_status = 'failed';
+      handoff.recommended_status_code = 60;
+      handoff.next_role = 'controller';
+      handoff.new_issues = [{
+        issue_id: `ISSUE-000${architectTurns}`, severity: 'major', domain: 'reconstruction',
+        code: 'RESIDUAL_SOURCE_VALUE_PIXELS', stage: 'template_specification',
+        artifact: 'sim.png', field: null, table: 'coo_form', cell: null, bbox: [0, 0, 1, 1],
+        evidence: 'still residual', owner: 'template_architect',
+        required_reruns: ['template_specification'], status: 'open'
+      }];
+    }
+    return { text: `notes\n\`\`\`json\n${JSON.stringify(handoff)}\n\`\`\`` };
+  };
+  const controller = {
+    async query({ prompt }) { return reply(prompt); },
+    async followUp({ text }) { return reply(text); },
+    async downloadLastAssistantEntities() { return []; },
+    async downloadLastAssistantFiles() { return []; }
+  };
+  const orch = new WorkflowOrchestrator({
+    roles: makeRoles(), config: { perTurnTimeoutMs: 1000, maxSelfRepairs: 2 }
+  });
+  const res = await orch.run({ pdf: t.pdf, baseGenerator: t.gen, outDir: t.out, controller });
+  assert.equal(architectTurns, 3, 'first attempt plus exactly maxSelfRepairs retries');
+  assert.equal(res.success, false);
+  assert.equal(res.statusCode, 60);
+});
+
+test('run(): upstream recovery is bounded and then fails with the blocked status', async () => {
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  let analystTurns = 0;
+  const reply = (message) => {
+    const { role, mode } = roleFromMessage(message);
+    const runId = String(message).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
+    recorder.turns.push(mode ? `${role}/${mode}` : role);
+    const handoff = {
+      run_id: runId, role, mode, stage_status: 'passed', recommended_status_code: null,
+      artifacts: [{ path: `temporary/${role}.json`, sha256: 'a'.repeat(64) }],
+      new_issues: [], verified_issues: [], required_reruns: [], next_role: null
+    };
+    if (role === 'template_analyst') analystTurns += 1;
+    if (role === 'template_architect') {
+      // Never satisfied: the analyst keeps handing back the same deficiency.
+      handoff.stage_status = 'blocked';
+      handoff.recommended_status_code = 80;
+      handoff.next_role = 'template_analyst';
+      handoff.required_reruns = ['scan_inventory_static_text_transcription'];
+    }
+    return { text: `notes\n\`\`\`json\n${JSON.stringify(handoff)}\n\`\`\`` };
+  };
+  const controller = {
+    async query({ prompt }) { return reply(prompt); },
+    async followUp({ text }) { return reply(text); },
+    async downloadLastAssistantEntities() { return []; },
+    async downloadLastAssistantFiles() { return []; }
+  };
+  const orch = new WorkflowOrchestrator({
+    roles: makeRoles(),
+    config: { perTurnTimeoutMs: 1000, maxUpstreamRecoveries: 2 }
+  });
+  const res = await orch.run({ pdf: t.pdf, baseGenerator: t.gen, outDir: t.out, controller });
+  assert.equal(analystTurns, 3, 'the first pass plus exactly maxUpstreamRecoveries retries');
+  assert.equal(res.statusCode, 80, 'an unresolvable blocker still ends the run as blocked/partial');
+  assert.equal(res.success, false);
+});
+
+test('run(): a repaired issue the writer never marked fixed still recovers the gate', async () => {
+  // Observed live: the architect applied the whole repair plan and returned `verified_issues: []`,
+  // so the issue stayed `open` rather than `fixed`. If the re-audit then passes without echoing the
+  // id, the gate must still recover — otherwise every round re-plans the same issue until the budget
+  // runs out, at roughly an hour per round.
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  const orch = new WorkflowOrchestrator({
+    roles: makeRoles(),
+    config: { perTurnTimeoutMs: 1000, maxRepairRounds: 4, enforceEdgeDecisions: true }
+  });
+  const res = await orch.run({
+    pdf: t.pdf, baseGenerator: t.gen, outDir: t.out,
+    controller: terseAuditController(recorder, { writerReportsFix: false })
+  });
+  assert.ok(res.gatesPassed.includes('template'), 'the template gate must recover');
+  assert.equal(res.issues.find((i) => i.issue_id === 'ISSUE-0001').status, 'verified');
+  const audits = recorder.turns.filter((x) => x === 'qa_auditor/template').length;
+  assert.ok(audits <= 3, `the loop must not burn every round (template audits: ${audits})`);
+  assert.equal(res.statusCode, 0);
+});
+
+test('run(): an issue fixed via upstream recovery does not block a gate whose audit passed', async () => {
+  // Observed live, and the closest a run came to passing: the architect blocked on the analyst's
+  // inventory, upstream recovery fixed it, the template audit later PASSED — and the gate still failed
+  // because that upstream issue sat at "fixed" and was never recorded as verified. It had never been in
+  // any repair round's assigned list, so tracking only per-round issues could not reach it.
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  let architectTurns = 0;
+  let templateAudits = 0;
+  const reply = (message) => {
+    const { role, mode } = roleFromMessage(message);
+    const runId = String(message).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
+    recorder.turns.push(mode ? `${role}/${mode}` : role);
+    const handoff = {
+      run_id: runId, role, mode, stage_status: 'passed',
+      recommended_status_code: role === 'final_auditor' || (role === 'controller' && mode === 'finalize') ? 0 : null,
+      artifacts: [{ path: `temporary/${role}.json`, sha256: 'a'.repeat(64) }],
+      new_issues: [], verified_issues: [], required_reruns: [], next_role: null
+    };
+    if (role === 'template_architect') {
+      architectTurns += 1;
+      if (architectTurns === 1) {
+        // Blocks on upstream work, raising a CRITICAL issue that upstream recovery will resolve.
+        handoff.stage_status = 'blocked';
+        handoff.recommended_status_code = 80;
+        handoff.next_role = 'template_analyst';
+        handoff.required_reruns = ['scan_inventory_static_text_transcription'];
+        handoff.new_issues = [{
+          issue_id: 'ISSUE-0001', severity: 'critical', domain: 'geometry',
+          code: 'SCAN_INVENTORY_CONTAINER_GEOMETRY_INCONSISTENT', stage: 'template_specification',
+          artifact: 'scan_inventory.json', field: null, table: 'coo_form', cell: 'box_8',
+          bbox: [0, 0, 1, 1], evidence: 'container geometry inconsistent', owner: 'template_architect',
+          required_reruns: ['scan_inventory'], status: 'open'
+        }];
+      } else {
+        handoff.stage_status = 'ready_for_review';
+        // The writer reports it fixed — status becomes `fixed`, never `verified`.
+        handoff.verified_issues = ['ISSUE-0001'];
+      }
+    }
+    if (role === 'qa_auditor' && mode === 'template') {
+      templateAudits += 1;
+      // Fails once so a repair loop starts, then passes — echoing nothing.
+      if (templateAudits === 1) {
+        handoff.stage_status = 'failed';
+        handoff.new_issues = [{
+          issue_id: 'ISSUE-0002', severity: 'major', domain: 'geometry', code: 'BBOX',
+          stage: 'template', artifact: 'a.png', field: null, table: 'coo_form', cell: null,
+          bbox: [0, 0, 1, 1], evidence: 'bbox not tight', owner: 'template_architect',
+          required_reruns: ['template'], status: 'open'
+        }];
+      }
+    }
+    if (role === 'qa_auditor' && mode === 'edge') handoff.edge_decisions = fullEdgeDecisions();
+    return { text: `notes\n\`\`\`json\n${JSON.stringify(handoff)}\n\`\`\`` };
+  };
+  const controller = {
+    async query({ prompt }) { return reply(prompt); },
+    async followUp({ text }) { return reply(text); },
+    async downloadLastAssistantEntities({ outDir }) {
+      const out = [];
+      for (const name of PERSISTENT_FILES) {
+        const p = path.join(outDir, name);
+        await fs.writeFile(p, persistentFileContent(name));
+        out.push({ path: p, name });
+      }
+      return out;
+    },
+    async downloadLastAssistantFiles() { return []; }
+  };
+  const orch = new WorkflowOrchestrator({
+    roles: makeRoles(),
+    config: { perTurnTimeoutMs: 1000, enforceEdgeDecisions: true, maxRepairRounds: 4, maxUpstreamRecoveries: 2 }
+  });
+  const res = await orch.run({ pdf: t.pdf, baseGenerator: t.gen, outDir: t.out, controller });
+  assert.ok(res.gatesPassed.includes('template'), 'a passing audit must close the gate');
+  assert.equal(res.issues.find((i) => i.issue_id === 'ISSUE-0001').status, 'verified',
+    'the upstream-recovered issue is recorded as verified by the passing audit');
+  assert.equal(res.statusCode, 0);
+});
+
+test('run(): a passing re-audit that does not echo issue IDs still recovers the gate', async () => {
+  // The deadlock this prevents: the writer marks issues `fixed`, the independent auditor re-validates
+  // and returns `passed` but lists nothing in `verified_issues`. Those issues stay "fixed" — which
+  // blocks release — while no longer being "open", so the next repair round has nothing to plan and
+  // every remaining round is spent achieving nothing before the gate fails.
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  let templateAudits = 0;
+  const controller = {
+    async query({ prompt }) { return reply(prompt); },
+    async followUp({ text }) { return reply(text); },
+    async downloadLastAssistantEntities({ outDir }) {
+      const out = [];
+      for (const name of PERSISTENT_FILES) {
+        const p = path.join(outDir, name);
+        await fs.writeFile(p, persistentFileContent(name));
+        out.push({ path: p, name });
+      }
+      return out;
+    },
+    async downloadLastAssistantFiles() { return []; }
+  };
+  function reply(message) {
+    const { role, mode } = roleFromMessage(message);
+    const runId = String(message).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
+    recorder.turns.push(mode ? `${role}/${mode}` : role);
+    const handoff = {
+      run_id: runId, role, mode, stage_status: 'passed',
+      recommended_status_code: role === 'final_auditor' || (role === 'controller' && mode === 'finalize') ? 0 : null,
+      artifacts: [{ path: `temporary/${role}.json`, sha256: 'a'.repeat(64) }],
+      new_issues: [], verified_issues: [], required_reruns: [], next_role: null
+    };
+    if (role === 'qa_auditor' && mode === 'template') {
+      templateAudits += 1;
+      if (templateAudits === 1) {
+        handoff.stage_status = 'failed';
+        handoff.new_issues = [{
+          issue_id: 'ISSUE-0001', severity: 'major', domain: 'geometry', code: 'BBOX',
+          stage: 'template', artifact: 'a.png', field: null, table: null, cell: null,
+          bbox: [0, 0, 1, 1], evidence: 'clipped glyphs', owner: 'template_architect',
+          required_reruns: ['template'], status: 'open'
+        }];
+      }
+      // Every later template audit passes but deliberately echoes NO ids.
+    }
+    if (role === 'template_architect' && templateAudits >= 1) {
+      // The writer reports the fix (contract: writers mark fixed, never verified).
+      handoff.stage_status = 'ready_for_review';
+      handoff.verified_issues = ['ISSUE-0001'];
+    }
+    if (role === 'qa_auditor' && mode === 'edge') handoff.edge_decisions = fullEdgeDecisions();
+    return { text: `notes\n\`\`\`json\n${JSON.stringify(handoff)}\n\`\`\`` };
+  }
+
+  const orch = new WorkflowOrchestrator({
+    roles: makeRoles(),
+    config: { perTurnTimeoutMs: 1000, maxRepairRounds: 4, enforceEdgeDecisions: true }
+  });
+  const res = await orch.run({ pdf: t.pdf, baseGenerator: t.gen, outDir: t.out, controller });
+  assert.ok(res.gatesPassed.includes('template'), 'the template gate must recover');
+  const repairAudits = recorder.turns.filter((x) => x === 'qa_auditor/template').length;
+  assert.ok(repairAudits <= 3, `the loop must not burn every round (template audits: ${repairAudits})`);
+  const issue = res.issues.find((i) => i.issue_id === 'ISSUE-0001');
+  assert.equal(issue.status, 'verified', "the auditor's pass is recorded as the verification");
+  assert.equal(res.statusCode, 0, 'the run completes once the gate recovers');
+});
+
+test('run(): a partial (blocked) repair plan still reaches the owning writer', async () => {
+  // Observed live: the Repair Engineer returned `blocked` because 1 of 8 issues was not locally
+  // repairable, while carrying five complete change groups for the other seven. The gate was
+  // abandoned on round 1 with no repair attempted at all.
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  const base = scriptedController(recorder, { fail: { 'qa_auditor/template': 1 } })();
+  const controller = {
+    ...base,
+    async followUp(args) {
+      const { role } = roleFromMessage(args.text);
+      if (role === 'repair_engineer') {
+        const runId = String(args.text).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
+        const handoff = {
+          run_id: runId, role: 'repair_engineer', mode: null,
+          stage_status: 'blocked', recommended_status_code: 80,
+          artifacts: [{ path: 'temporary/plan.json', sha256: 'a'.repeat(64) }],
+          new_issues: [], verified_issues: [], required_reruns: ['template'], next_role: 'template_architect'
+        };
+        return { text: '```json\n' + JSON.stringify(handoff) + '\n```' };
+      }
+      return base.followUp(args);
+    }
+  };
+  const orch = new WorkflowOrchestrator({ roles: makeRoles(), config: { perTurnTimeoutMs: 1000, maxRepairRounds: 1 } });
+  await orch.run({ pdf: t.pdf, baseGenerator: t.gen, outDir: t.out, controller });
+  // The architect authors the spec once in the normal plan; a second turn means the repair was
+  // actually applied rather than discarded with the plan.
+  const architectTurns = recorder.turns.filter((x) => x === 'template_architect').length;
+  assert.equal(architectTurns, 2, 'the architect must apply the repairable part of a partial plan');
+});
+
+test('run(): a repair plan that failed outright ends the gate without calling a writer', async () => {
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  const base = scriptedController(recorder, { fail: { 'qa_auditor/template': 1 } })();
+  const controller = {
+    ...base,
+    async followUp(args) {
+      const { role } = roleFromMessage(args.text);
+      if (role === 'repair_engineer') {
+        const runId = String(args.text).match(/Active run id: ([A-Za-z0-9_-]+)/)?.[1] || 'RUN-0001';
+        return { text: '```json\n' + JSON.stringify({
+          run_id: runId, role: 'repair_engineer', mode: null,
+          stage_status: 'failed', recommended_status_code: 50,
+          artifacts: [{ path: 'temporary/plan.json', sha256: 'a'.repeat(64) }],
+          new_issues: [], verified_issues: [], required_reruns: [], next_role: 'controller'
+        }) + '\n```' };
+      }
+      return base.followUp(args);
+    }
+  };
+  const orch = new WorkflowOrchestrator({ roles: makeRoles(), config: { perTurnTimeoutMs: 1000, maxRepairRounds: 1 } });
+  const res = await orch.run({ pdf: t.pdf, baseGenerator: t.gen, outDir: t.out, controller });
+  assert.equal(res.success, false);
+  const architectTurns = recorder.turns.filter((x) => x === 'template_architect').length;
+  assert.equal(architectTurns, 1, 'a planner that could not plan at all ends the gate, no repair write');
+});
+
+test('run(): a ChatGPT server error re-sends the same turn instead of asking for JSON again', async () => {
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  const orch = new WorkflowOrchestrator({
+    roles: makeRoles(),
+    config: { perTurnTimeoutMs: 1000, serverErrorRetries: 2, serverErrorBackoffMs: [0, 0] }
+  });
+  const res = await orch.run({
+    pdf: t.pdf, baseGenerator: t.gen, outDir: t.out,
+    controller: serverErrorController(recorder, 1)
+  });
+  assert.equal(res.statusCode, 0, 'the run recovers from a transient provider error');
+  assert.equal(recorder.errorReplies, 1);
+  // The opening turn was re-sent verbatim; the useless "reply again with valid JSON" nag, which
+  // used to consume the run's only retry against an error card, is never sent.
+  assert.equal(recorder.messages[0], recorder.messages[1], 'the identical turn is re-sent');
+  assert.ok(
+    !recorder.messages.some((m) => /did not end with a valid shared-handoff/.test(String(m))),
+    'no reformat re-ask is sent for a server error'
+  );
+  assert.equal(recorder.turns[0], 'controller/start');
+});
+
+test('run(): a persistent ChatGPT server error raises a retryable error carrying the completed turns', async () => {
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  const orch = new WorkflowOrchestrator({
+    roles: makeRoles(),
+    config: { perTurnTimeoutMs: 1000, serverErrorRetries: 1, serverErrorBackoffMs: [0] }
+  });
+  // Fail every turn from the third onward: the first two turns succeed, so there is real work to
+  // preserve when the outage hits.
+  let calls = 0;
+  const base = scriptedController(recorder)();
+  const controller = {
+    ...base,
+    async query(args) { calls += 1; return base.query(args); },
+    async followUp(args) {
+      calls += 1;
+      if (calls >= 3) {
+        return { text: 'Something went wrong while processing your request.', meta: { hasError: true } };
+      }
+      return base.followUp(args);
+    }
+  };
+  await assert.rejects(
+    () => orch.run({ pdf: t.pdf, baseGenerator: t.gen, outDir: t.out, controller }),
+    (err) => {
+      assert.equal(err.message, 'chatgpt_server_error');
+      assert.equal(err.retryable, true, 'the caller must retry this file rather than record a status');
+      assert.ok(Array.isArray(err.transcript) && err.transcript.length >= 2,
+        'the completed turns ride along for the post-mortem');
+      assert.ok(Array.isArray(err.issues));
+      return true;
+    }
+  );
+});
+
+test('run(): a controller throw carries the transcript of the turns that did complete', async () => {
+  const t = await tmpOut();
+  const recorder = { turns: [] };
+  const base = scriptedController(recorder)();
+  let calls = 0;
+  const controller = {
+    ...base,
+    async query(args) { calls += 1; return base.query(args); },
+    async followUp(args) {
+      calls += 1;
+      if (calls >= 3) {
+        const err = new Error('response_stalled_no_output');
+        err.retryable = true;
+        throw err;
+      }
+      return base.followUp(args);
+    }
+  };
+  await assert.rejects(
+    () => orch_run_helper(t, controller),
+    (err) => {
+      assert.equal(err.message, 'response_stalled_no_output');
+      assert.ok(err.transcript.length >= 2, 'completed turns survive a mid-run controller throw');
+      return true;
+    }
+  );
+});
+
+function orch_run_helper(t, controller) {
+  const orch = new WorkflowOrchestrator({ roles: makeRoles(), config: { perTurnTimeoutMs: 1000 } });
+  return orch.run({ pdf: t.pdf, baseGenerator: t.gen, outDir: t.out, controller });
+}
 
 test('loadRoles reads the tracked workflow/roles prompts', async () => {
   const roles = await loadRoles(path.join(process.cwd(), 'workflow'));

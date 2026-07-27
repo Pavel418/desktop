@@ -42,7 +42,13 @@ export const RESPONSE_COMPLETION_DEFAULTS = Object.freeze({
   terminalMs: 5000,
   incompleteTerminalMs: 15000,
   unknownFallbackMs: 60000,
-  incompleteFallbackMs: 10 * 60_000
+  incompleteFallbackMs: 10 * 60_000,
+  // Hard ceiling on "the turn is busy but has produced literally zero characters". A ChatGPT turn
+  // whose request died server-side keeps the stop button up forever, so idle-based completion never
+  // fires and only the per-turn timeout (2h) ends it — one such turn stalled a whole batch for two
+  // hours. Deliberately generous: legitimate heavy turns in this workflow think and run tools for
+  // many minutes, but they show *some* text well before this.
+  noOutputMs: 30 * 60_000
 });
 
 // Pure decision boundary for the response waiter. UI idleness alone is deliberately
@@ -53,6 +59,13 @@ export const RESPONSE_COMPLETION_DEFAULTS = Object.freeze({
 // longer fail-safe interval.
 export function responseCompletionDecision(state, config = RESPONSE_COMPLETION_DEFAULTS) {
   const text = String(state?.text || '');
+  // Stall detection comes first: a turn with zero characters after noOutputMs is not "still
+  // working", it is a dead request that will never complete. `stalled` is not completion — the
+  // caller aborts the turn so it can be retried in a fresh chat instead of burning the timeout.
+  const noOutputMs = Number(config?.noOutputMs) || 0;
+  if (!text && noOutputMs > 0 && (Number(state?.elapsedMs) || 0) >= noOutputMs) {
+    return { done: false, stalled: true, reason: 'no_output_stall' };
+  }
   if (!state?.started || !text || state?.busy || !state?.stable) return { done: false, reason: null };
 
   const idleForMs = Number(state?.idleForMs) || 0;
@@ -129,6 +142,9 @@ export class ChatGPTController {
         }
       : null;
     this.mutex = new Mutex();
+    // How many files the current turn attached, so the send-gate can require one completed upload
+    // sequence per file rather than trusting attachment chips.
+    this.expectedAttachments = 0;
     this.blocked = false;
     this.blockedKind = null;
     this.serverId = null;
@@ -136,6 +152,34 @@ export class ChatGPTController {
     this.currentRun = null;
     // Network-layer attachment upload watcher, live from #attachFiles through the send-gate.
     this.uploadWatch = null;
+  }
+
+  // Fail closed on any upload that did not become an attachment: a rejected response status
+  // (5xx/429/4xx) or a transport failure. Throws a retryable error so the caller can wait out a
+  // provider-side upload outage and retry in a fresh chat, instead of proceeding with a prompt
+  // whose files the model will never see. Returns silently when every upload is healthy.
+  #assertUploadsHealthy(netSnap, where) {
+    if (!netSnap || !(Number(netSnap.failed) > 0)) return;
+    const broken = (netSnap.requests || []).filter(
+      (r) => r.state === 'http_error' || r.state === 'failed' || r.state === 'canceled'
+    );
+    const statuses = netSnap.httpErrorStatuses?.length
+      ? netSnap.httpErrorStatuses.join(',')
+      : broken.map((r) => r.error || r.state).join(',');
+    this.#debug(
+      `${where}: attachment upload rejected — failed=${netSnap.failed} statuses=[${statuses}]\n` +
+      broken.map((r) => `  · ${r.state} ${r.method} ${r.url} status=${r.status ?? '-'}${r.error ? ` error=${r.error}` : ''}`).join('\n')
+    );
+    const err = new Error('attachment_upload_rejected');
+    err.retryable = true;
+    err.data = {
+      where,
+      failed: netSnap.failed,
+      httpErrors: netSnap.httpErrors ?? null,
+      statuses: netSnap.httpErrorStatuses ?? [],
+      requests: broken.map((r) => ({ method: r.method, url: r.url, status: r.status, state: r.state, error: r.error }))
+    };
+    throw err;
   }
 
   // Compact one-line summary of the current network upload snapshot for debug logs.
@@ -153,10 +197,8 @@ export class ChatGPTController {
       this.uploadWatch?.off?.();
     } catch {}
     this.uploadWatch = null;
-  }
-
-  async runExclusive(fn) {
-    return await this.mutex.run(fn);
+    // The per-file expectation belongs to the watch window; a follow-up turn attaches nothing.
+    this.expectedAttachments = 0;
   }
 
   async navigate(url) {
@@ -176,29 +218,6 @@ export class ChatGPTController {
 
   async getUrl() {
     return await this.page.getUrl();
-  }
-
-  async readPageText({ maxChars = 200_000 } = {}) {
-    const text = await this.#eval(`(() => {
-      const cap = ${maxChars};
-      const clean = (s) => String(s || '').replace(/\\u0000/g, '').replace(/\\s+\\n/g, '\\n').trim();
-      const root = document.querySelector('main') || document.body || document.documentElement;
-
-      let txt = clean(root?.innerText) || clean(document.body?.innerText) || clean(document.documentElement?.innerText);
-      if (!txt) txt = clean(root?.textContent) || clean(document.body?.textContent) || clean(document.documentElement?.textContent);
-
-      // Last fallback for heavily client-rendered/shell pages where innerText may be empty pre-hydration.
-      if (!txt) {
-        const hints = Array.from(document.querySelectorAll('button, a, input, textarea, [role=\"button\"], [aria-label], [placeholder]'))
-          .slice(0, 400)
-          .map((n) => [n.getAttribute('aria-label'), n.getAttribute('placeholder'), n.textContent].filter(Boolean).join(' ').trim())
-          .filter(Boolean);
-        txt = clean(hints.join('\\n'));
-      }
-
-      return txt.slice(0, cap);
-    })()`);
-    return String(text || '');
   }
 
   async detectChallenge() {
@@ -547,8 +566,6 @@ export class ChatGPTController {
           return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
         };
         const stopVisible = Array.from(document.querySelectorAll(${stopSel})).some(visible);
-        const send = Array.from(document.querySelectorAll(${sendSel})).find(visible);
-        const sendDisabled = !!send && !!send.disabled;
 
         const promptCandidates = Array.from(document.querySelectorAll(${promptSel}));
         const fallback = Array.from(document.querySelectorAll('main textarea, main [role=\"textbox\"], main [contenteditable=\"true\"], textarea, [role=\"textbox\"], [contenteditable=\"true\"]'));
@@ -571,10 +588,43 @@ export class ChatGPTController {
             break;
           }
         }
-        return { stopVisible, sendDisabled, promptLen };
+        return { stopVisible, promptLen };
       })()`);
 
-      if (snap?.stopVisible || snap?.sendDisabled || snap?.promptLen === 0) return true;
+      // A disabled send button is NOT proof of a send — it is also disabled while attachments
+      // are still "processing" (the ChatGPT-lag stall). Only a generation actually starting
+      // (stop button) or the composer clearing counts here; the caller additionally requires a
+      // persistent user turn via #confirmPosted before treating the send as real.
+      if (snap?.stopVisible || snap?.promptLen === 0) return true;
+      await sleep(pollMs);
+    }
+    return false;
+  }
+
+  // Count the user-message turns currently in the thread. A real send adds exactly one; a
+  // disabled button or a briefly-cleared composer does not.
+  async #countUserMessages() {
+    return await this.#eval(
+      `document.querySelectorAll('[data-message-author-role="user"]').length`
+    ).catch(() => 0);
+  }
+
+  // Definitive confirmation that a send actually landed: a NEW user turn appears in the thread
+  // (or the answer is already streaming). ChatGPT restores an unsent draft to the composer after
+  // a failed request, so "composer cleared" alone can be a transient that reverts — this gate is
+  // what turns a silent non-send into a fast, retryable failure instead of a multi-hour hang.
+  async #confirmPosted(baselineUserMsgs, { timeoutMs = 6000, pollMs = 200 } = {}) {
+    const stopSel = JSON.stringify(this.selectors.stopButton);
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      this.#throwIfStopRequested();
+      const snap = await this.#eval(`(() => {
+        const visible = (n) => { if (!n) return false; const r = n.getBoundingClientRect(); const s = getComputedStyle(n); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+        const users = document.querySelectorAll('[data-message-author-role="user"]').length;
+        const stop = Array.from(document.querySelectorAll(${stopSel})).some(visible);
+        return { users, stop };
+      })()`).catch(() => null);
+      if (snap && (snap.users > baselineUserMsgs || snap.stop)) return true;
       await sleep(pollMs);
     }
     return false;
@@ -643,6 +693,16 @@ export class ChatGPTController {
             `failed=${netSnap.failed} oldestInflightMs=${netSnap.oldestInflightMs} ` +
             `(domUploading=${snap.uploading}, sendReady=${snap.sendReady})`
           );
+        }
+        // Never dispatch a prompt whose attachments did not upload. The composer can look
+        // perfectly ready — chips present, send enabled — while the file bytes were rejected
+        // server-side (HTTP 5xx/429) or dropped in transport; sending then produces either a
+        // silent non-send or a turn that never answers.
+        this.#assertUploadsHealthy(netSnap, 'send-gate');
+        // Same invariant, one step stronger: every attached file needs a completed upload
+        // sequence. This is the check that would have caught the wedged composer directly.
+        if (this.expectedAttachments > 0) {
+          this.#assertUploadSequencesComplete(this.expectedAttachments, 'send-gate');
         }
       }
 
@@ -737,9 +797,86 @@ export class ChatGPTController {
     }
   }
 
+  // Why a send can silently do nothing, verified against the live app: with attachments present,
+  // ChatGPT's submit button is NOT `disabled` and reports every ready signal we can read, yet the
+  // click is a no-op while it still considers a file upload pending — the button renders a spinner
+  // and its tooltip says "File upload pending". That tooltip is lazily rendered and empty until it
+  // is shown, so it cannot be used as a pre-click gate. The one authoritative signal is whether a
+  // new user turn actually appeared, so a failed send waits and tries the whole sequence again
+  // instead of failing the file: the composer still holds the text and the chips, and the pending
+  // upload usually settles within seconds.
+  static SEND_RETRY_WAITS_MS = [5_000, 15_000, 30_000];
+
+  // How long to wait for each attached file's upload sequence to complete. Real sequences finished
+  // in ~4s in every observed run, so this is generous; tests override it.
+  static UPLOAD_SEQUENCE_TIMEOUT_MS = 30_000;
+
+  // Settle time after the composer looks hydrated, before the file input is set. Measured: a cold
+  // page needed several seconds before ChatGPT would dispatch uploads for a selected file.
+  static ATTACH_SETTLE_MS = 3_000;
+
   async #clickSend() {
+    const waits = ChatGPTController.SEND_RETRY_WAITS_MS;
+    // One stable baseline for every attempt. Re-reading it per attempt would hide a late post as a
+    // failure and then post the same prompt twice.
+    const baseUsers = await this.#countUserMessages();
+    for (let attempt = 0; attempt <= waits.length; attempt++) {
+      // The first attempt gives the composer the full send-gate patience; retries use a short one,
+      // because readiness was already established once and a composer that has wedged will not
+      // recover — waiting 120s per retry only delays the fresh-chat retry that does fix it.
+      const posted = await this.#attemptSend(baseUsers, { settleTimeoutMs: attempt === 0 ? undefined : 30_000 });
+      if (posted) return;
+      if (attempt === waits.length) break;
+      await this.#captureSendBlockedDiagnostics(attempt + 1);
+      const waitMs = waits[attempt];
+      this.#debug(`send: not posted (attempt ${attempt + 1}/${waits.length + 1}) — waiting ${Math.round(waitMs / 1000)}s and retrying the send`);
+      await sleep(waitMs);
+      // A send that landed late (after #confirmPosted gave up) must never be sent again. Use the
+      // same proof #confirmPosted uses — a new user turn OR an answer already streaming.
+      if (await this.#confirmPosted(baseUsers, { timeoutMs: 1200, pollMs: 200 })) {
+        this.#debug('send: the earlier send did land during the wait; not re-sending');
+        return;
+      }
+    }
+    const err = new Error('send_not_triggered');
+    err.retryable = true;
+    err.data = { host: this.lastSendHost || null, attempts: waits.length + 1 };
+    throw err;
+  }
+
+  // One-shot diagnostic for a send that did not post. The submit button's tooltip is rendered once
+  // it has been shown (the click hovers it), so by this point it usually carries ChatGPT's own
+  // reason — "File upload pending" being the one observed live.
+  async #captureSendBlockedDiagnostics(attempt) {
+    const info = await this.#eval(`(() => {
+      const clip = (s, n) => String(s || '').replace(/\\s+/g, ' ').trim().slice(0, n);
+      const prompt = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]');
+      const composer = prompt?.closest('form');
+      const send = composer?.querySelector('#composer-submit-button, button[data-testid="send-button"]');
+      const ref = send && (send.getAttribute('aria-describedby') || send.getAttribute('interestfor'));
+      const tip = ref ? document.getElementById(ref) : null;
+      return {
+        tipText: clip(tip?.innerText || tip?.textContent, 120) || null,
+        sendDisabled: send ? !!send.disabled : null,
+        sendIcon: send ? clip(Array.from(send.querySelectorAll('svg use')).map((u) => u.getAttribute('href')).join(','), 120) : null,
+        chips: composer ? composer.querySelectorAll('button[aria-label*="remove file" i], button[aria-label*="remove attachment" i]').length : -1,
+        promptLen: String(prompt?.innerText || '').trim().length,
+        userTurns: document.querySelectorAll('[data-message-author-role="user"]').length
+      };
+    })()`).catch(() => null);
+    if (!info) return;
+    this.#debug(
+      `send-blocked (attempt ${attempt}): reason="${info.tipText ?? '(tooltip not rendered)'}" ` +
+      `disabled=${info.sendDisabled} chips=${info.chips} promptLen=${info.promptLen} ` +
+      `userTurns=${info.userTurns} icon=${info.sendIcon}`
+    );
+  }
+
+  // Perform one full send attempt (button click → form submit → Enter variants) and report whether
+  // a new user turn actually landed. Returns true when the message posted.
+  async #attemptSend(baseUsers, { settleTimeoutMs } = {}) {
     await this.#emitProgress({ phase: 'sending_prompt' });
-    await this.#waitForUploadsToSettle();
+    await this.#waitForUploadsToSettle(settleTimeoutMs ? { timeoutMs: settleTimeoutMs } : {});
     const sendSel = JSON.stringify(this.selectors.sendButton);
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const res = await this.#eval(`(() => {
@@ -956,11 +1093,16 @@ export class ChatGPTController {
       }
     }
 
-    if (!sent) {
-      const err = new Error('send_not_triggered');
-      err.data = { host: res?.host || null };
-      throw err;
-    }
+    // Final authority: the message only counts as sent when a NEW user turn is present in the
+    // thread (or the answer is already streaming). This is checked regardless of the per-attempt
+    // heuristics — it rescues a real send whose signal we missed, and rejects a "send" that never
+    // posted or was reverted by ChatGPT, so the turn fails fast instead of hanging on a reply that
+    // will never come.
+    this.lastSendHost = res?.host || null;
+    const posted = await this.#confirmPosted(baseUsers);
+    if (posted) return true;
+    this.#debug(`send: no new user turn appeared (sawTransientSignal=${sent})`);
+    return false;
   }
 
   #debug(msg) {
@@ -986,9 +1128,11 @@ export class ChatGPTController {
   }
 
   async #attachFiles(files) {
+    this.expectedAttachments = 0;
     if (!files?.length) return;
     await this.#emitProgress({ phase: 'uploading_files' });
     const absFiles = files.map((p) => path.resolve(p));
+    this.expectedAttachments = absFiles.length;
     for (const f of absFiles) await fs.access(f);
     const baseNames = absFiles.map((f) => path.basename(f));
     this.#debug(`attach: uploading ${absFiles.length} file(s): ${baseNames.join(', ')}`);
@@ -1007,9 +1151,13 @@ export class ChatGPTController {
       });
     }
 
-    // Give React time to wire the hidden input's change handler before setting it.
-    await this.#eval(`(() => { const e = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]'); if (e) e.focus(); return true; })()`).catch(() => {});
-    await sleep(1200);
+    // Wait for the composer to be genuinely hydrated before touching the file input. A fixed
+    // 1200ms guess was not enough on a cold page: the change event still produced an attachment
+    // chip, but ChatGPT never dispatched the upload for that file, leaving a phantom attachment it
+    // then waited on forever ("File upload pending") so every send silently did nothing. Measured
+    // live: attaching ~8s after the chat opened uploaded both files reliably, while attaching
+    // ~1.2s in lost the first file's upload and its chip took 5.6s to appear.
+    await this.#waitForComposerHydration();
 
     // Upload files independently. Re-sending a whole partially successful batch can
     // replace the input selection or trigger duplicate-file handling in ChatGPT.
@@ -1075,9 +1223,19 @@ export class ChatGPTController {
 
       if (!registered) {
         const err = new Error('attachment_not_registered');
+        err.retryable = true;
         err.data = { file: fileName, files: baseNames, ...settle, expected: baseNames.length };
         throw err;
       }
+
+      // Let this file's bytes finish before touching the file input again. Setting the input for
+      // the next file while the previous upload is still being kicked off was observed to lose the
+      // first file's upload entirely: its chip stayed on screen, no POST/PUT/process_upload_stream
+      // ever ran for it, and ChatGPT then blocked every send with "File upload pending".
+      await this.#waitForUploadSequences(fileIndex + 1, {
+        timeoutMs: ChatGPTController.UPLOAD_SEQUENCE_TIMEOUT_MS,
+        label: fileName
+      });
     }
 
     settle = await this.#waitForAttachments({ baseNames, timeoutMs: 20_000, maxQuietMs: 6000 });
@@ -1089,15 +1247,112 @@ export class ChatGPTController {
         this.#debug(`attach: composer HTML (truncated):\n${dump}`);
       }
       const err = new Error('attachment_not_registered');
+      err.retryable = true;
       err.data = { files: baseNames, ...settle, expected: baseNames.length };
       throw err;
     }
 
-    // Chips are present. Report the network picture: if the upload requests have not
-    // finished here, the file is selected but its bytes are still in flight (or stalled)
-    // and the send-gate is what will actually wait them out.
+    // Chips are present, and the per-file loop above already waited for each file's upload
+    // sequence. Report the final network picture and fail closed on anything that did not land:
+    // a rejected upload, or a chip whose bytes never travelled.
     const summary = this.#uploadSummary();
     if (summary) this.#debug(`attach: chips settled; ${summary}`);
+    this.#assertUploadsHealthy(this.uploadWatch?.snapshot?.(), 'attach');
+    this.#assertUploadSequencesComplete(absFiles.length, 'attach');
+  }
+
+  // Wait until `expected` upload sequences have completed. Returns the final snapshot; the caller
+  // decides whether an incomplete result is fatal (it is, before sending).
+  async #waitForUploadSequences(expected, { timeoutMs = 60_000, pollMs = 500, label = '' } = {}) {
+    if (!this.uploadWatch?.snapshot) return null;
+    const start = Date.now();
+    let lastKey = null;
+    let snap = this.uploadWatch.snapshot();
+    while (Date.now() - start < timeoutMs) {
+      this.#throwIfStopRequested();
+      snap = this.uploadWatch.snapshot();
+      // A rejected upload will never complete — surface that cause instead of waiting it out.
+      this.#assertUploadsHealthy(snap, 'attach');
+      if ((Number(snap.completed) || 0) >= expected) {
+        this.#debug(
+          `attach: ${expected} upload sequence(s) complete after ${Date.now() - start}ms` +
+          `${label ? ` (${label})` : ''}`
+        );
+        return snap;
+      }
+      const key = `${snap.completed}:${snap.created}:${snap.blobs}:${snap.inflight}`;
+      if (key !== lastKey) {
+        lastKey = key;
+        this.#debug(
+          `attach: waiting for upload sequences${label ? ` (${label})` : ''} — completed=${snap.completed}/${expected} ` +
+          `created=${snap.created} blobs=${snap.blobs} inflight=${snap.inflight}`
+        );
+      }
+      await sleep(pollMs);
+    }
+    this.#debug(
+      `attach: upload sequences INCOMPLETE after ${timeoutMs}ms${label ? ` (${label})` : ''} — ` +
+      `completed=${snap?.completed ?? '?'}/${expected} created=${snap?.created ?? '?'} blobs=${snap?.blobs ?? '?'}`
+    );
+    return snap;
+  }
+
+  // Fail closed when fewer files finished uploading than were attached. Sending in that state is
+  // what produces a permanently wedged composer ("File upload pending"), a send that silently does
+  // nothing, and — when a prompt does get through — a turn the model can never answer.
+  #assertUploadSequencesComplete(expected, where) {
+    const snap = this.uploadWatch?.snapshot?.();
+    if (!snap) return;
+    const completed = Number(snap.completed) || 0;
+    if (completed >= expected) return;
+    const err = new Error('attachment_upload_incomplete');
+    err.retryable = true;
+    err.data = {
+      where, expected, completed,
+      created: snap.created, blobs: snap.blobs, inflight: snap.inflight, failed: snap.failed,
+      requests: (snap.requests || []).map((r) => ({ method: r.method, url: r.url, status: r.status, state: r.state }))
+    };
+    this.#debug(
+      `${where}: only ${completed}/${expected} attachment upload sequence(s) completed — refusing to ` +
+      `send, because ChatGPT would hold the missing attachment as pending forever`
+    );
+    throw err;
+  }
+
+  // Hold until the composer is interactive: the document is loaded, the prompt box and submit
+  // button are mounted, and the hidden multi-file input exists — then settle for a beat so React
+  // has its change handler wired. Attaching before this point is what produces a chipped-but-never-
+  // uploaded file. Falls through after the timeout rather than failing: the upload-sequence checks
+  // downstream are what actually enforce a healthy attachment.
+  async #waitForComposerHydration({ timeoutMs = 30_000, pollMs = 400 } = {}) {
+    const start = Date.now();
+    let ready = false;
+    while (Date.now() - start < timeoutMs) {
+      this.#throwIfStopRequested();
+      const snap = await this.#eval(`(() => {
+        const visible = (n) => { if (!n) return false; const r = n.getBoundingClientRect(); const s = getComputedStyle(n);
+          return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+        const prompt = Array.from(document.querySelectorAll('#prompt-textarea, [contenteditable="true"][role="textbox"]')).filter(visible).at(-1) || null;
+        const composer = prompt?.closest('form') || null;
+        const input = composer?.querySelector('input[type="file"]') || document.querySelector('input[type="file"]');
+        return {
+          loaded: document.readyState === 'complete',
+          hasPrompt: !!prompt,
+          hasComposer: !!composer,
+          hasInput: !!input && !input.disabled,
+          hasSubmit: !!(composer?.querySelector('#composer-submit-button, button[data-testid="send-button"]'))
+        };
+      })()`).catch(() => null);
+      if (snap?.loaded && snap.hasPrompt && snap.hasComposer && snap.hasInput && snap.hasSubmit) {
+        ready = true;
+        break;
+      }
+      await sleep(pollMs);
+    }
+    this.#debug(`attach: composer ${ready ? 'hydrated' : 'NOT confirmed hydrated'} after ${Date.now() - start}ms; settling ${ChatGPTController.ATTACH_SETTLE_MS}ms`);
+    await this.#eval(`(() => { const e = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"]'); if (e) e.focus(); return true; })()`).catch(() => {});
+    await sleep(ChatGPTController.ATTACH_SETTLE_MS);
+    return ready;
   }
 
   // Some ChatGPT variants hide the file input behind a two-stage "+" menu. Open
@@ -1348,8 +1603,21 @@ export class ChatGPTController {
         terminalVisible: !!snap?.terminalVisible,
         terminalForMs: terminalSince == null ? 0 : Date.now() - terminalSince,
         hasError: !!snap?.hasError,
-        semanticState
+        semanticState,
+        elapsedMs: Date.now() - start
       });
+      // A stalled turn (busy forever, zero characters) aborts now rather than at the per-turn
+      // timeout, so the caller can retry it in a fresh chat while the batch still has time.
+      if (decision.stalled) {
+        this.#debug(
+          `response-gate: ${decision.reason} after ${Date.now() - start}ms ` +
+          `(chars=0, busy=${!!snap?.busyVisible}, stop=${!!snap?.stopVisible}, htmlLength=${snap?.htmlLength ?? 0})`
+        );
+        const err = new Error('response_stalled_no_output');
+        err.retryable = true;
+        err.data = { elapsedMs: Date.now() - start, reason: decision.reason, snapshot: snap };
+        throw err;
+      }
       if (decision.done) {
         // Stall-inspection: a near-empty idle-fallback is the exact case under suspicion (is the
         // reply really empty, or are we reading the wrong node?). Instead of accepting it, dump the
@@ -1566,130 +1834,6 @@ export class ChatGPTController {
         if (this.currentRun === run) this.currentRun = null;
       }
     });
-  }
-
-  async getLastAssistantImages({ maxImages = 6 } = {}) {
-    const assistantSel = JSON.stringify(this.selectors.assistantMessage);
-    const out = await this.#eval(`(async () => {
-      const nodes = Array.from(document.querySelectorAll(${assistantSel}));
-      const last = nodes[nodes.length - 1] || document.querySelector('main') || document.body;
-      if (!last) return [];
-      const results = [];
-      const seen = new Set();
-      const push = (item) => {
-        const key = String(item.dataUrl || item.src || '');
-        if (!key || seen.has(key)) return;
-        seen.add(key);
-        results.push(item);
-      };
-      const collectRoot = (root) => Array.from(root.querySelectorAll('img')).filter((img) => {
-        const r = img.getBoundingClientRect();
-        const src = img.currentSrc || img.src || '';
-        return src && r.width >= 64 && r.height >= 64;
-      });
-      const imgs = [...collectRoot(last), ...collectRoot(document.querySelector('main') || document.body)];
-      for (const img of imgs) {
-        if (results.length >= ${maxImages}) break;
-        const src = img.currentSrc || img.src || '';
-        const alt = img.alt || '';
-        if (!src) continue;
-        if (src.startsWith('blob:') || src.startsWith('https://') || src.startsWith('http://')) {
-          try {
-            const r = await fetch(src);
-            const b = await r.blob();
-            if (b.size > 15 * 1024 * 1024) { push({ src, alt }); continue; }
-            const dataUrl = await new Promise((resolve, reject) => {
-              const fr = new FileReader();
-              fr.onerror = () => reject(new Error('file_reader_error'));
-              fr.onload = () => resolve(String(fr.result || ''));
-              fr.readAsDataURL(b);
-            });
-            push({ src, alt, dataUrl });
-            continue;
-          } catch {}
-        }
-        push({ src, alt });
-      }
-
-      const canvases = Array.from(last.querySelectorAll('canvas'));
-      for (let i = 0; i < canvases.length && results.length < ${maxImages}; i++) {
-        const c = canvases[i];
-        try {
-          const dataUrl = c.toDataURL('image/png');
-          if (dataUrl && dataUrl.startsWith('data:image/')) {
-            push({ src: 'canvas:' + (i + 1), alt: 'canvas', dataUrl });
-          }
-        } catch {}
-      }
-
-      if (results.length < ${maxImages}) {
-        const bgEls = Array.from((document.querySelector('main') || last).querySelectorAll('*')).filter(el => {
-          const s = getComputedStyle(el);
-          const r = el.getBoundingClientRect();
-          return s && s.backgroundImage && s.backgroundImage.includes('url(') && r.width >= 64 && r.height >= 64;
-        }).slice(0, 50);
-        for (const el of bgEls) {
-          if (results.length >= ${maxImages}) break;
-          const s = getComputedStyle(el).backgroundImage || '';
-          const m = s.match(/url\\([\"']?([^\"')]+)[\"']?\\)/i);
-          const src = m?.[1] || '';
-          if (src && (src.startsWith('http://') || src.startsWith('https://') || src.startsWith('blob:'))) push({ src, alt: 'background-image' });
-        }
-      }
-
-      if (results.length < ${maxImages}) {
-        const links = Array.from(document.querySelectorAll('a[href]')).filter((a) => {
-          const href = String(a.href || '');
-          return /\\.(png|jpe?g|webp)(\\?|#|$)/i.test(href) || /download|image|generated/i.test((a.textContent || '') + ' ' + (a.getAttribute('aria-label') || ''));
-        });
-        for (const a of links) {
-          if (results.length >= ${maxImages}) break;
-          const src = String(a.href || '');
-          if (src.startsWith('http://') || src.startsWith('https://') || src.startsWith('blob:')) push({ src, alt: (a.textContent || '').trim() || 'link' });
-        }
-      }
-      return results;
-    })()`);
-    return Array.isArray(out) ? out : [];
-  }
-
-  async downloadLastAssistantImages({ maxImages = 6, outDir = path.join(this.stateDir, 'downloads') } = {}) {
-    const imgs = await this.getLastAssistantImages({ maxImages });
-    await fs.mkdir(outDir, { recursive: true });
-    const saved = [];
-
-    for (let i = 0; i < imgs.length; i++) {
-      const img = imgs[i];
-      let dataUrl = img.dataUrl || null;
-      let mime = null;
-      let buf = null;
-
-      if (dataUrl && /^data:/i.test(dataUrl)) {
-        const m = String(dataUrl).match(/^data:([^;]+);base64,(.+)$/i);
-        if (m) {
-          mime = m[1];
-          buf = Buffer.from(m[2], 'base64');
-        }
-      }
-
-      if (!buf && img.src && /^https?:\/\//i.test(img.src)) {
-        const r = await fetch(img.src);
-        if (!r.ok) continue;
-        mime = r.headers.get('content-type') || 'application/octet-stream';
-        buf = Buffer.from(await r.arrayBuffer());
-      }
-
-      if (!buf) continue;
-
-      const ext =
-        mime?.includes('png') ? 'png' : mime?.includes('jpeg') || mime?.includes('jpg') ? 'jpg' : mime?.includes('webp') ? 'webp' : 'bin';
-      const name = `agentify-${Date.now()}-${String(i + 1).padStart(2, '0')}.${ext}`;
-      const file = path.join(outDir, name);
-      await fs.writeFile(file, buf);
-      saved.push({ path: file, alt: img.alt || '', mime: mime || null, source: img.src || null });
-    }
-
-    return saved;
   }
 
   // Download ChatGPT "entity" file buttons (generated files rendered as clickable

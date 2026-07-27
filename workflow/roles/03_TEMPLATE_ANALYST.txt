@@ -18,7 +18,12 @@ ACTIONS
    - handwriting, signatures, stamps, logos, and semantic images
    - approximate fonts, sizes, weights, colors, alignment, rotation, and line spacing
    - damaged, obscured, or ambiguous regions
-6. Classify each meaningful region as preserve, reconstruct, generated_field, static_text, table_structure, semantic_image, or excluded_background.
+6. Classify each meaningful region as preserve, reconstruct, generated_field, static_text,
+   table_structure, semantic_image, reserved_non_text, or excluded_background.
+6a. Record every signature, stamp, seal, logo, and handwriting area as a reserved_non_text region with
+   its exact bbox, its kind, and its owning table/cell. These areas reserve space that generated text
+   may never occupy, so the Architect needs their geometry — not merely a note that they exist. Where
+   a section holds both a writable area and a reserved area, give the boundary between them.
 7. Mark every original value that must be removed and every static element that crosses an affected region.
 8. Distinguish rasterized text from semantic images.
 9. Use non-OCR geometry assistance only where direct inspection is insufficient.
@@ -35,6 +40,34 @@ ACTIONS
     are preserved, but it is NOT a catalogued static-text label and is NOT subject to
     table-separation. Reserve static_text for genuine, separable form labels inside the layout.
 
+EXACT TEXT, NEVER A PLACEHOLDER
+
+A transcription is the exact visible characters of that line. "Arabic label line", "Chinese label
+line", "certification statement", "(illegible)" and similar descriptions are NOT transcriptions: they
+are placeholders, and every downstream role is forbidden to guess what they stood for, so one
+placeholder stalls the whole run. Transcribe every readable line in its own script, including Arabic,
+Chinese, Cyrillic, and accented Latin, by reading the rendered pixels at regional zoom.
+
+Static text is the text the BLANK form carries. A value somebody entered into a box — a country name, a
+weight, an address — is variable content for removal, never a static line, and a static line's bbox must
+sit on the printed label's own glyphs rather than on the value beside or below it. Mixing these up cannot
+be repaired later: a field placed in that box will always collide with the "static" entry sitting in the
+space the value occupies.
+
+This applies to the form's own labels — the lines inside its grid and fields. Margin and border
+preprint outside the grid stays excluded_background and is never catalogued as static text, so it is
+outside these counts entirely: completeness never means pulling exterior preprint in.
+
+Report both counts, and make them equal:
+
+  static_text_line_count                  (interior form lines only)
+  static_text_lines_exactly_transcribed   (must equal static_text_line_count)
+  static_text_lines_unresolved            (0)
+
+If a line genuinely cannot be read from the pixels, do not describe it and move on: mark the region
+blocked, attach a full-resolution crop of it, and state what you inspected. A named blocker with a
+crop is recoverable; a placeholder passed downstream as though it were text is not.
+
 OUTPUTS
 
 - scan_inventory.json
@@ -46,6 +79,10 @@ PASS CONDITIONS
 - Every meaningful region is classified.
 - Every writable or populated variable area is identified, with its printed label (all languages)
   and inferred business fact recorded, or explicitly marked semantically unestablished.
+- Every readable static line is transcribed exactly, with
+  static_text_lines_exactly_transcribed == static_text_line_count and no placeholder descriptions.
 - Every table and semantic image candidate is accounted for.
+- Every signature, stamp, seal, logo, and handwriting area is recorded as reserved_non_text with an
+  exact bbox.
 - Margin/border preprint text is classified as excluded_background, not static_text.
 - No mandatory region remains unresolved.

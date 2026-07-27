@@ -82,10 +82,12 @@ export const RERUN_MAP = {
   packaging: ['regression']
 };
 
-// Causal status codes (match generator.py STATUS_CODES).
+// Causal status codes by issue domain (must match generator.py STATUS_CODES). Keys are limited to
+// ISSUE_DOMAINS values — `fidelity` is a QA gate, not an issue domain, so its code lives in
+// STAGE_CODE, not here.
 const DOMAIN_CODE = {
   runtime: 20, compatibility: 20, semantics: 30, geometry: 50, annotation: 50,
-  reconstruction: 60, typography: 60, placement: 60, fidelity: 60, packaging: 70
+  reconstruction: 60, typography: 60, placement: 60, packaging: 70
 };
 const STAGE_CODE = {
   template: 50, background: 60, baseline: 60, fidelity: 60, edge: 60,
@@ -129,6 +131,15 @@ export const EDGE_CASES = [
 ];
 // 1-indexed name lookup used to backfill a decision's case number from its canonical name.
 const EDGE_CASE_INDEX = new Map(EDGE_CASES.map((name, i) => [name, i + 1]));
+
+// Waits between re-sends of a turn ChatGPT answered with its own error card. Provider-side
+// transients cleared in minutes during the observed outage, so the run pauses rather than
+// spending its file retries on a service that is briefly refusing every request.
+const SERVER_ERROR_BACKOFF_MS = Object.freeze([30_000, 120_000, 300_000]);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
 
 // SHA-256 of a file's bytes — the orchestrator's own, independently computed hash (as opposed to
 // the model-claimed hashes carried in handoffs).
@@ -826,6 +837,15 @@ const DEFAULT_CONFIG = {
   perTurnTimeoutMs: 7_200_000,
   successCode: 0,
   reAskOnBadHandoff: true,
+  // How many times a single turn is re-sent when ChatGPT answers with its own error card, and the
+  // waits before each re-send (null uses SERVER_ERROR_BACKOFF_MS; tests override with zeros).
+  serverErrorRetries: 2,
+  serverErrorBackoffMs: null,
+  // How many times a creation role may send blocking issues back to the upstream role that produced
+  // the artifact it could not work with, before the run gives up.
+  maxUpstreamRecoveries: 2,
+  // How many extra attempts a creation role gets when it judges its OWN output not approvable.
+  maxSelfRepairs: 2,
   // Release/final evidence (visual-review envelope + per-edge decisions) is pasted inline
   // when it fits this many characters; otherwise it is written to a single file and
   // attached, keeping the isolated auditor's prompt short so its attention stays sharp.
@@ -1109,6 +1129,39 @@ export class WorkflowOrchestrator {
     return controller.followUp({ text: message, timeoutMs, responseState });
   }
 
+  // ChatGPT sometimes answers a turn with its own error card ("Something went wrong while
+  // processing your request.") instead of a reply. That is a provider-side transient, not a
+  // malformed handoff: re-sending the SAME turn after a pause usually succeeds. Asking the model
+  // to "reply again with valid JSON" cannot work — there is no reply to reformat — and it used to
+  // consume the run's only retry, aborting a run that had already completed four good turns.
+  _isServerErrorReply(result) {
+    if (!result) return false;
+    if (result.meta?.hasError) return true;
+    if (result.meta?.completionReason === 'terminal_error') return true;
+    const text = String(result.text || '');
+    return text.length < 500 && /something went wrong|error generating|please try again/i.test(text);
+  }
+
+  async _sendWithServerErrorRetry(controller, message, sendOpts, label) {
+    const attempts = Math.max(0, Number(this.config.serverErrorRetries) || 0);
+    const backoff = Array.isArray(this.config.serverErrorBackoffMs) && this.config.serverErrorBackoffMs.length
+      ? this.config.serverErrorBackoffMs
+      : SERVER_ERROR_BACKOFF_MS;
+    let result = await this._send(controller, message, sendOpts);
+    for (let attempt = 1; attempt <= attempts && this._isServerErrorReply(result); attempt++) {
+      const waitMs = backoff[Math.min(attempt - 1, backoff.length - 1)];
+      this.log(
+        `  · ${label}: ChatGPT returned a server error — waiting ${humanizeDuration(waitMs)} and ` +
+        `re-sending the same turn (${attempt}/${attempts})`
+      );
+      await sleep(waitMs);
+      // Re-send the identical turn. `first` is preserved so a failed opening turn keeps its
+      // attachments; a follow-up stays a follow-up in the same conversation.
+      result = await this._send(controller, message, sendOpts);
+    }
+    return result;
+  }
+
   // Run one role turn: send, capture text, parse the handoff (re-asking once if needed).
   async _turn(controller, step, ctx, sendOpts, transcript) {
     const started = Date.now();
@@ -1116,12 +1169,19 @@ export class WorkflowOrchestrator {
     const message = this._composeMessage(step, ctx, { includeShared: sendOpts.first });
     const expected = { runId: ctx.runId, role: step.role, mode: step.mode ?? null, kind: step.kind };
     const responseState = (candidate) => handoffResponseState(candidate, expected);
-    let result = await this._send(controller, message, { ...sendOpts, responseState });
+    let result = await this._sendWithServerErrorRetry(controller, message, { ...sendOpts, responseState }, label);
     let text = String(result?.text || '');
     transcript.push({ role: step.role, mode: step.mode, text });
     let handoff = parseHandoff(text, expected);
     let validationError = handoff ? handoffValidationError(handoff, step, ctx.runId) : 'handoff JSON not found';
     if (validationError) handoff = null;
+    // A turn still showing ChatGPT's error card after every re-send has produced no reply at all.
+    // Re-asking for JSON would only add another error card, so fail the turn here and let the
+    // caller retry the file in a fresh chat.
+    if (!handoff && this._isServerErrorReply(result)) {
+      this.log(`  ✗ ${label} — ChatGPT server error persisted after ${this.config.serverErrorRetries} re-send(s)`);
+      return { handoff: null, result, text, serverError: true };
+    }
     if (!handoff && this.config.reAskOnBadHandoff) {
       this.log(
         `  · ${step.role}${step.mode ? '/' + step.mode : ''}: invalid handoff ` +
@@ -1156,12 +1216,78 @@ export class WorkflowOrchestrator {
     return { handoff, result, text };
   }
 
+  // Raise a provider outage as a retryable failure from anywhere in the pipeline, including the
+  // repair loop — where it first bit: four good turns, then ChatGPT's error card on the repair
+  // turn, and the whole file was abandoned with status 99.
+  _throwIfServerError(turn, label) {
+    if (!turn?.serverError) return;
+    const err = new Error('chatgpt_server_error');
+    err.retryable = true;
+    err.data = { step: label };
+    throw err;
+  }
+
+  // Which earlier creation step does a blocked writer want re-run? Prefer the role it names in
+  // `next_role`; otherwise infer it from the rerun modes it asks for (e.g. anything mentioning the
+  // scan inventory means the Template Analyst). Only ever resolves to a `write` step STRICTLY before
+  // the blocked one, so this can never jump forward or re-enter an audit.
+  _resolveUpstreamStep(currentIndex, handoff) {
+    const candidates = new Set();
+    const named = canonicalToken(handoff?.next_role);
+    if (named && named !== 'controller') candidates.add(named);
+    const reruns = (handoff?.required_reruns || []).map((r) => canonicalToken(r)).filter(Boolean);
+    for (const rerun of reruns) {
+      if (/scan_inventory|inventory|transcription/.test(rerun)) candidates.add('template_analyst');
+      if (/template_specification|template_spec/.test(rerun)) candidates.add('template_architect');
+      if (/background|reconstruction_build/.test(rerun)) candidates.add('generator_engineer');
+    }
+    if (!candidates.size) return null;
+    for (let j = currentIndex - 1; j >= 0; j--) {
+      const step = PLAN[j];
+      if (step.kind === 'write' && candidates.has(canonicalToken(step.role))) {
+        return { index: j, step };
+      }
+    }
+    return null;
+  }
+
+  // Compact one-line-per-issue dump. Without this, a failing gate logs only a count, and the issue
+  // records reach disk when the run ends — hours later, and never at all if the process is killed.
+  _logIssues(indent, issues) {
+    for (const i of issues) {
+      const where = [i.field, i.table, i.cell].filter(Boolean).join('/') || i.stage || '-';
+      this.log(
+        `${indent}${String(i.issue_id).padEnd(11)} ${String(i.severity || '?').padEnd(8)} ` +
+        `${String(i.code || '?').padEnd(44)} owner=${i.owner || '?'} at=${where}`
+      );
+    }
+  }
+
   // Attempt to recover a failed gate via repair rounds with targeted reruns.
   async _repairGate(controller, step, state, transcript) {
     const gate = step.gate;
+    // Every issue this gate's repair loop worked on, whether or not a writer bothered to report it
+    // fixed. Writers are supposed to mark addressed issues `fixed`, but observed live they apply the
+    // repair and return an empty `verified_issues`, which leaves the issue `open` instead — so
+    // tracking only writer-claimed fixes would miss the majority of real repairs.
+    const fixedThisGate = new Set();
     for (let round = 1; round <= this.config.maxRepairRounds; round++) {
       const assigned = state.issues.open();
       this.log(`  ↻ repair round ${round}/${this.config.maxRepairRounds} for "${gate}" gate (${assigned.length} open issue(s))`);
+      this._logIssues('      ', assigned);
+      for (const issue of assigned) {
+        if (issue?.issue_id) fixedThisGate.add(String(issue.issue_id));
+      }
+      // Nothing left to plan, yet the gate did not recover: repairing again cannot change anything,
+      // so stop instead of burning the remaining rounds (each costs a full model turn).
+      if (assigned.length === 0) {
+        const stuck = state.issues.blockingForRelease();
+        this.log(
+          `    no open issues remain but the gate has not recovered ` +
+          `(${stuck.length} unverified critical/major issue(s)) — ending the repair loop`
+        );
+        break;
+      }
 
       // 1) Repair Engineer diagnoses the root cause and plans the smallest change.
       const repairTurn = await this._turn(
@@ -1172,18 +1298,58 @@ export class WorkflowOrchestrator {
         { first: false, timeoutMs: this.config.perTurnTimeoutMs },
         transcript
       );
+      this._throwIfServerError(repairTurn, `repair_engineer [gate: ${gate}]`);
       if (!repairTurn.handoff) return { recovered: false, code: 99, stage: gate };
-      if (!['passed', 'ready_for_review'].includes(repairTurn.handoff.stage_status)) {
+      // A plan with no change records is guidance the writer will not get. Not fatal — the writer
+      // receives the issue records with the auditor's evidence either way — but worth naming in the
+      // log, because a thin plan is otherwise invisible next to a healthy one.
+      const planRecords = asList(repairTurn.handoff.change_records);
+      if (!planRecords.length) {
+        this.log(
+          `    ⚠ repair plan carries no change_records for ${assigned.length} assigned issue(s) ` +
+          `(${repairTurn.text.length} chars) — the writer works from the issue evidence alone`
+        );
+      }
+      // The Repair Engineer only PLANS — it writes nothing — so its aggregate status must not
+      // decide the gate. A `blocked` plan means "at least one issue cannot be locally corrected",
+      // not "no issue can": observed live, it returned blocked over 1 of 8 issues while carrying
+      // five complete change groups for the other seven, and the whole gate was abandoned on round
+      // one without a single repair being attempted. Carry the plan to the owning writer exactly as
+      // the writer path already tolerates a partial handback; unfixed issues reopen at the QA
+      // rerun, and an unrepairable gate still ends with the causal code after maxRepairRounds.
+      // Only `failed` — a planner that tried and could not produce a plan — ends the gate here.
+      const planStatus = repairTurn.handoff.stage_status;
+      if (!['passed', 'ready_for_review', 'blocked'].includes(planStatus)) {
         return { recovered: false, code: selectFailureCode(state.issues.snapshot(), gate), stage: gate };
+      }
+      if (planStatus === 'blocked') {
+        this.log('    repair plan is partial (some issues not locally repairable) — applying the repairable part');
       }
       state.issues.addNew(issueRecordsFromHandoff(repairTurn.handoff));
 
-      // 2) The owning writer applies the plan. Template geometry/semantics belongs to
-      // Template Architect; all generator/runtime/reconstruction concerns belong to
-      // Generator Engineer repair mode.
-      const domains = new Set(assigned.map((issue) => String(issue?.domain || '').toLowerCase()).filter(Boolean));
-      const architectOwned = gate === 'template' || domains.has('geometry') || domains.has('semantics');
-      const generatorOwned = gate !== 'template' || [...domains].some((domain) => !['geometry', 'semantics'].includes(domain));
+      // 2) The owning writer applies the plan. Route by each assigned issue's declared
+      // `owner` (falling back to domain when the owner is absent or unrecognized) rather
+      // than by the current gate: an issue can surface during a non-template gate yet still
+      // require a template-spec edit — e.g. a reconstruction mask that must be widened is
+      // owned by the Template Architect even though it was caught at the background gate.
+      // Inferring ownership from the gate alone stranded such issues with the wrong writer,
+      // which then returned `blocked` and aborted the entire repair on round 1. Template
+      // geometry/semantics belong to the Template Architect; all generator/runtime concerns
+      // belong to Generator Engineer repair mode. When both are needed the architect writes
+      // first, since generator artifacts must be regenerated from the updated spec after.
+      const architectDomains = new Set(['geometry', 'semantics']);
+      let architectOwned = gate === 'template';
+      // On a non-template gate the generator engineer always takes the final application
+      // turn: downstream artifacts must be regenerated after any change, including a spec edit.
+      let generatorOwned = gate !== 'template';
+      for (const issue of assigned) {
+        const owner = canonicalToken(issue?.owner);
+        const domain = canonicalToken(issue?.domain);
+        if (owner === 'template_architect') architectOwned = true;
+        else if (owner === 'generator_engineer') generatorOwned = true;
+        else if (architectDomains.has(domain)) architectOwned = true;
+        else generatorOwned = true;
+      }
       const writerSteps = [];
       if (architectOwned) writerSteps.push({ role: 'template_architect', mode: null, kind: 'write' });
       if (generatorOwned) writerSteps.push({ role: 'generator_engineer', mode: 'repair', kind: 'write' });
@@ -1198,12 +1364,30 @@ export class WorkflowOrchestrator {
           { first: false, timeoutMs: this.config.perTurnTimeoutMs },
           transcript
         );
-        if (!writerTurn.handoff || !['passed', 'ready_for_review'].includes(writerTurn.handoff.stage_status)) {
+        this._throwIfServerError(writerTurn, `${writerStep.role} [gate: ${gate}]`);
+        // No parseable handoff is unrecoverable — we cannot tell what the writer did.
+        if (!writerTurn.handoff) {
           return { recovered: false, code: selectFailureCode(state.issues.snapshot(), gate), stage: gate };
         }
+        // Record whatever the writer accomplished before deciding how to proceed.
         state.issues.addNew(issueRecordsFromHandoff(writerTurn.handoff));
         state.issues.markFixed(writerTurn.handoff.verified_issues);
+        for (const rec of writerTurn.handoff.verified_issues || []) {
+          const id = String(rec?.issue_id || rec || '');
+          if (id) fixedThisGate.add(id);
+        }
         writerReruns.push(...writerTurn.handoff.required_reruns);
+        // A `blocked` handback is not a gate failure while repair rounds remain: it means this
+        // writer applied what it could and is deferring the rest to another owner (its
+        // next_role) — e.g. the generator engineer waiting for the architect's spec change to
+        // clear template QA. Stop this round's writer chain and fall through to the QA rerun so
+        // unfixed issues reopen; the next round re-plans with this round's partial fixes already
+        // in place. Only a `failed` status (a writer that tried and could not) ends the gate now.
+        const status = writerTurn.handoff.stage_status;
+        if (status === 'blocked' && round < this.config.maxRepairRounds) break;
+        if (!['passed', 'ready_for_review'].includes(status)) {
+          return { recovered: false, code: selectFailureCode(state.issues.snapshot(), gate), stage: gate };
+        }
       }
 
       const rerunModes = mergeReruns(
@@ -1229,10 +1413,14 @@ export class WorkflowOrchestrator {
         const qaTurn = await this._turn(
           controller,
           qaStep,
-          { ...state.ctx, gate: mode, extra: 'Independently re-validate after repair. Verify fixed issues or reopen them.' },
+          { ...state.ctx, gate: mode, extra:
+            'Independently re-validate after repair. Account for every assigned issue by ID: list the ' +
+            'ones your checks now find resolved in `verified_issues`, and reopen the rest in `new_issues` ' +
+            'with fresh evidence. Do not return passed with an empty `verified_issues`.' },
           { first: false, timeoutMs: this.config.perTurnTimeoutMs },
           transcript
         );
+        this._throwIfServerError(qaTurn, `qa_auditor/${mode}`);
         if (!qaTurn.handoff) return { recovered: false, code: 99, stage: mode };
         state.issues.addNew(issueRecordsFromHandoff(qaTurn.handoff));
         state.issues.markVerified(qaTurn.handoff.verified_issues);
@@ -1244,10 +1432,13 @@ export class WorkflowOrchestrator {
         const qaTurn = await this._turn(
           controller,
           { role: 'qa_auditor', mode: gate, gate },
-          { ...state.ctx, gate, extra: 'Re-validate this gate after repair.' },
+          { ...state.ctx, gate, extra:
+            'Re-validate this gate after repair. Account for every assigned issue by ID in ' +
+            '`verified_issues` (resolved) or `new_issues` (still failing, with fresh evidence).' },
           { first: false, timeoutMs: this.config.perTurnTimeoutMs },
           transcript
         );
+        this._throwIfServerError(qaTurn, `qa_auditor/${gate}`);
         if (!qaTurn.handoff) return { recovered: false, code: 99, stage: gate };
         state.issues.addNew(issueRecordsFromHandoff(qaTurn.handoff));
         state.issues.markVerified(qaTurn.handoff.verified_issues);
@@ -1257,9 +1448,47 @@ export class WorkflowOrchestrator {
         gatePassed = qaTurn.handoff.stage_status === 'passed';
       }
 
+      // An independent auditor that re-validated this gate and returned `passed` has, by the
+      // contract's own pass policy, accepted the repairs this gate made — a pass is not permitted
+      // while a critical/major issue it owns is unresolved. Auditors do not always echo every ID
+      // back in `verified_issues` though, and an issue left at "fixed" blocks the gate forever:
+      // the next round finds nothing open to plan, so it cannot progress and the remaining rounds
+      // are spent achieving nothing. Record the auditor's pass as the verification for exactly the
+      // issues repaired during this gate, and say so in the log — this is bookkeeping of the
+      // auditor's decision, not a writer approving its own work.
+      if (gatePassed) {
+        // Every issue still sitting at "fixed" counts, not only those this gate's rounds worked on.
+        // An issue repaired through upstream recovery or self-repair never appears in a round's
+        // assigned list, so scoping this to `fixedThisGate` left it blocking forever: observed live,
+        // a template audit PASSED and the gate still failed because the analyst's inventory blocker —
+        // resolved before the repair loop even started — was never recorded as verified. Pipeline
+        // stages are sequential, so anything at "fixed" when this gate passes belongs to this stage or
+        // an earlier one, which is exactly what this auditor's pass covers.
+        const unrecorded = state.issues.snapshot().filter(
+          (i) => i.status === 'fixed' || (fixedThisGate.has(i.issue_id) && i.status !== 'verified')
+        );
+        if (unrecorded.length) {
+          this.log(
+            `    "${gate}" audit passed — recording it as verification for ${unrecorded.length} ` +
+            `repaired issue(s) the auditor did not echo back: ` +
+            unrecorded.map((i) => `${i.issue_id}[${i.status}]`).join(', ')
+          );
+          state.issues.markVerified(unrecorded.map((i) => ({ issue_id: i.issue_id })));
+        }
+      }
+
       if (gatePassed && state.issues.blockingForRelease().length === 0) {
         this.log(`  ✓ "${gate}" gate recovered after repair round ${round}`);
         return { recovered: true };
+      }
+      if (gatePassed) {
+        // The gate itself is clean but something else is unresolved — name it, so a stalled run is
+        // diagnosable from the log instead of looking like an unexplained repair failure.
+        const blocking = state.issues.blockingForRelease();
+        this.log(
+          `    "${gate}" audit passed but ${blocking.length} issue(s) remain unverified: ` +
+          blocking.map((i) => `${i.issue_id}[${i.status}/${i.severity}]`).join(', ')
+        );
       }
     }
     const code = selectFailureCode(state.issues.snapshot(), gate);
@@ -1322,6 +1551,19 @@ export class WorkflowOrchestrator {
     let failedStage = null;
     let packagedFiles = [];
     let packageProduced = false;
+    // Upstream recovery: a creation role can block because the artifact it was GIVEN is deficient —
+    // observed live, the architect refused to invent 24 static-text labels the analyst had left as
+    // placeholders, which is exactly the right refusal. The repair loop only handles audit failures,
+    // so without this the run ends at status 80 with the fix (re-transcribe the inventory) known but
+    // never attempted. `pendingUpstream` carries the blocking issues back to the named upstream role.
+    let pendingUpstream = null;
+    let upstreamRecoveries = 0;
+    // Self-repair: a writer can measure its OWN output, find it wanting, and say so — observed live,
+    // the architect simulated its plan, counted 98,560 residual ink pixels, and declared it not
+    // approvable. That is the honesty the contract asks for, but returning `failed` ended the run with
+    // the defect precisely known and never addressed. Give it another turn with its own findings
+    // assigned, which is what a repair round would do if an auditor had discovered them instead.
+    let selfRepairs = 0;
     // The isolated audit session is opened lazily at the release step and closed in the
     // finally below, so no extra tab opens for runs that fail before release.
     let auditSession = null;
@@ -1336,6 +1578,31 @@ export class WorkflowOrchestrator {
       let turnController = controller;
       let ctx = { ...state.ctx, gate: step.gate };
       let sendOpts = { first: i === 0, attachments, timeoutMs: perTurnTimeoutMs, newChat };
+
+      // This step is being re-run: either a downstream writer blocked on what it produced, or it
+      // judged its own output not approvable and gets another attempt with its findings assigned.
+      if (pendingUpstream && pendingUpstream.role === step.role && pendingUpstream.mode === (step.mode ?? null)) {
+        ctx = {
+          ...ctx,
+          assignedIssues: pendingUpstream.issues,
+          extra: pendingUpstream.kind === 'self'
+            ? `Your previous attempt reported these findings against your OWN output, so it was not ` +
+              `accepted. Correct them now and re-verify before returning: change the plan or geometry ` +
+              `that produced them, re-run the measurement that found them, and hand over the updated ` +
+              `artifacts. Returning the same finding again, or the same numbers with a different ` +
+              `explanation, ends the run — fix the work rather than restating the problem.`
+            : `A downstream role could not proceed with your previous output and returned these blocking ` +
+              `issues. Resolve them in your own artifact now — re-derive only what they name, keep ` +
+              `everything else identical, and do not hand the same deficiency back. If a value genuinely ` +
+              `cannot be established from the rendered pixels, say so explicitly with the evidence you ` +
+              `inspected rather than substituting a placeholder.`
+        };
+        this.log(
+          `  ↺ re-running ${step.role}${step.mode ? '/' + step.mode : ''} with ` +
+          `${pendingUpstream.issues.length} ${pendingUpstream.kind === 'self' ? 'self-reported finding(s)' : 'upstream blocker(s)'}`
+        );
+        pendingUpstream = null;
+      }
 
       if (isFreshAudit) {
         if (!auditController) {
@@ -1391,6 +1658,17 @@ export class WorkflowOrchestrator {
       this.log(`▶ ${step.role}${step.mode ? '/' + step.mode : ''}${step.gate ? ` [gate: ${step.gate}]` : ''}${isFreshAudit ? ' [isolated audit session]' : ''}`);
       const turn = await this._turn(turnController, step, ctx, sendOpts, transcript);
 
+      // A turn that only ever produced ChatGPT's error card is a provider outage, not a workflow
+      // result: raise it as a retryable failure so the caller waits and retries this file in a
+      // fresh chat (the completed turns ride along on the error for the post-mortem) instead of
+      // recording a bogus workflow status and spending a workflow attempt.
+      if (!turn.handoff && turn.serverError) {
+        const err = new Error('chatgpt_server_error');
+        err.retryable = true;
+        err.data = { step: `${step.role}${step.mode ? '/' + step.mode : ''}`, gate: step.gate ?? null };
+        throw err;
+      }
+
       if (!turn.handoff) {
         failedStage = step.gate || step.mode || step.role;
         statusCode = 99;
@@ -1407,6 +1685,50 @@ export class WorkflowOrchestrator {
       // ready for independent review. Fail closed on blocked, failed, or unknown
       // statuses instead of continuing to an auditor with incomplete artifacts.
       if (step.kind !== 'audit' && !['passed', 'ready_for_review'].includes(turn.handoff.stage_status)) {
+        // Blocked because an UPSTREAM artifact is deficient? Send the blockers back to the role that
+        // produced it and resume from there, rather than ending a run whose fix is already known.
+        const upstream = turn.handoff.stage_status === 'blocked'
+          ? this._resolveUpstreamStep(i, turn.handoff)
+          : null;
+        if (upstream && upstreamRecoveries < this.config.maxUpstreamRecoveries) {
+          upstreamRecoveries += 1;
+          const blockers = state.issues.open();
+          this.log(
+            `  ↺ ${step.role} blocked on upstream work — returning ${blockers.length} blocker(s) to ` +
+            `${upstream.step.role}${upstream.step.mode ? '/' + upstream.step.mode : ''} ` +
+            `(recovery ${upstreamRecoveries}/${this.config.maxUpstreamRecoveries})`
+          );
+          this._logIssues('      ', blockers);
+          pendingUpstream = {
+            role: upstream.step.role, mode: upstream.step.mode ?? null, issues: blockers, kind: 'upstream'
+          };
+          i = upstream.index - 1; // the for-loop's ++ resumes AT the upstream step
+          continue;
+        }
+
+        // No upstream culprit: the writer of THIS step is the only role that can change its artifact,
+        // so re-run it with the open issues. Do not require the issues to name it as `owner` — the
+        // contract restricts `owner` to the two spec/generator writers, so a Template Analyst's own
+        // findings can never point at itself. Observed live: the analyst blocked with six blocker crops
+        // for lines it could not read (exactly the honest behaviour its prompt asks for) and the run
+        // ended at status 80, because it is the FIRST write step and had neither an upstream role to
+        // return to nor self-owned issues to trigger a retry. It was the one role with no recovery.
+        const openIssues = state.issues.open();
+        const selfOwned = openIssues.filter(
+          (issue) => canonicalToken(issue.owner) === canonicalToken(step.role)
+        );
+        const selfAssigned = selfOwned.length ? selfOwned : openIssues;
+        if (selfAssigned.length && selfRepairs < this.config.maxSelfRepairs) {
+          selfRepairs += 1;
+          this.log(
+            `  ↻ ${step.role} reported its own output not approvable — re-running it with its ` +
+            `${selfAssigned.length} finding(s) assigned (self-repair ${selfRepairs}/${this.config.maxSelfRepairs})`
+          );
+          this._logIssues('      ', selfAssigned);
+          pendingUpstream = { role: step.role, mode: step.mode ?? null, issues: selfAssigned, kind: 'self' };
+          i = i - 1; // the for-loop's ++ returns to THIS step
+          continue;
+        }
         failedStage = step.mode || step.role;
         const rec = Number(turn.handoff.recommended_status_code);
         statusCode = Number.isFinite(rec) && rec !== 0
@@ -1447,6 +1769,22 @@ export class WorkflowOrchestrator {
       }
 
       if (step.kind === 'audit' && step.gate) {
+        // Same bookkeeping as the repair loop: this gate's independent auditor has reported the
+        // stage sound, and by the contract's pass policy it may not do so while a critical/major
+        // issue is unresolved. Record that pass as the verification for anything still sitting at
+        // "fixed" — otherwise a writer that reported a fix outside a repair round leaves a
+        // permanently blocking issue, which sends a PASSING gate into a repair loop that has
+        // nothing open to plan and can only fail.
+        if (turn.handoff.stage_status === 'passed' && QA_MODES.includes(step.gate)) {
+          const fixedOnly = state.issues.snapshot().filter((i) => i.status === 'fixed');
+          if (fixedOnly.length) {
+            this.log(
+              `    "${step.gate}" audit passed — recording it as verification for ` +
+              `${fixedOnly.length} issue(s) previously reported fixed: ${fixedOnly.map((i) => i.issue_id).join(', ')}`
+            );
+            state.issues.markVerified(fixedOnly.map((i) => ({ issue_id: i.issue_id })));
+          }
+        }
         if (turn.handoff.stage_status === 'passed' && state.issues.blockingForRelease().length === 0) {
           gatesPassed.push(step.gate);
           if (QA_MODES.includes(step.gate)) this._recordReview(state, step, turn.handoff, 0);
@@ -1481,6 +1819,16 @@ export class WorkflowOrchestrator {
         break;
       }
     }
+    } catch (err) {
+      // Carry the work done so far out with the failure. A controller-level throw (stalled turn,
+      // rejected upload, silent non-send) used to discard every completed turn of this run, so a
+      // post-mortem had no model output at all — the most expensive evidence to lose.
+      if (err && typeof err === 'object') {
+        if (!err.transcript) err.transcript = transcript;
+        if (!err.issues) err.issues = state.issues.snapshot();
+        if (!err.gatesPassed) err.gatesPassed = gatesPassed;
+      }
+      throw err;
     } finally {
       // Always close the isolated audit tab, on pass, reject, or throw.
       if (auditSession) await auditSession.close().catch(() => {});

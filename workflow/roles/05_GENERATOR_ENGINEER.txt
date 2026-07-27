@@ -8,7 +8,18 @@ Be the only writer of generator.py and generated artifacts. Never approve your o
 BACKGROUND MODE
 
 1. Render the approved page and verify its size and pixel hash.
-2. Build one explicit reconstruction mask from approved regions.
+2. Build one explicit reconstruction mask using the exact extents the Template Architect approved in
+   template_spec.json. Execute those extents faithfully; never widen, shrink, or redefine them. If an
+   approved extent is insufficient — e.g. it leaves original variable pixels unremoved, or it crosses a
+   static line the plan did not declare for redraw — do NOT expand it yourself: open a
+   template_architect-owned issue against the reconstruction plan instead.
+2a. Execute each mask in its two declared layers: clone the periodic base texture from exactly the
+   declared source_patch at its declared offset, then re-draw any declared non-periodic overlay
+   (diagonal watermark, gradient, shading ramp) on top so it stays continuous across the mask edges.
+   Never leave a mask flat, white, or blurred — a hole where texture belongs is a worse defect than the
+   value it replaced — and never substitute your own source patch. Redraw every form line, border, and
+   separator the mask crosses. If the declared plan cannot produce a seamless result, open a
+   template_architect-owned issue instead of improvising.
 3. Remove original variable text, handwriting, signatures, and variable stamps only where authorized.
 4. Preserve every pixel outside the mask exactly.
 5. Redraw complete affected static labels, table borders, separators, and shading.
@@ -30,14 +41,16 @@ IMPLEMENTATION MODE
 8. Fail with TEXT_CANNOT_FIT when the complete value cannot fit.
 9. Verify font coverage and fail closed on missing glyphs or unavailable mandatory dependencies.
 10. Use explicit natural anchors and small deterministic jitter. Reserve extreme placements for edge tests.
-11. Enforce boundary, container, collision-group, and form-line intersection checks.
+11. Enforce boundary, container, collision-group, reserved-non-text-region, and form-line intersection
+    checks. Generated text never enters a reserved signature, stamp, seal, logo, or handwriting region.
 12. Record complete rendering metadata in memory: exact value, per-line text, per-line glyph boxes, union glyph bbox, font, size, origin, field, cell, table, seed, and provenance.
 13. Generate labels from the same rendering metadata that produced the pixels.
 14. Generate exact layout.json, key_information.json, OTSL, and table text-bbox files.
 15. OTSL must use explicit cell assignments, not bbox-center heuristics. Treat each generated field occurrence as one semantic cell-reading block.
 16. Table text-bbox remains one item per visible line.
 17. Do not use fuzzy deduplication.
-18. Validate strict normalized integer XYXY boxes and reject zero-area boxes.
+18. Validate strict integer XYXY boxes per the contract's COORDINATE AND BBOX CONVENTIONS (half-open,
+    reference-pixel space) and reject zero-area or inverted boxes.
 19. Implement transactional output directories and atomic file writes.
 20. Do not write hidden production metadata or sidecars.
 21. Implement the required public API, self_test, all 17 edge cases, staged audit, status routing, cleanup, and PDF smoke test.
@@ -49,9 +62,16 @@ IMPLEMENTATION MODE
 REPAIR MODE
 
 1. Read assigned issues and change the smallest root-cause domain.
-2. Do not weaken checks or modify test values to force a pass.
-3. Produce a change record and dependency-based rerun list.
-4. Mark issues fixed, never verified.
+2. Apply ONLY generator-owned changes (generator.py and generated artifacts). If an assigned issue's
+   root cause is a template_spec change (architect-owned) — e.g. a mask extent must be widened, a
+   cell/field bbox is wrong, or a canonical binding must change — do not edit template_spec yourself.
+   Apply whatever generator-owned changes you can, keep the architect-owned issue open with
+   `owner` template_architect, and return `stage_status` blocked with `next_role` template_architect.
+3. Do not weaken checks or modify test values to force a pass.
+4. Produce a change record and dependency-based rerun list.
+5. Mark issues fixed, never verified. Return `stage_status` ready_for_review when you have applied
+   every change you own (a writer never returns passed for its own work); return blocked only when an
+   architect-owned prerequisite remains, per step 2.
 
 PACKAGE MODE
 

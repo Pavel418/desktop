@@ -59,6 +59,23 @@ FIDELITY
 - Match table lines, separators, field anchors, alignment, baselines, font metrics, line spacing, text color, and rotation as closely as the source permits.
 - Production placement uses explicit anchors and small bounded deterministic jitter. Unconstrained random placement is forbidden.
 
+COORDINATE AND BBOX CONVENTIONS
+
+These are fixed for every role and every artifact. Geometry disagreements caused by unstated
+conventions are contract violations, not tolerances.
+
+- One space only: integer pixels of the locked rendered reference page at reference DPI, origin
+  top-left, x to the right, y down. Never mix points, normalized units, or another DPI in a bbox.
+- Every bbox is [x0, y0, x1, y1], half-open: x0/y0 inclusive, x1/y1 exclusive. width = x1 - x0,
+  height = y1 - y0. x1 > x0 and y1 > y0 always; a zero-area or inverted box is invalid.
+- Containment is exact integer containment with ZERO tolerance: A is inside B only when
+  B.x0 <= A.x0, B.y0 <= A.y0, A.x1 <= B.x1, and A.y1 <= B.y1.
+- Required chain for every field: measured glyph extents inside reference_bbox inside boundary_bbox
+  inside container_bbox inside the owning cell inside its table inside the page.
+- When a box is derived from measurement, round OUTWARD (floor the minimums, ceil the maximums), and
+  round every enclosing box outward too. Never shrink an enclosing box to a measured value. An
+  off-by-one at a boundary is a defect to fix, never a rounding artifact to accept.
+
 TEXT AND LABEL TRUTH
 
 - Never truncate, slice, shorten, abbreviate, or ellipsize a value to make it fit.
@@ -67,7 +84,10 @@ TEXT AND LABEL TRUTH
 - Every rendered field has an explicit canonical key.
 - Every readable static table-text line has explicit table_id, cell_id, bbox, angle, and reading order.
 - Generate both OTSL and table text-bbox files for every table.
-- Use actual visible glyph bounds, not field boundaries, for text labels.
+- Use actual visible glyph bounds, not field boundaries, for text labels. A glyph bbox is both tight
+  and complete: it contains every visible dark pixel of its line — diacritics, umlaut dots, accents,
+  ascenders, descenders, punctuation, glyph overhangs — and nothing from any other line. Clipping a
+  glyph pixel is as serious as enclosing the whole cell; "tight" never means "cropped".
 - Do not use fuzzy label deduplication.
 - A visible text line without its required label is a failure.
 - A label without visible text is a failure.
@@ -142,7 +162,7 @@ Return only evidence and decisions, not hidden reasoning:
     "cell": "box_16",
     "bbox": [0, 0, 0, 0],
     "evidence": "One visible line has no table text-bbox item.",
-    "owner": "repair_engineer",
+    "owner": "generator_engineer",
     "required_reruns": ["baseline", "table_text_bbox", "visible_text_coverage"],
     "status": "open"
   }],
@@ -150,6 +170,23 @@ Return only evidence and decisions, not hidden reasoning:
   "required_reruns": [],
   "next_role": "controller"
 }
+
+Writers and the Repair Engineer add `change_records` — the audit trail of what a turn actually did.
+One entry per repair group, under these exact key names, so a reviewer can check the change instead of
+re-deriving it:
+
+  "change_records": [{
+    "change_group_id": "REPAIR-GROUP-0001",
+    "owner": "template_architect",
+    "issues_addressed": ["ISSUE-0001"],
+    "target": "fields[local_key=authority.endorsement_text].baseline_reference_px",
+    "old_value": [],
+    "new_value": [1902, 1948],
+    "reason": "baseline reference was empty, so placement could not be validated"
+  }]
+
+An empty `change_records` on a turn that was assigned open issues means nothing was changed — say that
+explicitly with a reason rather than returning an empty list and a passing status.
 
 For the qa_auditor edge mode ONLY, also include exactly 17 per-case decisions:
 
@@ -212,11 +249,130 @@ an issue ID; incomplete issue records are rejected at the orchestration boundary
   "cell": "box_16",
   "bbox": [0, 0, 0, 0],
   "evidence": "One visible line has no table text-bbox item.",
-  "owner": "repair_engineer",
+  "owner": "template_architect|generator_engineer",
   "required_reruns": ["baseline", "table_text_bbox", "visible_text_coverage"],
   "status": "open|fixed|verified|blocked"
 }
 
+OWNERSHIP
+
+`owner` is the single WRITER that must apply the fix, and the repair loop routes on it — not on
+`domain` or the gate at which the issue surfaced. It is exactly one of two values:
+
+- template_architect: any change to template_spec.json — page/table/cell/field geometry, the
+  static-text catalog and its bboxes, canonical bindings (semantics), and the reconstruction PLAN,
+  including exact mask extents and redraw declarations.
+- generator_engineer: any change to generator.py or generated artifacts — background build and
+  execution (rasterizing the approved masks, redrawing separators/labels), rendering, labels, OTSL,
+  runtime, and packaging.
+
+Assign by root cause, not by domain or symptom. `domain` alone does not determine the owner: a
+`reconstruction` issue is architect-owned when the mask PLAN or extent is wrong (fix in
+template_spec.json) and generator-owned when the build executed an already-approved plan incorrectly
+(fix in the background build). `repair_engineer` is never an owner — it plans repairs but writes
+nothing.
+
 PASS POLICY
 
 Missing evidence is not a pass. Successful rendering, file existence, bbox containment, or a contact sheet alone is not sufficient evidence.
+
+EVERY HASH IS COMPUTED, NEVER WRITTEN FROM MEMORY
+
+A SHA-256 cannot be worked out by inspection, so a hash you did not compute with code is wrong by
+construction. For every artifact you hand over, hash the exact bytes you are handing over, at the moment
+you hand them over — after the last edit, not before — and print `filename  sha256` into the log you
+attach. Copy the handoff value from that output.
+
+Reviewers recompute these. A hash carried over from an earlier version of a regenerated file is the
+usual reason a reviewer reports that measurements are correct yet the artifact contradicts them: the
+numbers describe an image that no longer exists at that path. If you regenerate a file, re-hash it and
+update every place its hash appears.
+
+MEASUREMENTS ARE REPRODUCIBLE OR THEY ARE NOTHING
+
+Any counter derived from pixels — residual ink, MSE, coverage, overflow, dark-pixel counts — is reported
+together with the means to reproduce it:
+
+- the script that computed it, handed over as an artifact with its hash (one file, standard library
+  plus the imaging packages already in use, no hidden state);
+- that script's raw stdout, handed over as an artifact, containing the per-item numbers;
+- values in your handoff transcribed from that stdout, unrounded;
+- the SHA-256 of every image the script read, printed by the script itself into that stdout, so a
+  reviewer can confirm the numbers describe the artifact it is looking at. Measurements of an image
+  nobody else has, or of an earlier version of one, are the usual reason a reviewer reports that an
+  artifact visibly contradicts numbers which are individually correct.
+
+THE SCRIPT MUST DERIVE ITS NUMBERS FROM THE IMAGE FILES. It opens the artifacts, reads their pixels, and
+computes every figure it prints. A script that carries the expected values as literals, prints constants,
+or hardcodes per-mask results has measured nothing, and the counters it produces are worth less than an
+honest "not measured" — they claim verification that never happened. The only inputs it may hardcode are
+paths, thresholds, and the geometry taken from the specification itself.
+
+A reviewer re-runs the script against the same inputs and expects the same numbers. This is the only
+form of self-verification that survives contact with an independent check: a number typed directly into
+a handoff cannot be distinguished from a number that was wished for, and reviewers across many runs have
+found exactly that — required counters at their required values beside artifacts that visibly contradict
+them. If you did not run code to obtain a pixel measurement, you do not have that measurement, and the
+honest report is that it is missing rather than a plausible-looking figure.
+
+MEASURED SELF-VERIFICATION
+
+Every pass condition in a role prompt must be verified by a check the role actually ran, and the
+handoff evidence must carry the resulting count or measurement for EACH condition — the number itself,
+not a boolean restatement of the rule. A condition claimed as satisfied without its measurement is
+unverified: any reviewer may reopen it, and a reviewer that finds a required counter missing records a
+failure rather than assuming a pass. Asserting compliance in prose while the measurement was never
+computed is a contract violation, not an oversight. Where a role prompt lists required counters and
+their required values, those values are the only acceptable ones — never round a number, relax a
+threshold, redefine a check, or omit a counter to make a stage pass.
+
+BACKGROUND-ONLY MSE — ONE DEFINITION, USED BY WRITER AND REVIEWER ALIKE
+
+Reconstruction quality is judged on the background a mask was supposed to PRESERVE, never on the
+content it was supposed to REMOVE. Compute it exactly this way:
+
+1. Align the locked source render and the simulation pixel-for-pixel (same page, DPI, and size).
+2. Inside the mask, exclude every pixel belonging to the variable content being removed: the original
+   value's dark glyph pixels, dilated by 1 pixel.
+3. Over the pixels that remain — the texture, shading, and form structure the plan promised to keep —
+   compute the mean squared RGB difference. That number is the background-only MSE.
+
+THE REFERENCE IS THE SCAN'S OWN TEXTURE VARIATION, measured in the SOURCE image alone — never between
+source and simulation, where an untouched region trivially yields zero. Take two disjoint patches of the
+same background_class, each the size of the mask and free of variable content, and compute the mean
+squared RGB difference between them: that is how much this paper naturally varies from place to place,
+and it is the yardstick a cloned patch is judged against. Report it as background_reference_mse. For a
+scanned form it is normally a small number in the single or low double digits; a value in the hundreds
+or thousands means variable content or a different background class leaked into one of the patches.
+
+FULL-MASK MSE IS A DIFFERENT NUMBER AND ITS LIMITS DO NOT APPLY. A correct reconstruction deletes the
+original value, so comparing the whole mask against the source necessarily yields a large MSE — often
+thousands. Never test a full-mask figure against the background-only limits, and never conclude from a
+large full-mask MSE that a reconstruction failed.
+
+Judge REMOVAL separately, and by pixels rather than by MSE: count the original value's dark pixels that
+are still present in the simulation (residual_source_value_pixels). Clean removal means that count is
+zero while the background-only MSE stays inside its limit. A reviewer disputing a reconstruction states
+both numbers, each measured as defined here, so writer and reviewer are comparing the same quantity.
+
+DECLARE THE REPLACEMENT SCOPE, because it decides what the numbers should look like:
+
+- glyph_only — only the value's own ink pixels are replaced and the surrounding background is left
+  byte-identical. A background-only MSE of exactly 0.000 is then CORRECT, not suspicious, because every
+  pixel the metric considers is untouched. The discriminating measurement here is residual ink.
+- whole_mask — the entire mask area is rebuilt. Its background-only MSE must be a real, non-zero
+  measurement inside the limits, and an exactly-zero value means it was never measured.
+
+INK IS WIDER THAN ITS DARK CORE. A scanned glyph fades into the paper through anti-aliased grey pixels,
+and replacing only the dark core leaves a pale outline of the original value — the single most common
+cause of a reconstruction that is declared clean and visibly is not. Treat every pixel measurably
+darker than the local background as ink, not just the near-black ones, and dilate the resulting ink
+mask by at least 2 pixels before replacing it. `residual_source_value_pixels` is counted against that
+same generous definition, so a surviving halo counts as residue.
+
+THE ARTIFACT WINS A MEASUREMENT DISPUTE. When a reviewer reports that a counter disagrees with the
+artifact it describes, the artifact is authoritative and your number was wrong. Re-measure from the
+artifact itself, correct the underlying geometry, plan, or code that produced the discrepancy, and
+report the newly measured value with the evidence you measured it from. Restating the original number,
+re-asserting that the check passed, or explaining why the reviewer's measurement should be discounted
+are all rejected: a disputed counter is a defect in the work, not a disagreement about arithmetic.

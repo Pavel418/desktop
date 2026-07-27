@@ -318,7 +318,6 @@ export class ChromeCdpPageAdapter {
     this.sessionId = sessionId;
     this.windowId = windowId;
     this.closed = false;
-    this.minimized = false;
   }
 
   markClosed() {
@@ -652,9 +651,19 @@ export class ChromeCdpPageAdapter {
       if (!mine(sid)) return;
       const rec = requests.get(p?.requestId);
       if (!rec || rec.state !== 'inflight') return;
-      rec.state = 'finished';
       rec.endedAt = Date.now();
       rec.bytes = Number(p?.encodedDataLength) || rec.bytes;
+      // A server error is a FAILED upload, not a completed one. Chrome fires loadingFinished for
+      // any response it received in full, including 4xx/5xx — so classifying by this event alone
+      // reported OpenAI's 500/503 upload outages as successful uploads, and the send-gate then
+      // dispatched a prompt whose attachments did not exist server-side.
+      if (Number(rec.status) >= 400) {
+        rec.state = 'http_error';
+        rec.error = rec.error || `http_${rec.status}`;
+        emit(rec, 'http_error');
+        return;
+      }
+      rec.state = 'finished';
       emit(rec, 'finished');
     });
     const offFail = this.client.on('Network.loadingFailed', (p, sid) => {
@@ -671,11 +680,32 @@ export class ChromeCdpPageAdapter {
       const now = Date.now();
       const all = Array.from(requests.values());
       const inflight = all.filter((r) => r.state === 'inflight');
+      const httpErrors = all.filter((r) => r.state === 'http_error');
+      // A ChatGPT attachment is only real once its whole three-request sequence succeeded:
+      // create (POST …/backend-api/files) → blob PUT → POST …/files/process_upload_stream.
+      // An attachment chip appears as soon as the file is *selected*, so chips alone say nothing
+      // about whether any bytes were uploaded — a file whose sequence never ran leaves the composer
+      // wedged on "File upload pending" and every send silently does nothing.
+      const ok = all.filter((r) => r.state === 'finished');
+      const processed = ok.filter((r) => /\/files\/process_upload_stream$/i.test(r.url)).length;
+      const created = ok.filter((r) => /\/backend-a(?:pi|lt)\/files$/i.test(r.url)).length;
+      const blobs = ok.filter((r) => r.method === 'PUT').length;
       return {
         total: all.length,
         inflight: inflight.length,
-        finished: all.filter((r) => r.state === 'finished').length,
-        failed: all.filter((r) => r.state === 'failed' || r.state === 'canceled').length,
+        finished: ok.length,
+        // Completed upload sequences — compare against the number of attached files. Keyed on the
+        // final process_upload_stream step, the last thing ChatGPT does before an attachment is
+        // usable; `created`/`blobs` are kept for diagnosing where a sequence stopped.
+        completed: processed,
+        processed,
+        created,
+        blobs,
+        // Transport failures, cancellations, AND server-error responses all mean "these bytes did
+        // not become an attachment". Callers gate the send on this being zero.
+        failed: all.filter((r) => r.state === 'failed' || r.state === 'canceled').length + httpErrors.length,
+        httpErrors: httpErrors.length,
+        httpErrorStatuses: [...new Set(httpErrors.map((r) => r.status).filter(Boolean))],
         oldestInflightMs: inflight.length ? now - Math.min(...inflight.map((r) => r.startedAt)) : 0,
         requests: all.map((r) => ({
           method: r.method, url: r.url, status: r.status, state: r.state,
@@ -823,19 +853,13 @@ export class ChromeCdpPageAdapter {
     await this.client.send('Page.bringToFront', {}, this.sessionId).catch(() => {});
     if (this.windowId != null) {
       await this.client.send('Browser.setWindowBounds', { windowId: this.windowId, bounds: { windowState: 'normal' } }).catch(() => {});
-      this.minimized = false;
     }
   }
 
   async minimize() {
     if (this.windowId == null) return false;
     await this.client.send('Browser.setWindowBounds', { windowId: this.windowId, bounds: { windowState: 'minimized' } }).catch(() => {});
-    this.minimized = true;
     return true;
-  }
-
-  isMinimized() {
-    return this.minimized;
   }
 
   async close() {
@@ -844,44 +868,6 @@ export class ChromeCdpPageAdapter {
       await this.client.send('Target.closeTarget', { targetId: this.targetId });
     } catch {}
     this.closed = true;
-  }
-}
-
-class ChromeCdpPresenter {
-  constructor(page) {
-    this.page = page;
-  }
-
-  isClosed() {
-    return this.page.isClosed();
-  }
-
-  isMinimized() {
-    return this.page.isMinimized();
-  }
-
-  restore() {
-    return this.page.bringToFront();
-  }
-
-  show() {
-    return this.page.bringToFront();
-  }
-
-  focus() {
-    return this.page.bringToFront();
-  }
-
-  minimize() {
-    return this.page.minimize();
-  }
-
-  isVisible() {
-    return !this.page.isClosed();
-  }
-
-  close() {
-    return this.page.close();
   }
 }
 
@@ -1019,8 +1005,6 @@ export class ChromeCdpBrowserBackend {
     };
   }
 
-  setQuitting() {}
-
   async createSession({ url, show = false, onClosed } = {}) {
     await this.start();
 
@@ -1066,7 +1050,6 @@ export class ChromeCdpBrowserBackend {
 
       return {
         page,
-        presenter: new ChromeCdpPresenter(page),
         close: async () => {
           this.tabClosers.delete(targetId);
           try {

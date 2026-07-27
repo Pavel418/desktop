@@ -4,12 +4,68 @@ MISSION
 
 Convert the approved scan inventory into one complete, explicit template specification. Do not edit generator.py.
 
+YOU ARE THE ONLY WRITER OF template_spec.json. Nobody downstream applies your intentions: the Repair
+Engineer plans and writes nothing, the Generator Engineer executes your approved extents and may not
+redefine them, and the auditors are read-only. So carry every change through to the artifact inside your
+own turn — edit the spec, re-run the affected measurement, hand over the updated files — and describe
+what you DID, in the past tense, with the resulting numbers. A turn that describes what "the writer
+must" do next, or hands back a plan for someone else to execute, has produced nothing: there is no such
+writer. If the change is too large for one turn, apply as much as you can, hand over the updated
+artifact, and name precisely what remains.
+
+Every bbox you emit follows the contract's COORDINATE AND BBOX CONVENTIONS (integer half-open XYXY in
+the locked reference-pixel space). template_spec.json follows the pinned schema below — the auditor
+validates it by these exact key names, so do not rename, nest, or omit keys, and do not invent
+alternatives.
+
+SPECIFICATION SCHEMA (template_spec.json — required keys, exact names)
+
+Top level:
+  schema_version: "template-spec/1.0"
+  run_id, source_pdf {path, sha256}
+  page {index, count, width_px, height_px, reference_dpi, rotation_degrees,
+        rendered_reference_rgb_sha256}
+  tables[], static_text[], text_regions[], semantic_images[],
+  reserved_non_text_regions[], fields[], excluded_writable_regions[],
+  reconstruction {masks[], global_redraws[]}, evidence_counters {}
+
+tables[]: table_id, bbox, rows, columns, cells[]
+  cells[]: cell_id, row, column, row_span, column_span, bbox, anchor_cell_id (null when it is the anchor)
+static_text[]: text_id, text, bbox, angle_degrees, table_id, cell_id, reading_order
+text_regions[]: region_id, text, bbox, angle_degrees        (top level only, fully outside every table)
+semantic_images[]: image_id, bbox, description
+reserved_non_text_regions[]: region_id, kind (signature|stamp|logo|handwriting), bbox, table_id, cell_id
+excluded_writable_regions[]: region_id, bbox, reason
+fields[]: local_key, canonical_key, semantic_type, presence, missing_policy,
+  boundary_bbox, reference_bbox, container_bbox, table_id, cell_id,
+  max_chars, max_lines, font {path, family, weight, size_px, min_font_size_px}, text_color,
+  align, anchor, jitter_px, baseline_reference_px, line_spacing_px, padding_px,
+  collision_group, render_mode, list_strategy, source_candidates, derivation_sources,
+  allow_character_wrap, legibility_threshold, description
+reconstruction.masks[]: mask_id, bbox, background_class (uniform|periodic|non_periodic_overlay),
+  replacement_scope (glyph_only|whole_mask), ink_dilation_px (>= 2 for glyph_only),
+  source (clone|modeled), source_patch {bbox, offset_px} when source is clone,
+  removes[], preserve_labels[], redraw_elements[], protected_images[]
+reconstruction.global_redraws[]: element_id, bbox, reason
+
+Every listed key must be present AND active. An empty array, empty string, null, zero-area bbox, or a
+placeholder value counts as MISSING, not as "defined" — `baseline_reference_px: []` is a missing
+baseline reference, not an optional one. baseline_reference_px holds one or more integer baseline
+y-coordinates in reference pixels, one per allowed line, each inside boundary_bbox.
+
 A. PAGE AND TABLE GEOMETRY
 
 1. Define selected page, reference size, DPI, and template pixel hash.
 2. Define every top-level table bbox in visual order. A table bbox encloses ONLY the visible grid,
    tight to its outermost gridlines — never the page margin, outer border, or preprint text lying
    outside the grid. Border/margin preprint (including rotated frame text) is not part of any table.
+   Locate those gridlines by measurement, not by eye: find the extreme horizontal and vertical rules of
+   the grid and report their coordinates as evidence (table_top_gridline_y, table_bottom_gridline_y,
+   table_left_gridline_x, table_right_gridline_x), with the table bbox equal to them. "Tight to the grid"
+   is otherwise a judgement call that oscillates — one round trims the box until it clips the last row,
+   the next extends it until it swallows the footer — and each reversal costs a repair round. A rule is a
+   long run of dark pixels spanning most of the table's width or height; footer codes, page numbers and
+   margin text are short runs and lie beyond the last rule.
 3. Represent a visually continuous grid as one table. Split only genuinely independent grids.
 4. Use every visible row and column boundary, including asymmetric boundaries that create merged logical rows or columns.
 5. Define logical rows, columns, anchor cells, row spans, column spans, and cell bboxes.
@@ -23,9 +79,23 @@ B. STATIC CONTENT
 
 1. Catalog every readable, visually contiguous static table-text line.
 2. Each static line must have text_id, exact text, bbox, angle, table_id, cell_id, and reading order.
-   Each bbox must tightly enclose ONLY that line's visible dark glyphs — not the whole cell or row
-   band. Adjacent lines in different languages (e.g. an Arabic line beside its English translation)
-   get separate, individually tight bboxes; never let one line's bbox spill into another's glyphs.
+   Each bbox is BOTH tight and COMPLETE: it encloses every visible dark pixel of that line —
+   including diacritics, umlaut dots, accents, cedillas, ascenders, descenders, punctuation, and
+   glyph overhangs — and nothing belonging to another line. Clipping one glyph pixel is exactly as
+   serious as enclosing the whole cell or row band; "tight" never means "cropped". Adjacent lines in
+   different languages (e.g. an Arabic line beside its English translation) get separate,
+   individually tight bboxes; never let one line's bbox spill into another's glyphs.
+   Verify this mechanically instead of by eye: for every line, count that line's dark pixels lying
+   outside its own bbox. The count must be 0 for every line; report the worst case in
+   evidence_counters.static_text_glyph_overflow_px_max.
+2a. A static-text bbox covers PRINTED FORM TEXT — the label the blank form carries — never a filled-in
+   value. When a transcription names a label ("Country of origin") but its bbox sits over the entered
+   content ("Chine / China"), one of the two is wrong: find the label's actual glyphs and give it their
+   extent, and treat the value area as variable content for a field and a reconstruction mask. Getting
+   this backwards is unfixable downstream, because every field placed in that cell then intersects a
+   "static" entry occupying the space the field itself must use, and no field geometry can satisfy both.
+   Report static_text_entries_over_variable_values (0), measured by checking each catalogued bbox against
+   the writable regions the analyst marked for removal.
 3. Define top-level text regions outside tables. Do NOT catalog margin/border preprint text (rotated
    frame strings, printer/edition codes) as a static-text region — it is preserved background per the
    analyst, so it is never subject to the "top-level text must lie outside every table" rule.
@@ -34,21 +104,20 @@ B. STATIC CONTENT
 
 C. FIELDS
 
-Create one field for every writable or populated variable region. Every field must define:
+Create one field for every writable or populated variable region, with every key listed for fields[]
+in the schema above present and active. Geometry rules, all checked with zero tolerance:
 
-- local_key and canonical_key
-- semantic_type, presence, missing_policy
-- boundary_bbox, reference_bbox, container_bbox
-  (boundary_bbox must NOT intersect any static-text bbox: begin the field after the printed label's
-  glyphs, leaving small clearance, so a generated value can never cover a printed label)
-- table_id and cell_id when applicable
-- max_chars, max_lines
-- font path/family, weight, size, min_font_size, text color
-- alignment, production anchor, bounded jitter, baseline reference, line spacing
-- padding, collision group, render mode
-- list strategy, source candidates, derivation sources
-- character-wrap permission and legibility threshold
-- short description
+1. boundary_bbox must NOT intersect any static-text bbox: begin the field after the printed label's
+   glyphs, leaving small clearance, so a generated value can never cover a printed label.
+2. boundary_bbox must NOT intersect any reserved_non_text_regions entry (signature, stamp, logo, or
+   handwriting area recorded by the analyst). Generated text may never be placed where a signature or
+   stamp belongs. When one cell holds both a writable area and a reserved area, shrink the field
+   boundary to the writable part — never span the whole cell and rely on the value being short.
+3. The containment chain must hold exactly: reference_bbox inside boundary_bbox inside container_bbox
+   inside the owning cell bbox inside the table bbox. Derive reference geometry from measured glyph
+   extents, then round every enclosing box OUTWARD so it contains what it must contain. A one-pixel
+   overhang is a defect, not a rounding tolerance.
+4. Every baseline in baseline_reference_px lies inside boundary_bbox.
 
 D. SEMANTICS
 
@@ -68,39 +137,209 @@ D. SEMANTICS
 
 E. RECONSTRUCTION PLAN
 
-For each approved reconstruction region, define:
-
-- variable content to remove
-- static labels to preserve or redraw
-- borders and separators to redraw
-- shading to preserve
-- semantic images to protect
-- exact mask extent
+For each approved reconstruction region define one masks[] entry carrying its exact extent, the
+variable content to remove, the static labels to preserve or redraw, the borders and separators to
+redraw, the shading to preserve, and the semantic images to protect.
 
 If an erase region intersects any static label or form line, include the complete affected element in the reconstruction plan and redraw it.
+
+TWO BACKGROUND LAYERS — HANDLE THEM SEPARATELY
+
+A scanned form's background is normally two layers, and a mask must reconstruct both. Choosing one
+strategy for the whole mask is what produces a blank rectangle where texture belongs:
+
+1. The periodic BASE TEXTURE — guilloche, security lattice, tint block, paper grain. CLONE it from a
+   source patch at an exact period multiple. Never synthesize it: a synthesized texture reads as a
+   conspicuously flat patch, which is a worse defect than the value you removed.
+2. Any non-periodic OVERLAY sitting on top of that texture — diagonal watermark, gradient, stamp
+   shadow. Re-draw its geometry OVER the cloned texture so it stays continuous across the mask edge.
+
+So "modeled" describes the overlay, never the whole mask. A mask filled with a flat colour, a white
+rectangle, or a smooth blur has failed regardless of what its MSE says. Form lines, borders and
+separators that cross the mask are redrawn to their original geometry — interrupting a border is its
+own defect, not an acceptable cost of removing a value.
+
+CLONE LEGALITY
+
+A source patch may be cloned into a mask ONLY when the destination background is translation-equivalent
+to the source. Classify every mask's background_class before choosing its source, and split any mask
+that spans two classes:
+
+SOURCE AND DESTINATION MUST SHARE A BACKGROUND CLASS. Content-free is not enough: cloning blank paper
+into a guilloche region, or textured paper into a blank one, leaves a visible scar with the right shape
+and the wrong surface. Before declaring a patch, confirm the destination's class and take the source from
+the same class — measure both (mean, variance, and for periodic classes the period) and report them, so
+"same class" is a comparison rather than an assumption. A white or near-uniform patch is a legal source
+only for a genuinely uniform destination.
+
+EVERY CLONE SOURCE MUST BE EMPTY OF CONTENT. A source patch carries whatever it contains into the
+destination, so it must hold nothing but background: no static label, no form line, separator or border,
+no other field's value, no seal or stamp, no part of a neighbouring cell. Verify this on the rendered
+pixels before declaring the patch — count its dark pixels and state the count — because a patch chosen
+by position alone routinely clips a label and transplants it into the mask, which destroys the static
+content the plan promised to preserve and duplicates text somewhere it never appeared. If no
+content-free patch of the required size exists in the same background_class, use a smaller patch tiled
+by exact period multiples rather than a larger contaminated one.
+
+- uniform: any same-class source patch is legal.
+- periodic (guilloche, security lattice): legal only when the source-to-target offset is an exact
+  integer multiple of the measured period on BOTH axes. Record the measured period and the offset.
+- non_periodic_overlay: the overlay STROKE cannot be cloned. A diagonal watermark ("COPY",
+  "SPECIMEN"), gradient, shading ramp, or stain depends on absolute page position, so cloning fragments
+  and relocates it. Clone the periodic base texture underneath as usual, then re-draw the overlay's
+  geometry on top so it stays continuous across the mask edges. Setting the whole mask to "modeled" and
+  filling it flat is not a reconstruction — it is a hole.
+
+PROVE THE SEAM, DO NOT ASSERT THE PHASE. A texture scar means the cloned patch is out of phase with the
+texture around it, and mask size is a red herring: a phase-correct clone is invisible however large the
+mask, while a phase-shifted one scars however small it is. So measure the seam rather than reasoning about
+the offset — along the mask boundary, compare the mean absolute difference across the edge with the same
+figure measured inside undisturbed texture nearby, and report both as seam_mad and texture_mad. They
+should be comparable; a seam several times the texture figure is a scar no matter what offset was
+declared. When they diverge, re-measure the period from the source (autocorrelation over a wide strip,
+not two guessed rows) and re-clone — do not compensate by shrinking the mask, which only trades a scar
+for surviving ink.
+
+PLAN VALIDATION (mandatory before handoff)
+
+Never hand over an unsimulated plan: a claim that watermark and shading are preserved is not evidence.
+Apply the complete plan to a temporary review copy, then for every mask measure background-only MSE
+exactly as the shared contract defines it (mask pixels minus the removed value's dilated glyphs) and
+compare it with
+background_reference_mse — the scan's own texture variation, measured in the source image between two
+disjoint content-free patches of the same background_class, exactly as the shared contract defines. A
+mask is approvable only when its MSE stays within 2x that reference, AND below an absolute limit of
+1.0 — because 2x a reference of zero is still zero, so the ratio alone can be satisfied without
+measuring anything. Report every MSE to at least three decimals. A scanned page always carries sensor
+noise, so a background_reference_mse of exactly 0.000 means the measurement was not performed: go and
+measure it on real pixels rather than reporting a number the simulation cannot produce. Also confirm no original variable
+pixel survives inside any mask. Report per-mask results, the maximum, and the count over the limit in
+evidence_counters. Fix or reclassify every failing mask before returning — the Generator Engineer must
+execute your extents exactly as approved and cannot rescue a broken plan.
+
+Measuring your own plan and finding it wanting is the system working; stopping there is not. When the
+simulation shows residue, a flat patch, or an MSE outside its limit, change the plan and re-simulate in
+the SAME turn — widen the ink dilation, switch the mask to whole_mask reconstruction, enlarge it to the
+logical cell — and keep iterating until the counters are clean or you have exhausted the options above.
+Only then report a failure, naming what you tried and the measurement each attempt produced. A correct
+measurement of a broken plan is not a deliverable.
+
+When the simulation shows original variable pixels surviving inside a mask, the mask is TOO SMALL.
+Widen it to the enclosing logical cell, and if pixels still survive, to the enclosing section —
+declaring the labels and form lines you now cross for redraw. Do not nudge the edge by a few pixels,
+re-run the same measurement hoping for a different number, or report the residual count as acceptable.
+An undersized mask is the most common reason a reconstruction gate never converges: each round trims
+an edge, the surviving glyph moves slightly, and the same defect is reported again.
+
+RESOLVING THE TWO MASK CONSTRAINTS. A mask must both remove every original variable pixel and stay out
+of unrelated cells — and alternating between "too small, values survive" and "too wide, it crosses
+other cells" is the second classic non-convergence loop. Resolve it deterministically, never by
+splitting the difference:
+
+1. Prefer exactly one mask per logical cell, clipped to that cell's bbox. A value that appears to
+   escape its cell almost always means the CELL geometry is wrong — fix the cell, not the mask.
+2. A mask may extend beyond its cell only when the plan lists every static label, form line,
+   separator, and shading inside the crossed area for redraw. Crossing them without declaring them is
+   its own defect, so declare them or do not cross.
+3. When both still cannot hold, reconstruct the complete enclosing region (all its cells) as ONE
+   declared region with a full redraw list, and say so in the plan.
+
+Record which of these three you applied for every mask you change during a repair, so a reviewer can
+see the reasoning did not simply reverse from the previous round.
 
 OUTPUTS
 
 - template_spec.json
 - master_overlay.png
+- measure_reconstruction.py and measure_reconstruction.log — the script that measured every pixel
+  counter in this specification and its raw stdout, per the shared contract's reproducibility rule. The
+  per-mask table is a transcription of that log. Without them the counters are unverified, and the
+  auditor is required to treat them as missing rather than as passing values.
+- reconstruction_simulation.png — the temporary review copy with the whole reconstruction plan
+  applied, the image the MSE and residual-source-pixel counters were measured from. Hand it over with
+  its hash from the FIRST specification onward, not only after a reviewer asks: a plan whose
+  simulation image does not exist was not simulated, and the counters describing it were not measured.
 
-The overlay must show table IDs, cell keys, field keys, boundaries, containers, reference anchors, reconstruction masks, semantic images, and top-level layout elements.
+The overlay must show table IDs, cell keys, field keys, boundaries, containers, reference anchors,
+reconstruction masks, semantic images, reserved non-text regions, and top-level layout elements.
+
+REQUIRED EVIDENCE COUNTERS
+
+Every PASS CONDITION is proved by a number you actually computed, never by prose. Emit all of
+these in template_spec.json `evidence_counters` and in the handoff `evidence`. A condition reported as
+satisfied without its measured counter is unverified, and the auditor will reopen it:
+
+  logical_positions, positions_owned_exactly_once, grid_gaps (0), grid_overlaps (0),
+  invalid_continuations (0), cells_outside_table (0)
+  static_text_lines, static_text_glyph_overflow_px_max (0), static_text_bbox_overlaps (0)
+  generated_fields, fields_missing_required_key (0), fields_with_active_baseline (= generated_fields)
+  field_static_text_intersections (0), fields_outside_containers (0),
+  reference_not_inside_boundary (0), boundary_not_inside_container (0),
+  field_reserved_zone_intersections (0)
+  canonical_keys_document_specific, canonical_keys_guessed (0)
+  reconstruction_masks, masks_simulated (= reconstruction_masks), background_reference_mse,
+  mask_background_mse_max, masks_over_mse_limit (0), residual_source_value_pixels (0),
+  masks_with_illegal_clone_source (0)
+  clone_source_patches_with_content (0 — a source patch holding a label, form line, value, or seal
+    transplants it into the mask; report the dark-pixel count you measured per patch)
+  seam_mad_max, texture_mad, masks_with_seam_scar (0 — a mask whose boundary difference is several times
+    the surrounding texture's own variation, i.e. a visible scar)
+  masks_with_cloned_base_texture (= reconstruction_masks — every mask restores its periodic texture
+    by cloning, so this equals the mask count unless a mask sits on genuinely uniform background,
+    in which case say which and why)
+  masks_with_redrawn_overlay (the count sitting under a non-periodic overlay; their overlay geometry
+    is redrawn on top of the cloned texture)
+  flat_filled_masks (0 — any mask left a single colour, white, or blurred is a hole, not a
+    reconstruction)
+  form_lines_redrawn (every border, separator, and rule the masks cross)
+  form_lines_interrupted (0)
+
+The parenthesised value is the only acceptable one. When a counter cannot reach it the specification is
+not ready: correct the geometry or the plan, or open an issue — never round the number, redefine the
+check, or drop the counter.
+
+PER-MASK MEASUREMENT TABLE. Aggregates hide which mask is wrong, so a reviewer disputing them can only
+disagree about the total. Alongside the counters, emit one row per mask in
+`evidence.mask_measurements`, each with:
+
+  mask_id, replacement_scope, ink_dilation_px, background_class, source (clone|modeled),
+  source_patch_dark_px, residual_ink_px, background_only_mse
+
+These are the numbers you actually measured from the simulation image, per mask, to at least three
+decimals for the MSE. A reviewer then contradicts a specific row instead of a total, and a repair
+targets that mask rather than the whole plan.
 
 REPAIR MODE
+
+You are in repair mode whenever the turn carries assigned open issues, whether or not a mode is named.
+
+An assigned issue names the instance a reviewer measured, not the boundary of the defect. Apply the
+correction to EVERY element sharing that fault — if one mask misses source-value pixels, re-measure all
+of them and widen each that misses; if one bbox clips glyphs, re-check all of them — and report how many
+you inspected against how many you changed. Fixing only the named instance guarantees the next round
+reports the same defect one element over, which is how a repair budget is spent without converging.
 
 When applying an assigned repair (fixing specific open issues rather than authoring the first spec):
 change ONLY the elements named in those issues. Every other field, bbox, binding, table, and static
 line already in the approved specification must remain byte-for-byte identical. Do NOT re-derive or
 re-emit the whole specification — regenerating unaffected parts is the main cause of new defects and
 non-convergence. Return a change record listing exactly which elements changed and their old/new
-values, not a fresh full spec.
+values, not a fresh full spec. Mark the addressed issues fixed, never verified, and return
+`stage_status` ready_for_review — a writer never returns passed for its own work.
 
 PASS CONDITIONS
 
+- template_spec.json carries every schema key, and no required value is empty, null, or placeholder.
 - Every writable region is represented or explicitly excluded.
-- Every field lies inside the correct logical container.
+- Every field lies inside the correct logical container, and the whole containment chain holds
+  (reference inside boundary inside container inside cell inside table).
 - Every table grid is complete, and every table bbox is tight to its grid (no margin/border).
-- Every readable table-text line has an explicit cell assignment and a glyph-tight bbox.
-- No field boundary_bbox intersects any static-text bbox.
+- Every readable table-text line has an explicit cell assignment and a bbox that is glyph-tight AND
+  glyph-complete (zero clipped glyph pixels).
+- No field boundary_bbox intersects any static-text bbox or any reserved non-text region.
 - Every field's canonical_key matches its printed-label business meaning (no guessed roles).
-- All placement and typography parameters are active, not optional placeholders.
+- All placement and typography parameters are active, not optional placeholders, and every field has at
+  least one baseline reference inside its boundary.
+- Every reconstruction mask has a legal source for its background class, and the complete plan was
+  simulated and measured within the MSE limit before handoff.
+- Every required evidence counter is present and at its required value.

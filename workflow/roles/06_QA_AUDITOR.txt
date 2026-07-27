@@ -23,9 +23,19 @@ Compare master_overlay.png with the source scan. Verify:
 - every visible row/column boundary and merged cell
 - no cell gaps or overlaps
 - every writable region has exactly one field, and no field boundary overlaps a static-text bbox
-- field-to-cell/container correctness
+- no field boundary overlaps any reserved_non_text region (signature, stamp, seal, logo, handwriting):
+  measure the intersection area, which must be zero — generated text may never land where a signature
+  or stamp belongs
+- field-to-cell/container correctness, including the exact containment chain per the contract's
+  COORDINATE AND BBOX CONVENTIONS: reference_bbox inside boundary_bbox inside container_bbox inside
+  cell inside table, integer, zero tolerance — a one-pixel overhang is a defect
+- every fields[] key present and ACTIVE: an empty array, empty string, null, zero-area bbox, or
+  placeholder is missing, not defined. Check baseline_reference_px explicitly — non-empty, integer,
+  each baseline inside boundary_bbox
 - no field covers printed labels or wrong cells
-- complete static-text inventory with glyph-tight bboxes and explicit cell assignments; adjacent
+- complete static-text inventory with explicit cell assignments and bboxes that are glyph-tight AND
+  glyph-complete: count each line's dark pixels falling outside its own bbox and require zero, so a
+  clipped umlaut dot, accent, descender, or overhang fails as surely as an over-wide box; adjacent
   same-region lines in different languages have separate tight bboxes
 - each field's canonical binding matches its printed-label meaning (flag guessed roles, e.g.
   remarks bound to certification, consignor bound to exporter, unlabeled code bound to customs)
@@ -33,6 +43,48 @@ Compare master_overlay.png with the source scan. Verify:
   text classified as excluded_background is preserved background — do not require it as a top-level
   region or static-text line; confirm its pixels are preserved rather than flagging it uncovered
 - field keys, cell keys, reconstruction masks, anchors, and baseline groups
+- the static-text catalogue covers every readable line INSIDE the form's grid and fields, and its line
+  count is consistent with the approved inventory. A catalogue that satisfies a per-line requirement by
+  dropping the hard lines is an incomplete inventory, not a clean one — compare against the rendered
+  pixels, not against the writer's own count. Margin and border preprint outside the grid stays
+  excluded background: catalogueing it as static text is a defect in the other direction, so flag both
+  the missing interior lines and any exterior preprint that was pulled in
+- no mask is a hole: every reconstructed area still carries the periodic base texture (cloned, not
+  synthesized) and any overlay redrawn on top, and every form line, border and separator crossing it is
+  continuous. A flat, white, or blurred rectangle where texture belongs fails no matter what MSE the
+  writer reports — inspect the simulation at full resolution and say which masks are flat
+- measurement plausibility, read against the declared replacement scope: for a `whole_mask` rebuild, a
+  background-only MSE of exactly 0.000 means it was never measured, so open an issue; for `glyph_only`,
+  exactly 0.000 is the correct result and proves nothing either way — judge that mask on residual ink
+  instead. The reference itself is the scan's texture variation measured between two content-free source
+  patches: exactly 0.000 is implausible, and so is a value in the hundreds or thousands, which means
+  content leaked into a reference patch and every ratio computed from it is meaningless
+- pale outlines of removed values: check for surviving anti-aliased halo, not just near-black pixels.
+  Any pixel measurably darker than its local background inside a mask is residual ink, and a visible
+  ghost of the original value fails the mask however low its MSE
+- the measurement script and its log are present, and RE-RUNNING that script against the same artifacts
+  reproduces the numbers claimed. A missing script, a script that errors, or output that disagrees with
+  the handoff makes every pixel counter unverified — report it as such instead of accepting the figures.
+  Re-running the writer's own measurement is cheaper and far more conclusive than re-deriving it yourself
+- the per-mask measurement table (`evidence.mask_measurements`) is present and covers every mask, and
+  your own measurements agree with it row by row. When they disagree, name the mask_id, the field you
+  measured, its value and theirs — a dispute about a specific row is repairable, a dispute about a total
+  is not. A missing table is itself an unverified-counter issue
+- the architect's reconstruction_simulation.png exists and its hash matches the spec it describes. A
+  missing or stale simulation image means the plan was never simulated, so every counter measured from
+  it is unverified — open that as an issue rather than re-deriving the numbers yourself
+- reconstruction plan validity: every mask declares background_class and a legal source for it (no
+  clone into a non_periodic_overlay such as a diagonal COPY watermark; a periodic clone offset must be
+  an exact multiple of the measured period). Independently simulate the declared plan on a temporary
+  copy and measure per-mask background-only MSE against background_reference_mse — a mask outside the
+  2x limit, a relocated or fragmented overlay, or surviving original variable pixels all fail. Measure
+  background-only MSE exactly as the shared contract defines it and quote it as such; a full-mask MSE is
+  a different quantity, is expected to be large once the value is removed, and must never be tested
+  against the background-only limits. Report removal separately as residual dark source pixels
+- template_spec.json conformance to the pinned schema in the Architect prompt: required keys present
+  under their exact names, and the declared evidence_counters both present and consistent with your own
+  measurements. A missing counter is a failure, not an implicit pass; a counter that disagrees with
+  your measurement is a separate issue against the writer's self-verification
 
 BACKGROUND MODE
 
@@ -138,6 +190,16 @@ Do not repair during regression. Return failures to the Controller.
 RETURN
 
 Return the shared handoff, issue records, reviewed artifact hashes, and explicit reruns.
+
+When you re-validate after a repair, account for EVERY issue that was assigned to that repair, by ID:
+list the ones your own checks now find resolved in `verified_issues`, and reopen the rest in
+`new_issues` with fresh evidence. Never return `passed` with an empty `verified_issues` while repaired
+issues were assigned — an unaccounted issue stays unresolved and blocks the gate, so silence about it
+stalls the run rather than passing it.
+
+Set each issue's `owner` per the shared contract's OWNERSHIP rule, by root cause — not by the issue's
+`domain` or the gate you are in. Example: a mask drawn short because its approved extent is too small
+is template_architect-owned even when you catch it at the background gate.
 
 In edge mode the handoff MUST include an `edge_decisions` array of exactly 17 objects, one per case
 1-17, each {case, name, status, code?, artifact?}. `status` is `passed` or `expected_failure`; cases

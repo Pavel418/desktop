@@ -27,22 +27,22 @@ The workflow never uses OCR or PDF text extraction and never adds artificial sca
 2. **Controller** opens the run and enforces ownership and gates. The base generator's soundness is
    asserted mechanically by the orchestrator (byte-hash identity gate), not by an LLM audit.
 3. **Template Analyst** creates the scan inventory and locks the target page by rendered-pixel hash.
-5. **Template Architect** creates the complete template specification and master overlay.
-6. **QA Auditor, template** reviews all geometry, fields, cells, keys, static text, images, and reconstruction masks.
-7. **Generator Engineer, background** creates the clean hybrid background.
-8. **QA Auditor, background** checks source-value removal, static structure, seams, and preserved pixels.
-9. **Generator Engineer, implementation** adapts generator.py and creates normal and stress samples with all labels.
-10. **QA Auditor, baseline** performs complete machine, visual, and visible-text coverage audits.
-11. **QA Auditor, fidelity** compares source structure and generated placement conventions.
-12. **Repair loop** repeats Generator Engineer or Template Architect changes, QA verification, and dependency-based reruns until baseline and fidelity pass.
-13. **QA Auditor, edge** runs and reviews all 17 cases one by one.
-14. **Repair loop** repeats only affected tests, followed by the complete edge suite.
-15. **QA Auditor, regression** runs all clean machine stages from isolated directories.
-16. **Generator Engineer, package** writes manifest.json and generator_report.json and cleans temporary outputs.
-17. **Controller** assembles and validates the visual-review envelope from the retained QA reviews (six gates, 17 individual edge decisions, reviewer identity distinct from every writer, model-claimed artifact hashes), computes real SHA-256 of the three persistent files, and cross-checks generator_report.json (`checks.visual_quality`) — failing closed if incomplete. This envelope is what the release and final auditors receive.
-18. **Contract Auditor, release** checks runtime and package correctness against that envelope.
-19. **Final Auditor** independently approves or rejects release.
-20. **Controller** emits the final result.
+4. **Template Architect** creates the complete template specification and master overlay. `template_spec.json` follows the pinned key schema in `04_TEMPLATE_ARCHITECT.txt`, and every pass condition is backed by a measured counter in `evidence_counters` — the auditor validates those exact key names and reopens any condition asserted without its measurement.
+5. **QA Auditor, template** reviews all geometry, fields, cells, keys, static text, images, and reconstruction masks.
+6. **Generator Engineer, background** creates the clean hybrid background.
+7. **QA Auditor, background** checks source-value removal, static structure, seams, and preserved pixels.
+8. **Generator Engineer, implementation** adapts generator.py and creates normal and stress samples with all labels.
+9. **QA Auditor, baseline** performs complete machine, visual, and visible-text coverage audits.
+10. **QA Auditor, fidelity** compares source structure and generated placement conventions.
+11. **Repair loop** repeats Generator Engineer or Template Architect changes, QA verification, and dependency-based reruns until baseline and fidelity pass.
+12. **QA Auditor, edge** runs and reviews all 17 cases one by one.
+13. **Repair loop** repeats only affected tests, followed by the complete edge suite.
+14. **QA Auditor, regression** runs all clean machine stages from isolated directories.
+15. **Generator Engineer, package** writes manifest.json and generator_report.json and cleans temporary outputs.
+16. **Controller** assembles and validates the visual-review envelope from the retained QA reviews (six gates, 17 individual edge decisions, reviewer identity distinct from every writer, model-claimed artifact hashes), computes real SHA-256 of the three persistent files, and cross-checks generator_report.json (`checks.visual_quality`) — failing closed if incomplete. This envelope is what the release and final auditors receive.
+17. **Contract Auditor, release** checks runtime and package correctness against that envelope.
+18. **Final Auditor** independently approves or rejects release.
+19. **Controller** emits the final result.
 
 ## Why stages are isolated
 

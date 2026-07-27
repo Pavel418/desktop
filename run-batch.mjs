@@ -58,12 +58,47 @@ function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+// Failures that mean "the provider or the browser session misbehaved", not "the workflow produced a
+// wrong result". These are worth waiting out and retrying in a fresh chat, and they must NOT spend
+// the workflow retry budget: a three-minute upload outage once consumed both attempts of two files
+// in under a minute, permanently skipping them.
+const RETRYABLE_INFRA_ERRORS = new Set([
+  'chatgpt_server_error',
+  'attachment_upload_rejected',
+  'attachment_upload_incomplete',
+  'attachment_not_registered',
+  'send_not_triggered',
+  'response_stalled_no_output',
+  'timeout_waiting_for_response',
+  'already_generating',
+  'send_failed',
+  'type_failed'
+]);
+
+// Waits before each provider-side retry: long enough for a brief outage to clear, bounded so a
+// hard failure still ends the file promptly.
+const INFRA_BACKOFF_MS = Object.freeze([30_000, 120_000, 300_000]);
+
+export function isRetryableInfraError(err) {
+  if (!err) return false;
+  if (err.retryable === true) return true;
+  return RETRYABLE_INFRA_ERRORS.has(String(err.message || '').trim());
+}
+
+// The per-run log (kept forever, one file per run) plus a stable `batch-run.log` that always holds
+// the current run for convenience. Both receive every line.
 let activeRunLogPath = null;
+let stableRunLogPath = null;
 
 function log(...args) {
   console.log(...args);
-  if (activeRunLogPath) {
-    fs.appendFile(activeRunLogPath, `${new Date().toISOString()} ${format(...args)}\n`).catch(() => {});
+  const line = `${new Date().toISOString()} ${format(...args)}\n`;
+  for (const target of [activeRunLogPath, stableRunLogPath]) {
+    if (target) fs.appendFile(target, line).catch(() => {});
   }
 }
 
@@ -140,6 +175,32 @@ function renderTranscript(transcript) {
       return `${head}\n${t.text || ''}`;
     })
     .join('\n\n');
+}
+
+// Keep the newest `keep` per-run logs and delete older ones, so per-run logs do not grow forever.
+export async function pruneOldRunLogs(stateDir, keep = 20) {
+  const names = await fs.readdir(stateDir).catch(() => []);
+  const logs = names.filter((n) => /^batch-run-.*\.log$/.test(n)).sort();
+  for (const name of logs.slice(0, Math.max(0, logs.length - keep))) {
+    await fs.rm(path.join(stateDir, name), { force: true }).catch(() => {});
+  }
+  return logs.length;
+}
+
+// Write one attempt's transcript and issue log. Called on the success path AND from the error
+// path, because temporary chats are never saved by ChatGPT: a turn that is not written here is
+// gone for good. The first try is unsuffixed; later tries get `.attemptN` so nothing overwrites
+// an earlier (often longer) attempt.
+export async function persistAttempt(outDir, stem, tryIndex, transcript, issues) {
+  const turns = Array.isArray(transcript) ? transcript : [];
+  const issueList = Array.isArray(issues) ? issues : [];
+  if (!turns.length && !issueList.length) return null;
+  const suffix = tryIndex > 0 ? `.attempt${tryIndex + 1}` : '';
+  await fs.mkdir(outDir, { recursive: true });
+  const responsePath = path.join(outDir, `${stem}${suffix}.response.txt`);
+  await fs.writeFile(responsePath, renderTranscript(turns));
+  await fs.writeFile(path.join(outDir, `${stem}${suffix}.issues.json`), JSON.stringify(issueList, null, 2));
+  return responsePath;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +289,12 @@ export async function processEntry({
 
   await fs.mkdir(entry.outDir, { recursive: true });
   const maxRetry = Number.isFinite(workflowConfig.maxRetry) ? workflowConfig.maxRetry : 1;
+  // Separate budget for provider-side failures (rejected uploads, silent non-sends, stalled turns),
+  // so a transient outage cannot consume the workflow retries meant for real workflow failures.
+  const maxInfraRetries = Number.isFinite(workflowConfig.maxInfraRetries) ? workflowConfig.maxInfraRetries : 3;
+  const infraBackoffMs = Array.isArray(workflowConfig.infraBackoffMs) && workflowConfig.infraBackoffMs.length
+    ? workflowConfig.infraBackoffMs
+    : INFRA_BACKOFF_MS;
 
   log(`[${entry.name}] ${pdfs.length} PDF(s); workflow=${entry.workflowDir}; output → ${entry.outDir}`);
 
@@ -239,14 +306,24 @@ export async function processEntry({
     const iterOut = group
       ? path.join(entry.outDir, group)
       : path.join(entry.outDir, `${String(i + 1).padStart(2, '0')}-${stem}`);
-    const record = { pdf: path.basename(pdf), group, files: [], error: null, status: null, attempts: 0, gatesPassed: [] };
+    const record = {
+      pdf: path.basename(pdf), group, files: [], error: null, status: null,
+      attempts: 0, infraRetries: 0, gatesPassed: []
+    };
     const fileStarted = Date.now();
     log(`\n───── ${labelBase} ─────${monitor ? `  (${monitor.format()})` : ''}`);
 
     let resolved = false;
-    for (let attempt = 0; attempt <= maxRetry && !resolved; attempt++) {
-      record.attempts = attempt + 1;
-      const label = `${labelBase}${attempt > 0 ? ` [retry ${attempt}/${maxRetry}]` : ''}`;
+    // `attempt` counts workflow attempts (a run that produced a real, wrong result); `infraRetry`
+    // counts provider-side retries, which are budgeted separately. `tryIndex` only names artifacts.
+    let attempt = 0;
+    let infraRetry = 0;
+    let tryIndex = 0;
+    while (!resolved) {
+      record.attempts = tryIndex + 1;
+      const label = `${labelBase}` +
+        `${attempt > 0 ? ` [retry ${attempt}/${maxRetry}]` : ''}` +
+        `${infraRetry > 0 ? ` [infra retry ${infraRetry}/${maxInfraRetries}]` : ''}`;
       const attemptStarted = Date.now();
       let session = null;
       // The isolated audit session (for the independent release/final decision) is opened
@@ -303,14 +380,14 @@ export async function processEntry({
         record.status = res.statusCode;
         record.gatesPassed = res.gatesPassed;
         record.files = res.files.map((f) => f.path);
+        // A completed run supersedes any earlier attempt's error, so a file that recovered is not
+        // reported as failed in the summary (and does not set a non-zero exit code).
+        record.error = null;
 
         // Persist the transcript and issue log (temporary chats aren't saved by ChatGPT).
         // Suffix retries so a later attempt never overwrites an earlier attempt's transcript —
         // the earlier (often longer) run is exactly what a post-mortem needs.
-        await fs.mkdir(iterOut, { recursive: true });
-        const attemptSuffix = attempt > 0 ? `.attempt${attempt + 1}` : '';
-        await fs.writeFile(path.join(iterOut, `${stem}${attemptSuffix}.response.txt`), renderTranscript(res.transcript));
-        await fs.writeFile(path.join(iterOut, `${stem}${attemptSuffix}.issues.json`), JSON.stringify(res.issues, null, 2));
+        await persistAttempt(iterOut, stem, tryIndex, res.transcript, res.issues);
 
         log(
           `[${label}] status ${res.statusCode} | gates: ${res.gatesPassed.join('→') || 'none'} | ` +
@@ -322,6 +399,7 @@ export async function processEntry({
           if (res.files.length === 0) log(`[${label}] ⚠ success status but no persistent files captured`);
           resolved = true;
         } else if (attempt < maxRetry) {
+          attempt += 1;
           log(`[${label}] status ${res.statusCode} (failed at ${res.failedStage}) → retrying in a fresh chat`);
         } else {
           record.error = `status_${res.statusCode}${res.failedStage ? `@${res.failedStage}` : ''}`;
@@ -332,12 +410,32 @@ export async function processEntry({
         record.error = err?.message || String(err);
         log(`[${label}] ERROR: ${record.error}`);
         if (err?.data) log(`[${label}] ERROR DATA: ${JSON.stringify(err.data)}`);
-        if (attempt >= maxRetry) resolved = true;
-        else log(`[${label}] → retrying in a fresh chat after error`);
+        // Whatever turns completed before the throw are the most valuable diagnostic there is;
+        // the orchestrator attaches them to the error so they survive an aborted run.
+        await persistAttempt(iterOut, stem, tryIndex, err?.transcript, err?.issues).catch(() => {});
+        if (Array.isArray(err?.gatesPassed) && err.gatesPassed.length) record.gatesPassed = err.gatesPassed;
+
+        if (isRetryableInfraError(err) && infraRetry < maxInfraRetries) {
+          const waitMs = infraBackoffMs[Math.min(infraRetry, infraBackoffMs.length - 1)];
+          infraRetry += 1;
+          record.infraRetries = infraRetry;
+          log(
+            `[${label}] provider-side failure (${record.error}) — waiting ${humanizeDuration(waitMs)}, ` +
+            `then retrying in a fresh chat without spending a workflow attempt ` +
+            `(${infraRetry}/${maxInfraRetries})`
+          );
+          await sleep(waitMs);
+        } else if (attempt < maxRetry) {
+          attempt += 1;
+          log(`[${label}] → retrying in a fresh chat after error`);
+        } else {
+          resolved = true;
+        }
       } finally {
         if (auditSession) await auditSession.close().catch(() => {});
         if (session) await session.close().catch(() => {});
       }
+      tryIndex += 1;
     }
 
     record.durationMs = Date.now() - fileStarted;
@@ -357,8 +455,15 @@ async function main() {
   const config = await loadConfig(configPath);
   const stateDir = defaultStateDir();
   await fs.mkdir(stateDir, { recursive: true });
-  activeRunLogPath = path.join(stateDir, 'batch-run.log');
+  // One retained log file per run, plus the stable batch-run.log for the current run. Truncating a
+  // single shared file at startup used to destroy the previous run's log — including the evidence
+  // needed to explain why that run failed.
+  const runStamp = new Date().toISOString().replace(/[:.]/g, '-');
+  activeRunLogPath = path.join(stateDir, `batch-run-${runStamp}.log`);
+  stableRunLogPath = path.join(stateDir, 'batch-run.log');
   await fs.writeFile(activeRunLogPath, '');
+  await fs.writeFile(stableRunLogPath, '');
+  await pruneOldRunLogs(stateDir, 20);
 
   const show = argFlag('--headless') ? false : argFlag('--show') ? true : config.show !== false;
   const timeoutMs = Number(argValue('--timeout-ms', config.timeoutMs || 7_200_000));
@@ -397,6 +502,11 @@ async function main() {
     perTurnTimeoutMs: Number.isFinite(wf.perTurnTimeoutMs) ? wf.perTurnTimeoutMs : timeoutMs,
     successCode: Number.isFinite(wf.successCode) ? wf.successCode : 0,
     maxRetry: Number.isFinite(wf.maxRetry) ? wf.maxRetry : DEFAULT_WORKFLOW_CONFIG.maxRetry,
+    // Provider-side retries (rejected uploads, silent non-sends, stalled turns) have their own
+    // budget so a transient outage never consumes maxRetry.
+    maxInfraRetries: Number.isFinite(wf.maxInfraRetries) ? wf.maxInfraRetries : 3,
+    // Re-sends of a single turn that ChatGPT answered with its own error card.
+    serverErrorRetries: Number.isFinite(wf.serverErrorRetries) ? wf.serverErrorRetries : 2,
     auditEvidenceInlineMax: Number.isFinite(config.auditEvidenceInlineMax) ? config.auditEvidenceInlineMax : 12_000,
     // Require all 17 individual edge decisions before the visual-review envelope can be built.
     // Default on in production; disable with "enforceEdgeDecisions": false.
@@ -415,14 +525,24 @@ async function main() {
   const concurrency = clamp(Number.isFinite(requestedConcurrency) ? requestedConcurrency : entries.length, 1, entries.length);
 
   const chromeSettings = config.chrome || {};
+  // The resolvers read flat `chromeXxx` keys (with argv > env > settings precedence), but the batch
+  // config nests them under `chrome` with unprefixed names. Map both forms so config values such as
+  // `chrome.profileMode` actually take effect — previously they were silently ignored and always
+  // fell back to the built-in default.
+  const chromeResolverSettings = {
+    chromeExecutablePath: chromeSettings.executablePath ?? chromeSettings.chromeExecutablePath,
+    chromeDebugPort: chromeSettings.debugPort ?? chromeSettings.chromeDebugPort,
+    chromeProfileMode: chromeSettings.profileMode ?? chromeSettings.chromeProfileMode,
+    chromeProfileName: chromeSettings.profileName ?? chromeSettings.chromeProfileName
+  };
   const selectors = await loadSelectors(stateDir);
 
   const backend = new ChromeCdpBrowserBackend({
     stateDir,
-    executablePath: resolveChromeExecutablePath({ settings: chromeSettings }),
-    debugPort: resolveChromeDebugPort({ settings: chromeSettings }),
-    profileMode: resolveChromeProfileMode({ settings: chromeSettings }),
-    profileName: resolveChromeProfileName({ settings: chromeSettings }),
+    executablePath: resolveChromeExecutablePath({ settings: chromeResolverSettings }),
+    debugPort: resolveChromeDebugPort({ settings: chromeResolverSettings }),
+    profileMode: resolveChromeProfileMode({ settings: chromeResolverSettings }),
+    profileName: resolveChromeProfileName({ settings: chromeResolverSettings }),
     pruneCookiesOnOpen: chromeSettings.pruneCookiesOnOpen !== false
   });
 
@@ -430,7 +550,7 @@ async function main() {
   log(`Runtime source: ${fileURLToPath(import.meta.url)} | attachment=${ATTACHMENT_RUNTIME_REVISION}`);
   log(`Persistent log: ${activeRunLogPath}`);
   log(`Entries: ${entries.length} | parallel: ${concurrency} | timeout: ${timeoutMs}ms | window: ${show ? 'visible' : 'hidden'} | chat: ${temporaryChat ? 'temporary' : 'regular'}${debug ? ' | debug: ON' : ''}`);
-  log(`Workflow: maxRepairRounds=${workflowConfig.maxRepairRounds} | maxRetry=${workflowConfig.maxRetry} | successCode=${workflowConfig.successCode} | release/final audit: ${independentAudit ? 'isolated session' : 'shared chat'}`);
+  log(`Workflow: maxRepairRounds=${workflowConfig.maxRepairRounds} | maxRetry=${workflowConfig.maxRetry} | maxInfraRetries=${workflowConfig.maxInfraRetries} | serverErrorRetries=${workflowConfig.serverErrorRetries} | successCode=${workflowConfig.successCode} | release/final audit: ${independentAudit ? 'isolated session' : 'shared chat'}`);
   if (stallInspect) log(`⏸ STALL INSPECT MODE ON — a near-empty idle-fallback will dump DOM+screenshots and HOLD instead of reacting (kill the run when done inspecting).`);
   log('Starting Chrome…');
   const chromeState = await backend.start();
@@ -441,6 +561,21 @@ async function main() {
   const monitor = new ResourceMonitor({ chromePid, log, intervalMs: resourceIntervalMs });
   log(`Resource monitor: chrome pid=${chromePid ?? 'n/a'} | sampling every ${Math.round(resourceIntervalMs / 1000)}s | ${monitor.cores} CPU core(s)`);
   monitor.start();
+
+  // Ctrl+C used to kill the process mid-turn with no trace at all: the log simply stopped, leaving
+  // no record that the run was interrupted rather than hung, and Chrome outliving the script.
+  let shuttingDown = false;
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK']) {
+    process.on(signal, () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      log(`\n⚠ ${signal} received — stopping the run. Turns already completed were written to the ` +
+          `output directory; the turn in flight is lost.`);
+      Promise.allSettled([monitor.stop(), backend.dispose()]).then(() => process.exit(130));
+      // Do not wait forever on a wedged browser.
+      setTimeout(() => process.exit(130), 10_000).unref();
+    });
+  }
 
   const runStarted = Date.now();
   let summaries;

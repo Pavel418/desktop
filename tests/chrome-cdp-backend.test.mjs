@@ -617,6 +617,83 @@ test('watchUploads: tracks upload requests, ignores unrelated traffic, and strip
   assert.ok(events.some((e) => e.phase === 'failed'));
 });
 
+test('watchUploads: an HTTP error response is a failed upload, not a finished one', () => {
+  const { client, emit } = fakeEventClient();
+  const page = new ChromeCdpPageAdapter({ client, targetId: 't', sessionId: 'session' });
+  const events = [];
+  const watch = page.watchUploads({ onEvent: (e) => events.push(e) });
+
+  // Chrome reports a fully received 5xx response via loadingFinished (verified against a live
+  // browser), so classifying by that event alone counted OpenAI's upload outage as success.
+  emit('Network.requestWillBeSent', { requestId: 'a', request: { url: 'https://chatgpt.com/backend-api/files', method: 'POST' } });
+  emit('Network.responseReceived', { requestId: 'a', response: { status: 503 } });
+  emit('Network.loadingFinished', { requestId: 'a', encodedDataLength: 423 });
+
+  emit('Network.requestWillBeSent', { requestId: 'b', request: { url: 'https://chatgpt.com/backend-api/files', method: 'POST' } });
+  emit('Network.responseReceived', { requestId: 'b', response: { status: 500 } });
+  emit('Network.loadingFinished', { requestId: 'b', encodedDataLength: 1430 });
+
+  // A genuine success is still a success.
+  emit('Network.requestWillBeSent', { requestId: 'c', request: { url: 'https://chatgpt.com/backend-api/files', method: 'POST' } });
+  emit('Network.responseReceived', { requestId: 'c', response: { status: 200 } });
+  emit('Network.loadingFinished', { requestId: 'c', encodedDataLength: 2364 });
+
+  const snap = watch.snapshot();
+  assert.equal(snap.total, 3);
+  assert.equal(snap.finished, 1, 'only the 200 counts as finished');
+  assert.equal(snap.failed, 2, '5xx uploads count as failed');
+  assert.equal(snap.httpErrors, 2);
+  assert.deepEqual(snap.httpErrorStatuses.sort(), [500, 503]);
+  assert.equal(snap.requests.find((r) => r.status === 503).state, 'http_error');
+  assert.equal(snap.requests.find((r) => r.status === 503).error, 'http_503');
+  assert.ok(events.some((e) => e.phase === 'http_error' && e.status === 503));
+  assert.ok(!events.some((e) => e.phase === 'finished' && e.status === 503), 'a 5xx never reports as finished');
+});
+
+test('watchUploads: counts COMPLETED upload sequences, not selected files', () => {
+  const { client, emit } = fakeEventClient();
+  const page = new ChromeCdpPageAdapter({ client, targetId: 't', sessionId: 'session' });
+  const watch = page.watchUploads();
+  // One file's full sequence: create -> blob PUT -> process_upload_stream.
+  const seq = (n) => {
+    emit('Network.requestWillBeSent', { requestId: `c${n}`, request: { url: 'https://chatgpt.com/backend-api/files', method: 'POST' } });
+    emit('Network.responseReceived', { requestId: `c${n}`, response: { status: 200 } });
+    emit('Network.loadingFinished', { requestId: `c${n}`, encodedDataLength: 2433 });
+    emit('Network.requestWillBeSent', { requestId: `b${n}`, request: { url: `https://sdmntprnortheu.oaiusercontent.com/files/${n}/raw`, method: 'PUT' } });
+    emit('Network.responseReceived', { requestId: `b${n}`, response: { status: 201 } });
+    emit('Network.loadingFinished', { requestId: `b${n}`, encodedDataLength: 1046 });
+    emit('Network.requestWillBeSent', { requestId: `p${n}`, request: { url: 'https://chatgpt.com/backend-api/files/process_upload_stream', method: 'POST' } });
+    emit('Network.responseReceived', { requestId: `p${n}`, response: { status: 200 } });
+    emit('Network.loadingFinished', { requestId: `p${n}`, encodedDataLength: 2834 });
+  };
+
+  seq(1);
+  let snap = watch.snapshot();
+  assert.equal(snap.completed, 1, 'one file finished uploading');
+  assert.equal(snap.created, 1);
+  assert.equal(snap.blobs, 1);
+
+  // The exact observed failure: a second file was selected (chip shown) but no request ever ran
+  // for it, so the sequence count must stay at 1 even though two files were attached.
+  assert.equal(watch.snapshot().completed, 1, 'a selected-but-not-uploaded file adds nothing');
+
+  seq(2);
+  snap = watch.snapshot();
+  assert.equal(snap.completed, 2);
+  assert.equal(snap.total, 6, 'two files produce six upload requests');
+});
+
+test('watchUploads: a 4xx upload rejection also counts as failed', () => {
+  const { client, emit } = fakeEventClient();
+  const page = new ChromeCdpPageAdapter({ client, targetId: 't', sessionId: 'session' });
+  const watch = page.watchUploads();
+  emit('Network.requestWillBeSent', { requestId: 'a', request: { url: 'https://files.oaiusercontent.com/file-x', method: 'PUT' } });
+  emit('Network.responseReceived', { requestId: 'a', response: { status: 413 } });
+  emit('Network.loadingFinished', { requestId: 'a', encodedDataLength: 12 });
+  assert.equal(watch.snapshot().failed, 1);
+  assert.deepEqual(watch.snapshot().httpErrorStatuses, [413]);
+});
+
 test('watchUploads: ignores events from other sessions and stops after off()', () => {
   const { client, emit, handlerCount } = fakeEventClient();
   const page = new ChromeCdpPageAdapter({ client, targetId: 't', sessionId: 'session' });

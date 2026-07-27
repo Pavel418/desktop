@@ -10,13 +10,30 @@ ACTIONS
 2. Confirm the issue evidence and affected dependency scope.
 3. Repair one domain at a time.
 4. Prefer root-cause correction over per-example patches.
+4a. An issue names the instance a reviewer happened to measure, not the extent of the defect. Before
+   planning, check every sibling for the same fault — all masks, all fields, all cells, all static
+   lines — and plan the fix for every instance found, stating how many you checked and how many you are
+   changing. Repairing only the named instance is how a gate consumes a round per instance: a reviewer
+   measures one mask, that mask is fixed, the next round finds the identical defect in the next mask,
+   and the budget expires long before the defect class does.
 5. Preserve unrelated approved behavior. Repairs are SURGICAL: the writer must touch only the exact
    elements named in the open issues and keep every already-verified field, bbox, binding, table, and
    static line byte-for-byte identical. Never plan a full re-specification or a re-derivation of
    unaffected parts — that is the main cause of new defects appearing and the gate never converging.
-6. Create one change record per repair group with files changed, old/new values, issues addressed, and exact reruns.
-7. Mark issues fixed, never verified.
-8. Escalate only when local correction is unreliable:
+6. Create one change record per repair group with files changed, old/new values, issues addressed, and
+   exact reruns. Identify every change by its precise location — the template_spec.json path
+   (e.g. fields[local_key=authority.endorsement_text].baseline_reference_px, or
+   reconstruction.masks[mask_id=...].source) or the generator.py symbol — so the writer can change that
+   element alone and leave everything else byte-for-byte identical.
+7. Set each change group's `owner` to the writer that must apply it — template_architect for
+   template_spec changes (geometry, cells, fields, static-text, semantics, reconstruction-plan and
+   mask extents), generator_engineer for generator.py or generated-artifact changes (see the shared
+   contract's OWNERSHIP rule). A single gate's failure may span both owners; emit one group per owner.
+8. When one group depends on another owner's fix landing first — e.g. the generator background can
+   only be rebuilt after the architect widens an approved mask — state that dependency explicitly and
+   order the groups so the prerequisite (usually the template_architect change) is applied first.
+9. Mark issues fixed, never verified.
+10. Escalate only when local correction is unreliable:
    parameter -> field -> cell -> region -> section -> full form reconstruction.
 
 FORBIDDEN
@@ -48,3 +65,19 @@ RERUN RULES
 RETURN
 
 Return the shared handoff and change record. Another role must verify the result.
+
+STATUS SEMANTICS
+
+You plan; you never write. Your `stage_status` therefore reports whether a PLAN exists, not whether
+the document is fixed:
+
+- ready_for_review — you produced a plan for at least one assigned issue. This is the normal result,
+  including when the plan is partial: mark the issues you could not plan for with `status` blocked
+  inside their own issue records, and still return ready_for_review for the rest.
+- blocked — you could not plan a correction for ANY assigned issue. Reserve it for that case only; a
+  single unrepairable issue among several does not make the round blocked, and reporting it as such
+  discards the repairs you did plan for the others.
+- failed — you could not carry out the planning work at all (missing evidence, unreadable artifacts).
+
+Name the blocked issues and the reason explicitly, so the Controller can decide between escalation
+and a genuine partial result.

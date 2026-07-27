@@ -76,7 +76,10 @@ Copy and edit `batch.config.json`:
     "maxRepairRounds": 4,      // repair→rerun rounds allowed per recoverable QA gate
     "perTurnTimeoutMs": 7200000,// timeout per role turn (defaults to timeoutMs)
     "successCode": 0,          // final status that means "done"
-    "maxRetry": 1              // max whole-workflow retries in a fresh chat on failure
+    "maxRetry": 1,             // max whole-workflow retries in a fresh chat on failure
+    "maxInfraRetries": 3,      // provider-side retries (rejected/incomplete uploads, silent
+                               // non-sends, stalled turns) — budgeted separately from maxRetry
+    "serverErrorRetries": 2    // re-sends of one turn ChatGPT answered with its own error card
   },
   "chrome": { "profileMode": "isolated" },
   "entries": [
@@ -110,7 +113,13 @@ Each role turn ends with a structured handoff (`stage_status` +
   issue), matching `generator.py`'s codes (`10` input, `20` impl/import, `30`
   schema/API/manifest/self-test, `40` rendering, `50` annotation/coordinate/OTSL, `60`
   visual quality, `70` persistent output, `80` partial, `99` internal).
-- The whole workflow is retried in a **fresh chat** up to `maxRetry` times on failure.
+- The whole workflow is retried in a **fresh chat** up to `maxRetry` times when a run produces a
+  genuine (wrong) result.
+- A **provider-side** failure is not a workflow result and does not spend that budget: a rejected or
+  incomplete attachment upload, a send that never posted, a turn that stalls with zero output, or a
+  persistent ChatGPT error card is retried in a fresh chat out of `maxInfraRetries`, with backoff.
+  Attachments are gated on one *completed* upload sequence per file (chips alone prove nothing), so a
+  prompt is never dispatched with a file the model cannot see.
 
 Status **0** requires the full set in the shared contract's authoritative "STATUS 0 DEFINITION": the
 six QA gates passed, all 17 edge decisions resolved, reviewer≠writer, current orchestrator-verified

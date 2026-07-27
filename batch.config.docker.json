@@ -1,0 +1,22 @@
+{
+  "show": true,
+  "temporaryChat": true,
+  "concurrency": 1,
+  "timeoutMs": 7200000,
+  "chrome": {
+    "executablePath": "/app/docker/chrome-wrapper.sh",
+    "debugPort": 9222,
+    "profileMode": "existing",
+    "profileName": "Default",
+    "pruneCookiesOnOpen": true
+  },
+  "entries": [
+    {
+      "name": "example",
+      "pdfDir": "/workspace/input",
+      "baseGenerator": "/workspace/input/base_generator.py",
+      "workflowDir": "/workspace/workflow",
+      "outDir": "/workspace/output"
+    }
+  ]
+}

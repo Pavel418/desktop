@@ -1,0 +1,30 @@
+services:
+  agentify-batch:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentify-batch:local
+    init: true
+    shm_size: "2gb"
+    environment:
+      HOME: /home/agentify
+      DISPLAY: ":99"
+      AGENTIFY_DESKTOP_CHROME_BIN: /app/docker/chrome-wrapper.sh
+      AGENTIFY_DESKTOP_CHROME_PROFILE_MODE: isolated
+      AGENTIFY_DESKTOP_CHROME_DEBUG_PORT: "9222"
+      NOVNC_PORT: "6080"
+      SCREEN_GEOMETRY: "1440x1000x24"
+    ports:
+      - "6080:6080"
+    volumes:
+      - ./batch.config.docker.json:/workspace/config/batch.config.json:ro
+      - ./docker-data/input:/workspace/input:ro
+      - ./docker-data/output:/workspace/output
+      - ./docker-data/state:/home/agentify/.agentify-desktop
+      - ./workflow:/workspace/workflow:ro
+    command:
+      - node
+      - run-batch.mjs
+      - --config
+      - /workspace/config/batch.config.json
+    restart: "no"

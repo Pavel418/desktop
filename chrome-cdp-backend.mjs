@@ -508,79 +508,370 @@ export class ChromeCdpPageAdapter {
   }
 
   async setFileInputFiles(files) {
+    const expectedCount = Array.isArray(files) ? files.length : 0;
     let lastFound = 0;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      const { root } = await this.client.send('DOM.getDocument', { depth: 12, pierce: true }, this.sessionId);
-      // Resolve the input owned by the VISIBLE prompt composer. ChatGPT keeps stale
-      // upload inputs mounted (often three with the same #upload-files id), so taking
-      // the first global match can succeed at the CDP layer without notifying React.
+    const diagnostics = [];
+
+    // Open the active composer's attachment menu.
+    await this.evaluate(`(() => {
+      const visible = (node) => {
+        if (!node) return false;
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return rect.width > 0 &&
+          rect.height > 0 &&
+          style.visibility !== 'hidden' &&
+          style.display !== 'none';
+      };
+
+      const selectors = [
+        '[data-testid="composer-plus-btn"]',
+        'button[aria-label*="Attach" i]',
+        'button[aria-label*="Add" i]',
+        'button[aria-label*="upload" i]'
+      ];
+
+      for (const selector of selectors) {
+        const button = Array.from(
+          document.querySelectorAll(selector)
+        ).filter(visible).at(-1);
+
+        if (button) {
+          button.click();
+          return { clicked: true, selector };
+        }
+      }
+
+      return { clicked: false };
+    })()`).catch(() => null);
+
+    await sleep(400);
+
+    // ChatGPT now uses a two-step attachment UI in some builds:
+    // plus button -> menu item -> file input. Select the upload-files menu
+    // item before resolving the input, otherwise only stale hidden inputs may
+    // exist in the document.
+    await this.evaluate(`(() => {
+      const visible = (node) => {
+        if (!node) return false;
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return rect.width > 0 &&
+          rect.height > 0 &&
+          style.visibility !== 'hidden' &&
+          style.display !== 'none';
+      };
+
+      const candidates = Array.from(
+        document.querySelectorAll(
+          '[role="menuitem"], [role="option"], button, [data-testid]'
+        )
+      ).filter(visible);
+
+      const uploadItem = candidates.find((node) => {
+        const text = [
+          node.innerText,
+          node.textContent,
+          node.getAttribute('aria-label'),
+          node.getAttribute('data-testid')
+        ].filter(Boolean).join(' ').trim();
+
+        return /(?:upload|attach|add)\\s+(?:from\\s+computer|files?|photos?)/i.test(text) ||
+          /upload[-_ ]?file/i.test(text);
+      });
+
+      if (uploadItem) {
+        uploadItem.click();
+        return {
+          clicked: true,
+          text: (
+            uploadItem.innerText ||
+            uploadItem.getAttribute('aria-label') ||
+            uploadItem.getAttribute('data-testid') ||
+            ''
+          ).trim()
+        };
+      }
+
+      return {
+        clicked: false,
+        visibleItems: candidates.slice(0, 30).map((node) => ({
+          tag: node.tagName,
+          text: (
+            node.innerText ||
+            node.getAttribute('aria-label') ||
+            node.getAttribute('data-testid') ||
+            ''
+          ).trim().slice(0, 120)
+        }))
+      };
+    })()`).catch(() => null);
+
+    await sleep(500);
+
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const { root } = await this.client.send(
+        'DOM.getDocument',
+        {
+          depth: 20,
+          pierce: true
+        },
+        this.sessionId
+      );
+
       let activeNodeId = null;
       let activeObjectId = null;
+
       try {
         const active = await this.client.send(
           'Runtime.evaluate',
           {
             expression: `(() => {
-              const visible = (n) => {
-                if (!n) return false;
-                const r = n.getBoundingClientRect();
-                const s = getComputedStyle(n);
-                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+              const visible = (node) => {
+                if (!node) return false;
+                const rect = node.getBoundingClientRect();
+                const style = getComputedStyle(node);
+                return rect.width > 0 &&
+                  rect.height > 0 &&
+                  style.visibility !== 'hidden' &&
+                  style.display !== 'none';
               };
-              const prompts = Array.from(document.querySelectorAll('#prompt-textarea, [contenteditable="true"][role="textbox"]'));
+
+              const prompts = Array.from(
+                document.querySelectorAll(
+                  '#prompt-textarea, [contenteditable="true"][role="textbox"]'
+                )
+              );
+
               const prompt = prompts.filter(visible).at(-1) || null;
-              const composer = prompt?.closest('form') || prompt?.closest('[data-testid*="composer" i]') || null;
-              const local = composer ? Array.from(composer.querySelectorAll('input[type="file"]')).filter((n) => !n.disabled) : [];
-              if (local.length) return local.find((n) => n.id === 'upload-files') || local.at(-1);
-              const all = Array.from(document.querySelectorAll('input[type="file"]')).filter((n) => !n.disabled);
-              return all.at(-1) || null;
+              const composer =
+                prompt?.closest('form') ||
+                prompt?.closest('[data-testid*="composer" i]') ||
+                prompt?.parentElement?.parentElement ||
+                null;
+
+              const allInputs = Array.from(
+                document.querySelectorAll('input[type="file"]')
+              ).filter((node) => node.isConnected && !node.disabled);
+
+              const localInputs = composer
+                ? allInputs.filter((node) => composer.contains(node))
+                : [];
+
+              const ranked = [
+                ...localInputs.filter((node) => node.id === 'upload-files'),
+                ...localInputs.filter((node) => node.multiple),
+                ...localInputs,
+                ...allInputs.filter((node) => node.id === 'upload-files'),
+                ...allInputs.filter((node) => node.multiple),
+                ...allInputs
+              ];
+
+              return ranked.find(Boolean) || null;
             })()`,
             awaitPromise: false,
             returnByValue: false
           },
           this.sessionId
         );
+
         activeObjectId = active?.result?.objectId || null;
+
         if (activeObjectId) {
-          const requested = await this.client.send('DOM.requestNode', { objectId: activeObjectId }, this.sessionId);
-          if (Number.isFinite(requested?.nodeId) && requested.nodeId > 0) activeNodeId = requested.nodeId;
+          const requested = await this.client.send(
+            'DOM.requestNode',
+            { objectId: activeObjectId },
+            this.sessionId
+          );
+
+          if (
+            Number.isFinite(requested?.nodeId) &&
+            requested.nodeId > 0
+          ) {
+            activeNodeId = requested.nodeId;
+          }
         }
       } catch {
         activeNodeId = null;
       } finally {
         if (activeObjectId) {
-          await this.client.send('Runtime.releaseObject', { objectId: activeObjectId }, this.sessionId).catch(() => {});
+          await this.client.send(
+            'Runtime.releaseObject',
+            { objectId: activeObjectId },
+            this.sessionId
+          ).catch(() => {});
         }
       }
 
-      // Set exactly ONE input. Global matches are fallback candidates only.
       const ordered = activeNodeId ? [activeNodeId] : [];
-      for (const sel of ['input[type="file"]#upload-files', 'form input[type="file"]', 'input[type="file"]']) {
-        const q = await this.client.send('DOM.querySelectorAll', { nodeId: root.nodeId, selector: sel }, this.sessionId);
-        for (const id of (Array.isArray(q?.nodeIds) ? q.nodeIds : [])) if (!ordered.includes(id)) ordered.push(id);
+
+      for (const selector of [
+        'form input[type="file"]#upload-files',
+        '[data-testid*="composer" i] input[type="file"]',
+        'input[type="file"]#upload-files',
+        'input[type="file"][multiple]',
+        'form input[type="file"]',
+        'input[type="file"]'
+      ]) {
+        const query = await this.client.send(
+          'DOM.querySelectorAll',
+          {
+            nodeId: root.nodeId,
+            selector
+          },
+          this.sessionId
+        );
+
+        for (
+          const nodeId of Array.isArray(query?.nodeIds)
+            ? query.nodeIds
+            : []
+        ) {
+          if (!ordered.includes(nodeId)) ordered.push(nodeId);
+        }
       }
+
       lastFound = ordered.length;
+
       if (!ordered.length) {
-        await sleep(180);
+        await sleep(300);
         continue;
       }
+
       for (const nodeId of ordered) {
+        let objectId = null;
+
         try {
-          await this.client.send('DOM.setFileInputFiles', { nodeId, files }, this.sessionId);
-          return {
-            found: ordered.length,
-            set: 1,
+          const beforeResolved = await this.client.send(
+            'DOM.resolveNode',
+            { nodeId },
+            this.sessionId
+          );
+          objectId = beforeResolved?.object?.objectId || null;
+
+          let beforeDetail = null;
+          if (objectId) {
+            const inspected = await this.client.send(
+              'Runtime.callFunctionOn',
+              {
+                objectId,
+                functionDeclaration: `function () {
+                  const composer =
+                    this.closest('form') ||
+                    this.closest('[data-testid*="composer" i]');
+                  return {
+                    connected: this.isConnected,
+                    disabled: this.disabled,
+                    id: this.id || null,
+                    multiple: Boolean(this.multiple),
+                    accept: this.accept || null,
+                    insideComposer: Boolean(composer),
+                    composerVisible: composer
+                      ? (() => {
+                          const r = composer.getBoundingClientRect();
+                          const s = getComputedStyle(composer);
+                          return r.width > 0 &&
+                            r.height > 0 &&
+                            s.display !== 'none' &&
+                            s.visibility !== 'hidden';
+                        })()
+                      : false
+                  };
+                }`,
+                returnByValue: true
+              },
+              this.sessionId
+            );
+            beforeDetail = inspected?.result?.value || null;
+          }
+
+          await this.client.send(
+            'DOM.setFileInputFiles',
+            { nodeId, files },
+            this.sessionId
+          );
+
+          let verification = null;
+          if (objectId) {
+            verification = await this.client.send(
+              'Runtime.callFunctionOn',
+              {
+                objectId,
+                functionDeclaration: `function () {
+                  return {
+                    connected: this.isConnected,
+                    fileCount: this.files?.length || 0,
+                    names: Array.from(this.files || []).map(
+                      (file) => file.name
+                    )
+                  };
+                }`,
+                returnByValue: true
+              },
+              this.sessionId
+            );
+          }
+
+          const detail = verification?.result?.value || {};
+
+          diagnostics.push({
             nodeId,
-            strategy: activeNodeId && nodeId === activeNodeId ? 'active-composer' : 'global-fallback'
-          };
-        } catch {}
+            before: beforeDetail,
+            after: detail,
+            strategy:
+              activeNodeId && nodeId === activeNodeId
+                ? 'active-composer'
+                : 'fallback'
+          });
+
+          if (
+            Number(detail.fileCount) === expectedCount &&
+            beforeDetail?.insideComposer === true &&
+            beforeDetail?.composerVisible === true
+          ) {
+            // CDP emits the trusted file-input event for the selected node.
+            // Do not synthesize a second untrusted event here.
+            await sleep(1200);
+
+            return {
+              found: ordered.length,
+              set: expectedCount,
+              nodeId,
+              strategy:
+                activeNodeId && nodeId === activeNodeId
+                  ? 'active-composer'
+                  : 'fallback',
+              verification: detail,
+              diagnostics
+            };
+          }
+        } catch (error) {
+          diagnostics.push({
+            nodeId,
+            error: error?.message || String(error)
+          });
+        } finally {
+          if (objectId) {
+            await this.client.send(
+              'Runtime.releaseObject',
+              { objectId },
+              this.sessionId
+            ).catch(() => {});
+          }
+        }
       }
-      await sleep(180);
+
+      await sleep(300);
     }
 
-    const err = new Error('missing_file_input');
-    err.data = { selector: 'input[type=file]', found: lastFound };
-    throw err;
+    const error = new Error('file_input_assignment_failed');
+    error.data = {
+      selector: 'input[type=file]',
+      found: lastFound,
+      expectedCount,
+      diagnostics
+    };
+    throw error;
   }
 
   // Watch ChatGPT attachment uploads at the NETWORK layer so a caller can tell a genuine

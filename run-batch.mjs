@@ -31,6 +31,27 @@ import { ATTACHMENT_RUNTIME_REVISION, ChatGPTController } from './chatgpt-contro
 import { defaultStateDir } from './state.mjs';
 import { WorkflowOrchestrator, loadRoles, humanizeDuration } from './workflow-orchestrator.mjs';
 import { ResourceMonitor } from './resource-monitor.mjs';
+import { createRunLogger } from './observability/logger.mjs';
+import {
+  classifyError,
+  isRetryableInfraError
+} from './observability/error-taxonomy.mjs';
+import {
+  EXPECTED_PERSISTENT_OUTPUTS,
+  verifyOutputCompleteness
+} from './observability/output-completeness.mjs';
+import {
+  captureFailureDiagnostics
+} from './observability/failure-diagnostics.mjs';
+import {
+  buildRunSummary,
+  writeRunSummary
+} from './observability/run-summary.mjs';
+import {
+  EXIT_CODES,
+  determineRunExitCode,
+  getSignalExitCode
+} from './observability/exit-codes.mjs';
 import {
   resolveChromeExecutablePath,
   resolveChromeDebugPort,
@@ -62,37 +83,21 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
-// Failures that mean "the provider or the browser session misbehaved", not "the workflow produced a
-// wrong result". These are worth waiting out and retrying in a fresh chat, and they must NOT spend
-// the workflow retry budget: a three-minute upload outage once consumed both attempts of two files
-// in under a minute, permanently skipping them.
-const RETRYABLE_INFRA_ERRORS = new Set([
-  'chatgpt_server_error',
-  'attachment_upload_rejected',
-  'attachment_upload_incomplete',
-  'attachment_not_registered',
-  'send_not_triggered',
-  'response_stalled_no_output',
-  'timeout_waiting_for_response',
-  'already_generating',
-  'send_failed',
-  'type_failed'
-]);
+// Error categories and retryability are defined centrally in
+// observability/error-taxonomy.mjs. Re-export this helper to preserve the
+// existing public API used by tests and other modules.
+export { isRetryableInfraError };
 
 // Waits before each provider-side retry: long enough for a brief outage to clear, bounded so a
 // hard failure still ends the file promptly.
 const INFRA_BACKOFF_MS = Object.freeze([30_000, 120_000, 300_000]);
 
-export function isRetryableInfraError(err) {
-  if (!err) return false;
-  if (err.retryable === true) return true;
-  return RETRYABLE_INFRA_ERRORS.has(String(err.message || '').trim());
-}
-
 // The per-run log (kept forever, one file per run) plus a stable `batch-run.log` that always holds
 // the current run for convenience. Both receive every line.
 let activeRunLogPath = null;
 let stableRunLogPath = null;
+let activeStructuredLogging = null;
+let activeRunSummaryContext = null;
 
 function log(...args) {
   console.log(...args);
@@ -100,6 +105,38 @@ function log(...args) {
   for (const target of [activeRunLogPath, stableRunLogPath]) {
     if (target) fs.appendFile(target, line).catch(() => {});
   }
+}
+
+function emitStructured(
+  logger,
+  level,
+  event,
+  message,
+  fields = {}
+) {
+  if (!logger) return;
+
+  const payload = {
+    event,
+    ...fields
+  };
+
+  if (level === 'error') {
+    logger.error(payload, message);
+    return;
+  }
+
+  if (level === 'warn') {
+    logger.warn(payload, message);
+    return;
+  }
+
+  if (level === 'debug') {
+    logger.debug(payload, message);
+    return;
+  }
+
+  logger.info(payload, message);
 }
 
 // ---------------------------------------------------------------------------
@@ -277,12 +314,35 @@ export async function processEntry({
   entry, backend, monitor = null, selectors, stateDir, show, timeoutMs, debug = false,
   chatUrl = 'https://chatgpt.com/', newChat = true,
   workflowConfig = DEFAULT_WORKFLOW_CONFIG, makeController = defaultMakeController,
-  independentAudit = true, stallInspect = null
+  independentAudit = true, stallInspect = null,
+  logger = null,
+  diagnosticsRoot = null
 }) {
+  const entryLogger = logger?.child({
+    entryName: entry.name
+  });
+
+  emitStructured(
+    entryLogger,
+    'info',
+    'entry_started',
+    'Batch entry started'
+  );
+
   const summary = { name: entry.name, pdfs: [], aborted: false };
   const pdfs = await selectPdfs(entry);
 
   if (pdfs.length === 0) {
+    emitStructured(
+      entryLogger,
+      'warn',
+      'entry_empty',
+      'No PDFs found for entry',
+      {
+        pdfDir: entry.pdfDir
+      }
+    );
+
     log(`[${entry.name}] no PDFs found under ${entry.pdfDir}`);
     return summary;
   }
@@ -302,13 +362,34 @@ export async function processEntry({
     const pdf = pdfs[i].path;
     const group = pdfs[i].group;
     const stem = path.basename(pdf, path.extname(pdf));
+    const workflowRunId = `RUN-${String(i + 1).padStart(4, '0')}`;
+
+    const pdfLogger = entryLogger?.child({
+      pdfStem: stem,
+      pdfName: path.basename(pdf),
+      group: group || null,
+      pdfIndex: i + 1,
+      pdfCount: pdfs.length,
+      workflowRunId
+    });
+
+    emitStructured(
+      pdfLogger,
+      'info',
+      'pdf_selected',
+      'PDF selected for processing',
+      {
+        pdfPath: pdf
+      }
+    );
+
     const labelBase = `${entry.name}${group ? '/' + group : ''} ${i + 1}/${pdfs.length} ${path.basename(pdf)}`;
     const iterOut = group
       ? path.join(entry.outDir, group)
       : path.join(entry.outDir, `${String(i + 1).padStart(2, '0')}-${stem}`);
     const record = {
       pdf: path.basename(pdf), group, files: [], error: null, status: null,
-      attempts: 0, infraRetries: 0, gatesPassed: []
+      attempts: 0, infraRetries: 0, gatesPassed: [], outputCompleteness: null
     };
     const fileStarted = Date.now();
     log(`\n───── ${labelBase} ─────${monitor ? `  (${monitor.format()})` : ''}`);
@@ -324,7 +405,27 @@ export async function processEntry({
       const label = `${labelBase}` +
         `${attempt > 0 ? ` [retry ${attempt}/${maxRetry}]` : ''}` +
         `${infraRetry > 0 ? ` [infra retry ${infraRetry}/${maxInfraRetries}]` : ''}`;
+
+      const attemptLogger = pdfLogger?.child({
+        attemptNumber: tryIndex + 1,
+        workflowRetryNumber: attempt,
+        infraRetryNumber: infraRetry
+      });
+
       const attemptStarted = Date.now();
+
+      emitStructured(
+        attemptLogger,
+        'info',
+        'attempt_started',
+        'PDF processing attempt started',
+        {
+          attachmentNames: [
+            path.basename(pdf),
+            path.basename(entry.baseGenerator)
+          ]
+        }
+      );
       let session = null;
       // The isolated audit session (for the independent release/final decision) is opened
       // lazily by the orchestrator via this factory, and closed in the finally below.
@@ -337,10 +438,24 @@ export async function processEntry({
           selectors,
           stateDir,
           stallInspect,
-          onDebug: debug ? (msg) => log(`[${label}] · ${msg}`) : null,
-          onBlocked: (st) =>
-            log(`[${label}] ⚠ ChatGPT needs attention (${st?.kind || 'blocked'}) — complete it in the Chrome window; waiting…`),
-          onUnblocked: () => log(`[${label}] resolved — continuing`)
+          onDebug: debug ? (msg) => {
+            log(`[${label}] · ${msg}`);
+            emitStructured(attemptLogger, 'debug', 'controller_debug', msg, { sessionType: 'workflow' });
+          } : null,
+          onBlocked: (st) => {
+            const blockedKind = st?.kind || 'blocked';
+            log(`[${label}] ⚠ ChatGPT needs attention (${blockedKind}) — complete it in the Chrome window; waiting…`);
+            emitStructured(attemptLogger, 'warn', 'attention_required', 'ChatGPT requires manual attention', {
+              blockedKind,
+              sessionType: 'workflow'
+            });
+          },
+          onUnblocked: () => {
+            log(`[${label}] resolved — continuing`);
+            emitStructured(attemptLogger, 'info', 'attention_resolved', 'ChatGPT manual-attention state resolved', {
+              sessionType: 'workflow'
+            });
+          }
         });
 
         const makeAuditController = independentAudit ? async () => {
@@ -352,10 +467,24 @@ export async function processEntry({
             selectors,
             stateDir,
             stallInspect,
-            onDebug: debug ? (msg) => log(`[${label}] · (audit) ${msg}`) : null,
-            onBlocked: (st) =>
-              log(`[${label}] ⚠ (audit) ChatGPT needs attention (${st?.kind || 'blocked'}) — complete it in the Chrome window; waiting…`),
-            onUnblocked: () => log(`[${label}] (audit) resolved — continuing`)
+            onDebug: debug ? (msg) => {
+              log(`[${label}] · (audit) ${msg}`);
+              emitStructured(attemptLogger, 'debug', 'controller_debug', msg, { sessionType: 'audit' });
+            } : null,
+            onBlocked: (st) => {
+              const blockedKind = st?.kind || 'blocked';
+              log(`[${label}] ⚠ (audit) ChatGPT needs attention (${blockedKind}) — complete it in the Chrome window; waiting…`);
+              emitStructured(attemptLogger, 'warn', 'attention_required', 'Audit chat requires manual attention', {
+                blockedKind,
+                sessionType: 'audit'
+              });
+            },
+            onUnblocked: () => {
+              log(`[${label}] (audit) resolved — continuing`);
+              emitStructured(attemptLogger, 'info', 'attention_resolved', 'Audit manual-attention state resolved', {
+                sessionType: 'audit'
+              });
+            }
           });
           return { controller: c, close: () => s.close().catch(() => {}) };
         } : null;
@@ -363,7 +492,10 @@ export async function processEntry({
         const orchestrator = new WorkflowOrchestrator({
           roles: entry.roles,
           config: workflowConfig,
-          log: (msg) => log(`[${label}] ${msg}`)
+          log: (msg) => {
+            log(`[${label}] ${msg}`);
+            emitStructured(attemptLogger, 'info', 'workflow_message', msg);
+          }
         });
 
         const res = await orchestrator.run({
@@ -373,13 +505,61 @@ export async function processEntry({
           controller,
           timeoutMs,
           newChat,
-          runId: `RUN-${String(i + 1).padStart(4, '0')}`,
+          runId: workflowRunId,
           makeAuditController
         });
 
         record.status = res.statusCode;
         record.gatesPassed = res.gatesPassed;
         record.files = res.files.map((f) => f.path);
+        record.outputCompleteness = await verifyOutputCompleteness({
+          files: res.files,
+          expectedFileNames: EXPECTED_PERSISTENT_OUTPUTS
+        });
+
+        emitStructured(
+          attemptLogger,
+          record.outputCompleteness.complete ? 'info' : 'warn',
+          'output_completeness_checked',
+          record.outputCompleteness.complete
+            ? 'Expected persistent outputs are complete'
+            : 'Expected persistent outputs are incomplete',
+          record.outputCompleteness
+        );
+
+        if (!record.outputCompleteness.complete) {
+          log(
+            `[${label}] ⚠ output completeness check failed: ` +
+            `missing=${record.outputCompleteness.missingFileNames.join(', ') || 'none'} | ` +
+            `empty=${record.outputCompleteness.emptyFileNames.join(', ') || 'none'} | ` +
+            `unreadable=${record.outputCompleteness.unreadableFileNames.join(', ') || 'none'}`
+          );
+
+          const diagnostics = await captureFailureDiagnostics({
+            diagnosticsRoot,
+            entryName: entry.name,
+            pdfStem: stem,
+            attemptNumber: tryIndex + 1,
+            reason: 'output_incomplete',
+            pages: [
+              { name: 'workflow', page: session?.page },
+              { name: 'audit', page: auditSession?.page }
+            ]
+          });
+
+          emitStructured(
+            attemptLogger,
+            diagnostics.captured ? 'warn' : 'debug',
+            diagnostics.captured
+              ? 'failure_diagnostics_captured'
+              : 'failure_diagnostics_unavailable',
+            diagnostics.captured
+              ? 'Failure diagnostics captured'
+              : 'Failure diagnostics were unavailable',
+            diagnostics
+          );
+        }
+
         // A completed run supersedes any earlier attempt's error, so a file that recovered is not
         // reported as failed in the summary (and does not set a non-zero exit code).
         record.error = null;
@@ -395,10 +575,41 @@ export async function processEntry({
           `${monitor ? ` | ${monitor.format()}` : ''}`
         );
 
+        emitStructured(
+          attemptLogger,
+          res.success ? 'info' : 'warn',
+          'attempt_completed',
+          'PDF processing attempt completed',
+          {
+            success: res.success,
+            statusCode: res.statusCode,
+            failedStage: res.failedStage || null,
+            gatesPassed: res.gatesPassed || [],
+            outputFileCount: res.files?.length || 0,
+            outputComplete: record.outputCompleteness?.complete ?? false,
+            missingOutputFileNames: record.outputCompleteness?.missingFileNames || [],
+            emptyOutputFileNames: record.outputCompleteness?.emptyFileNames || [],
+            unreadableOutputFileNames: record.outputCompleteness?.unreadableFileNames || [],
+            durationMs: Date.now() - attemptStarted
+          }
+        );
+
         if (res.success) {
           if (res.files.length === 0) log(`[${label}] ⚠ success status but no persistent files captured`);
           resolved = true;
         } else if (attempt < maxRetry) {
+          emitStructured(
+            attemptLogger,
+            'warn',
+            'retry_scheduled',
+            'Workflow retry scheduled',
+            {
+              retryType: 'workflow',
+              nextAttemptNumber: tryIndex + 2,
+              failedStage: res.failedStage || null,
+              statusCode: res.statusCode
+            }
+          );
           attempt += 1;
           log(`[${label}] status ${res.statusCode} (failed at ${res.failedStage}) → retrying in a fresh chat`);
         } else {
@@ -408,6 +619,51 @@ export async function processEntry({
         }
       } catch (err) {
         record.error = err?.message || String(err);
+        const errorInfo = classifyError(err);
+
+        const diagnostics = await captureFailureDiagnostics({
+          diagnosticsRoot,
+          entryName: entry.name,
+          pdfStem: stem,
+          attemptNumber: tryIndex + 1,
+          reason: errorInfo.code,
+          pages: [
+            { name: 'workflow', page: session?.page },
+            { name: 'audit', page: auditSession?.page }
+          ]
+        });
+
+        emitStructured(
+          attemptLogger,
+          diagnostics.captured ? 'warn' : 'debug',
+          diagnostics.captured
+            ? 'failure_diagnostics_captured'
+            : 'failure_diagnostics_unavailable',
+          diagnostics.captured
+            ? 'Failure diagnostics captured'
+            : 'Failure diagnostics were unavailable',
+          diagnostics
+        );
+
+        emitStructured(
+          attemptLogger,
+          'error',
+          'attempt_failed',
+          'PDF processing attempt failed',
+          {
+            err,
+            rawErrorMessage: record.error,
+            errorCategory: errorInfo.category,
+            errorCode: errorInfo.code,
+            retryable: errorInfo.retryable,
+            retryScope: errorInfo.retryScope,
+            diagnosticsCaptured: diagnostics.captured,
+            diagnosticsDir: diagnostics.diagnosticsDir,
+            diagnosticFiles: diagnostics.files,
+            durationMs: Date.now() - attemptStarted
+          }
+        );
+
         log(`[${label}] ERROR: ${record.error}`);
         if (err?.data) log(`[${label}] ERROR DATA: ${JSON.stringify(err.data)}`);
         // Whatever turns completed before the throw are the most valuable diagnostic there is;
@@ -417,6 +673,20 @@ export async function processEntry({
 
         if (isRetryableInfraError(err) && infraRetry < maxInfraRetries) {
           const waitMs = infraBackoffMs[Math.min(infraRetry, infraBackoffMs.length - 1)];
+          emitStructured(
+            attemptLogger,
+            'warn',
+            'retry_scheduled',
+            'Infrastructure retry scheduled',
+            {
+              retryType: 'infrastructure',
+              errorCategory: errorInfo.category,
+              errorCode: errorInfo.code,
+              nextAttemptNumber: tryIndex + 2,
+              nextInfraRetryNumber: infraRetry + 1,
+              waitMs
+            }
+          );
           infraRetry += 1;
           record.infraRetries = infraRetry;
           log(
@@ -426,6 +696,18 @@ export async function processEntry({
           );
           await sleep(waitMs);
         } else if (attempt < maxRetry) {
+          emitStructured(
+            attemptLogger,
+            'warn',
+            'retry_scheduled',
+            'Workflow retry scheduled after error',
+            {
+              retryType: 'workflow',
+              errorCategory: errorInfo.category,
+              errorCode: errorInfo.code,
+              nextAttemptNumber: tryIndex + 2
+            }
+          );
           attempt += 1;
           log(`[${label}] → retrying in a fresh chat after error`);
         } else {
@@ -440,8 +722,42 @@ export async function processEntry({
 
     record.durationMs = Date.now() - fileStarted;
     log(`[${labelBase}] ⏱ file total ${humanizeDuration(record.durationMs)} over ${record.attempts} attempt(s)`);
+
+    emitStructured(
+      pdfLogger,
+      record.error ? 'error' : 'info',
+      'pdf_completed',
+      'PDF processing completed',
+      {
+        success: !record.error,
+        statusCode: record.status,
+        error: record.error,
+        attemptCount: record.attempts,
+        infraRetryCount: record.infraRetries,
+        gatesPassed: record.gatesPassed,
+        outputFileCount: record.files.length,
+        outputComplete: record.outputCompleteness?.complete ?? false,
+        missingOutputFileNames: record.outputCompleteness?.missingFileNames || [],
+        emptyOutputFileNames: record.outputCompleteness?.emptyFileNames || [],
+        unreadableOutputFileNames: record.outputCompleteness?.unreadableFileNames || [],
+        durationMs: record.durationMs
+      }
+    );
+
     summary.pdfs.push(record);
   }
+
+  emitStructured(
+    entryLogger,
+    'info',
+    'entry_completed',
+    'Batch entry completed',
+    {
+      pdfCount: summary.pdfs.length,
+      successCount: summary.pdfs.filter((record) => !record.error).length,
+      failureCount: summary.pdfs.filter((record) => record.error).length
+    }
+  );
 
   return summary;
 }
@@ -458,7 +774,24 @@ async function main() {
   // One retained log file per run, plus the stable batch-run.log for the current run. Truncating a
   // single shared file at startup used to destroy the previous run's log — including the evidence
   // needed to explain why that run failed.
-  const runStamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const runStartedAt = new Date().toISOString();
+  const runStamp = runStartedAt.replace(/[:.]/g, '-');
+  const runId = `run-${runStamp}-${process.pid}`;
+  const runDir = path.join(stateDir, 'runs', runId);
+  await fs.mkdir(runDir, { recursive: true });
+
+  const structuredLogging = createRunLogger({
+    runId,
+    runDir,
+    level: argFlag('--debug') || config.debug === true ? 'debug' : 'info'
+  });
+  activeStructuredLogging = structuredLogging;
+  activeRunSummaryContext = {
+    runId,
+    runDir,
+    runStartedAt,
+    configPath
+  };
   activeRunLogPath = path.join(stateDir, `batch-run-${runStamp}.log`);
   stableRunLogPath = path.join(stateDir, 'batch-run.log');
   await fs.writeFile(activeRunLogPath, '');
@@ -546,6 +879,25 @@ async function main() {
     pruneCookiesOnOpen: chromeSettings.pruneCookiesOnOpen !== false
   });
 
+  structuredLogging.logger.info(
+    {
+      event: 'run_started',
+      runStartedAt,
+      configPath,
+      runDir,
+      structuredLogPath: structuredLogging.logPath,
+      runtimeSource: fileURLToPath(import.meta.url),
+      attachmentRuntimeRevision: ATTACHMENT_RUNTIME_REVISION,
+      entryCount: entries.length,
+      concurrency,
+      timeoutMs,
+      windowMode: show ? 'visible' : 'hidden',
+      chatMode: temporaryChat ? 'temporary' : 'regular',
+      debug
+    },
+    'Batch run started'
+  );
+
   log(`Config: ${configPath}`);
   log(`Runtime source: ${fileURLToPath(import.meta.url)} | attachment=${ATTACHMENT_RUNTIME_REVISION}`);
   log(`Persistent log: ${activeRunLogPath}`);
@@ -569,11 +921,31 @@ async function main() {
     process.on(signal, () => {
       if (shuttingDown) return;
       shuttingDown = true;
+      const signalExitCode = getSignalExitCode(signal);
+
       log(`\n⚠ ${signal} received — stopping the run. Turns already completed were written to the ` +
           `output directory; the turn in flight is lost.`);
-      Promise.allSettled([monitor.stop(), backend.dispose()]).then(() => process.exit(130));
+
+      structuredLogging.logger.warn(
+        {
+          event: 'signal_received',
+          signal,
+          exitCode: signalExitCode
+        },
+        'Batch run interrupted'
+      );
+
+      Promise.allSettled([
+        monitor.stop(),
+        backend.dispose(),
+        structuredLogging.flush()
+      ]).then(() => process.exit(signalExitCode));
+
       // Do not wait forever on a wedged browser.
-      setTimeout(() => process.exit(130), 10_000).unref();
+      setTimeout(
+        () => process.exit(signalExitCode),
+        10_000
+      ).unref();
     });
   }
 
@@ -581,7 +953,23 @@ async function main() {
   let summaries;
   try {
     summaries = await runPool(entries, concurrency, (entry) =>
-      processEntry({ entry, backend, monitor, selectors, stateDir, show, timeoutMs, debug, chatUrl, newChat, workflowConfig, independentAudit, stallInspect }).catch((err) => ({
+      processEntry({
+        entry,
+        backend,
+        monitor,
+        selectors,
+        stateDir,
+        show,
+        timeoutMs,
+        debug,
+        chatUrl,
+        newChat,
+        workflowConfig,
+        independentAudit,
+        stallInspect,
+        logger: structuredLogging.logger,
+        diagnosticsRoot: runDir
+      }).catch((err) => ({
         name: entry.name,
         pdfs: [],
         aborted: true,
@@ -596,7 +984,6 @@ async function main() {
 
   // ---- Summary ----
   log('\n===== SUMMARY =====');
-  let hadError = false;
   for (const s of summaries) {
     const okCount = s.pdfs.filter((p) => !p.error).length;
     const errCount = s.pdfs.filter((p) => p.error).length;
@@ -610,15 +997,115 @@ async function main() {
       const took = p.durationMs ? `, ${humanizeDuration(p.durationMs)}` : '';
       log(`    ${p.error ? '✗' : '✓'} ${p.group || p.pdf} (${p.pdf}): ${st}${attempts}${gates}${took}${p.error ? ` — ${p.error}` : ` — ${p.files.length} file(s)`}`);
     }
-    if (errCount > 0 || s.aborted || s.fatal) hadError = true;
   }
-  process.exitCode = hadError ? 1 : 0;
+
+  process.exitCode = determineRunExitCode(summaries);
+  const runSucceeded = process.exitCode === EXIT_CODES.SUCCESS;
+
+  const runFinishedAt = new Date().toISOString();
+  const runSummary = buildRunSummary({
+    runId,
+    runStartedAt,
+    runFinishedAt,
+    durationMs: Date.now() - runStarted,
+    exitCode: process.exitCode,
+    configPath,
+    runDir,
+    structuredLogPath: structuredLogging.logPath,
+    summaries
+  });
+
+  const summaryPath = await writeRunSummary({
+    runDir,
+    summary: runSummary
+  });
+
+  log(`Run summary: ${summaryPath}`);
+
+  structuredLogging.logger.info(
+    {
+      event: 'run_summary_written',
+      summaryPath,
+      success: runSummary.success,
+      entryCount: runSummary.counts.entries,
+      pdfCount: runSummary.counts.pdfs,
+      failureCount: runSummary.counts.failedPdfs
+    },
+    'Run summary written'
+  );
+
+  structuredLogging.logger.info(
+    {
+      event: 'run_completed',
+      success: runSucceeded,
+      exitCode: process.exitCode,
+      durationMs: Date.now() - runStarted,
+      entryCount: summaries.length,
+      failedEntryCount: summaries.filter(
+        (summary) =>
+          summary.aborted ||
+          summary.fatal ||
+          summary.pdfs.some((record) => record.error)
+      ).length,
+      summaryPath
+    },
+    'Batch run completed'
+  );
+
+  await structuredLogging.flush();
 }
 
 const isMain = path.resolve(process.argv[1] || '') === fileURLToPath(import.meta.url);
 if (isMain) {
-  main().catch((err) => {
+  main().catch(async (err) => {
     log(`fatal: ${err?.message || err}`);
-    process.exitCode = 1;
+
+    try {
+      const errorInfo = classifyError(err);
+      let summaryPath = null;
+
+      if (activeRunSummaryContext) {
+        const runFinishedAt = new Date().toISOString();
+        const fatalSummary = buildRunSummary({
+          runId: activeRunSummaryContext.runId,
+          runStartedAt: activeRunSummaryContext.runStartedAt,
+          runFinishedAt,
+          durationMs:
+            Date.parse(runFinishedAt) -
+            Date.parse(activeRunSummaryContext.runStartedAt),
+          exitCode: EXIT_CODES.FATAL,
+          configPath: activeRunSummaryContext.configPath,
+          runDir: activeRunSummaryContext.runDir,
+          structuredLogPath: activeStructuredLogging?.logPath || null,
+          summaries: [],
+          fatalError: err
+        });
+
+        summaryPath = await writeRunSummary({
+          runDir: activeRunSummaryContext.runDir,
+          summary: fatalSummary
+        });
+      }
+
+      activeStructuredLogging?.logger.error(
+        {
+          event: 'run_fatal',
+          err,
+          errorCategory: errorInfo.category,
+          errorCode: errorInfo.code,
+          retryable: errorInfo.retryable,
+          retryScope: errorInfo.retryScope,
+          exitCode: EXIT_CODES.FATAL,
+          summaryPath
+        },
+        'Batch run failed fatally'
+      );
+
+      await activeStructuredLogging?.flush();
+    } catch {
+      // Never hide the original fatal error because logging failed.
+    }
+
+    process.exitCode = EXIT_CODES.FATAL;
   });
 }
